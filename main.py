@@ -1,3 +1,4 @@
+CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.65"))
 import os
 import json
 from typing import Any, Dict, Optional
@@ -187,3 +188,4 @@ async def verdict_test(payload: Dict[str, Any]):
     prompt = build_prompt(dummy)
     verdict = await call_llm(prompt)
     return verdict
+
