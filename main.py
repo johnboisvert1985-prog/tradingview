@@ -1,4 +1,3 @@
-CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.65"))
 import os
 import json
 from typing import Any, Dict, Optional
@@ -10,7 +9,9 @@ from pydantic import ConfigDict
 from openai import OpenAI
 import httpx
 
-# --- Config (env) ---
+# ---------------------------
+# ENV / Config
+# ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY in environment.")
@@ -18,20 +19,27 @@ if not OPENAI_API_KEY:
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# Telegram (facultatif)
+# Telegram (facultatif; si vides -> pas d'envoi)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-client = OpenAI()  # lit la clé dans l'env
+# Option: ne forward sur Telegram que si confiance >= CONFIDENCE_MIN
+CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+
+# Client OpenAI (lit la clé dans l'env)
+client = OpenAI()
+
 app = FastAPI(title="AI Trade Pro — LLM Bridge", version="1.0.0")
 
-# --- Models ---
+# ---------------------------
+# Pydantic models
+# ---------------------------
 class SR(BaseModel):
     R1: Optional[float] = None
     S1: Optional[float] = None
 
 class VectorStreak(BaseModel):
-    # Pydantic v2 interdit les noms commençant par "_"
+    # Pydantic v2: pas de nom commençant par "_"
     f5:   Optional[int] = Field(None, alias="5")
     f15:  Optional[int] = Field(None, alias="15")
     f60:  Optional[int] = Field(None, alias="60")
@@ -72,7 +80,9 @@ class TVPayload(BaseModel):
     levels: Optional[Levels] = None
     secret: Optional[str] = None
 
-# --- Utils ---
+# ---------------------------
+# Helpers
+# ---------------------------
 def build_prompt(p: TVPayload) -> str:
     return f"""
 Tu es un moteur de décision de trading. 
@@ -119,6 +129,7 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
         return {"decision": "IGNORE", "confidence": 0.0, "reason": "invalid-json-from-llm", "raw": txt}
 
 async def send_telegram(text: str) -> None:
+    """Envoie un message Telegram si BOT_TOKEN + CHAT_ID configurés."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -129,6 +140,7 @@ async def send_telegram(text: str) -> None:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
+            # ne bloque pas le webhook si Telegram échoue
             pass
 
 def fmt_lvl(x: Optional[float]) -> str:
@@ -137,31 +149,41 @@ def fmt_lvl(x: Optional[float]) -> str:
 def fmt_int(x: Optional[int]) -> str:
     return "-" if x is None else str(x)
 
-# --- Routes ---
+# ---------------------------
+# Routes
+# ---------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
+    # Sécurité simple: secret dans le JSON doit matcher l'env
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # (Exemples de hard-rules en amont si tu veux)
+    # f = payload.features or Features()
+    # levels = payload.levels or Levels()
+    # if not levels.SL or not levels.TP1:
+    #     return JSONResponse({"decision":"IGNORE","confidence":0.0,"reason":"levels incomplets","received":payload.model_dump(by_alias=True)})
+
+    # Appel LLM
     prompt = build_prompt(payload)
     verdict = await call_llm(prompt)
 
+    # Prépare message Telegram (concis)
     f = payload.features or Features()
     levels = payload.levels or Levels()
     sr = f.sr or SR()
     vs = f.vectorStreak or VectorStreak()
     mtf = f.mtfSignal or MTFSignal()
 
-    # Message Telegram (MAJ: champs f5/f15/...)
     tg = []
     tg.append(f"📈 <b>{payload.symbol}</b>  ⏱ TF <b>{payload.tf}</b>")
     tg.append(f"Signal: <b>{payload.direction}</b>  | Close: <b>{payload.close:.4f}</b>")
-    tg.append(f"LLM: <b>{verdict.get('decision','?')}</b>  (conf. {verdict.get('confidence',0):.2f})")
+    tg.append(f"LLM: <b>{verdict.get('decision','?')}</b>  (conf. {float(verdict.get('confidence',0)):.2f})")
     tg.append(f"Raison: {verdict.get('reason','-')}")
     tg.append(f"Trend={f.trend if f.trend is not None else '-'}  Rej={f.rejcount if f.rejcount is not None else '-'}  ATR={f.volatility_atr if f.volatility_atr is not None else '-'}")
     tg.append(f"R1={fmt_lvl(sr.R1)}  S1={fmt_lvl(sr.S1)}")
@@ -169,14 +191,18 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     tg.append(f"MTF 5/15/60/240/D = {fmt_int(mtf.f5)}/{fmt_int(mtf.f15)}/{fmt_int(mtf.f60)}/{fmt_int(mtf.f240)}/{fmt_int(mtf.D)}")
     tg.append(f"SL={fmt_lvl(levels.SL)}  TP1={fmt_lvl(levels.TP1)}  TP2={fmt_lvl(levels.TP2)}  TP3={fmt_lvl(levels.TP3)}")
 
-    # (Optionnel) n'envoyer que si ≠ IGNORE :
-    # if verdict.get("decision") != "IGNORE":
-    await send_telegram("\n".join(tg))
+    # Envoi Telegram (option seuil de confiance)
+    try:
+        conf = float(verdict.get("confidence", 0))
+    except Exception:
+        conf = 0.0
+    if verdict.get("decision") != "IGNORE" and conf >= CONFIDENCE_MIN:
+        await send_telegram("\n".join(tg))
 
     return JSONResponse(
         {
             "decision": verdict.get("decision", "IGNORE"),
-            "confidence": verdict.get("confidence", 0.0),
+            "confidence": float(verdict.get("confidence", 0)),
             "reason": verdict.get("reason", "no-reason"),
             "received": payload.model_dump(by_alias=True),
         }
@@ -188,4 +214,3 @@ async def verdict_test(payload: Dict[str, Any]):
     prompt = build_prompt(dummy)
     verdict = await call_llm(prompt)
     return verdict
-
