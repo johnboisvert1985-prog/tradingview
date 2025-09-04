@@ -108,39 +108,93 @@ Exemple de format:
 {{"decision":"IGNORE","confidence":0.55,"reason":"MTF mitigé, volatilité élevée, S/R proche"}}
 """.strip()
 
+# --- à coller dans main.py, en remplacement intégral des fonctions existantes ---
+
 def parse_response_json_text(resp_obj) -> str:
-    # OpenAI Python SDK v1.43.0: Responses API a une propriété pratique output_text
+    """
+    Utilisé si jamais le SDK supporte Responses API. Sinon renvoie "".
+    """
     try:
         return resp_obj.output_text
     except Exception:
-        # Fallback extrêmement prudent si jamais la lib change
-        # (La structure standard: resp.output[0].content[0].text)
         try:
             return resp_obj.output[0].content[0].text
         except Exception:
             return ""
 
 async def call_llm(prompt: str) -> Dict[str, Any]:
-    # Responses API (évite l'erreur "max_tokens non supporté")
-    resp = client.responses.create(
-        model=LLM_MODEL,
-        input=prompt,
-        temperature=0.2,
-        max_output_tokens=200,  # limite de sortie
-        response_format={"type": "json_object"},  # force JSON
-    )
-    txt = parse_response_json_text(resp).strip()
+    """
+    Essaie Responses API si disponible (SDK récent),
+    sinon fallback Chat Completions (SDK plus ancien).
+    """
+    txt = ""
+    try:
+        # Tentative Responses API (peut lever AttributeError si non supportée)
+        create_resp = getattr(client, "responses").create  # type: ignore[attr-defined]
+        r = create_resp(
+            model=LLM_MODEL,
+            input=prompt,
+            temperature=0.2,
+            # pas de max_tokens ici pour compatibilité multi-modèles
+            response_format={"type": "json_object"},
+        )
+        txt = parse_response_json_text(r).strip()
+    except Exception:
+        # Fallback Chat Completions (NE PAS mettre max_tokens avec gpt-4o-mini)
+        r = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu es un moteur de décision et tu renvoies STRICTEMENT un JSON valide. "
+                        "Format attendu: {\"decision\":\"BUY|SELL|IGNORE\",\"confidence\":0..1,\"reason\":\"...\"} "
+                        "N'ajoute aucun texte en dehors du JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        txt = r.choices[0].message.content.strip()
+
+    # Parsing JSON robuste
     try:
         data = json.loads(txt)
-        if "decision" not in data:
-            data["decision"] = "IGNORE"
-        if "confidence" not in data:
-            data["confidence"] = 0.5
-        if "reason" not in data:
-            data["reason"] = "no-reason"
+        data.setdefault("decision", "IGNORE")
+        data.setdefault("confidence", 0.5)
+        data.setdefault("reason", "no-reason")
         return data
     except Exception:
         return {"decision": "IGNORE", "confidence": 0.0, "reason": "invalid-json-from-llm", "raw": txt}
+
+@app.get("/openai-health")
+def openai_health(secret: Optional[str] = Query(None, description="must match WEBHOOK_SECRET")):
+    """
+    Teste OpenAI sans supposer la présence de Responses API.
+    """
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    try:
+        if hasattr(client, "responses"):
+            r = client.responses.create(model=LLM_MODEL, input="ping")
+            sample = parse_response_json_text(r) or "pong"
+        else:
+            r = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": "ping"}],
+                temperature=0
+            )
+            sample = r.choices[0].message.content or "pong"
+
+        return {"ok": True, "model": LLM_MODEL, "sample": sample}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "openai_key_mask": _mask(OPENAI_API_KEY)}
+        )
+
 
 async def send_telegram(text: str, chat_id: Optional[str] = None) -> Dict[str, Any]:
     """Envoie un message Telegram si BOT_TOKEN + CHAT_ID configurés. Retourne un dict de debug."""
@@ -299,3 +353,4 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
     }
+
