@@ -232,6 +232,40 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # ---------------- Overrides dynamiques (par TF ou tag) ----------------
+    tf = (payload.tf or "").lower()
+    tag = (payload.tag or "").lower()
+
+    conf_min = CONFIDENCE_MIN
+    min_conf = MIN_CONFLUENCE
+    near_sr  = NEAR_SR_ATR
+    rr_min   = RR_MIN
+    cooldown = COOLDOWN_SEC
+
+    # Exemples d'overrides par "profil" via tag TradingView
+    if "scalp" in tag:
+        conf_min = max(conf_min, 0.78)
+        min_conf = max(min_conf, 3)
+        cooldown = max(cooldown, 900)
+    elif "swing" in tag:
+        conf_min = max(conf_min, 0.82)
+        min_conf = max(min_conf, 3)
+        near_sr  = max(near_sr, 0.8)
+        rr_min   = max(rr_min, 1.3)
+        cooldown = max(cooldown, 3600)
+
+    # Overrides par TF
+    if tf in ["5", "5m"]:
+        cooldown = max(cooldown, 900)
+    elif tf in ["15", "15m"]:
+        cooldown = max(cooldown, 1800)
+    elif tf in ["60", "1h"]:
+        cooldown = max(cooldown, 1800)
+    elif tf in ["240", "4h", "1d", "d", "day"]:
+        cooldown = max(cooldown, 3600)
+
+    # ---------------------------------------------------------------------
+
     # --- Anti-bruit & pré-filtres ---
     key = f"{payload.symbol}:{payload.tf}:{payload.direction}"
     now_ms = payload.time or int(time() * 1000)
@@ -241,35 +275,35 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
 
     # Cooldown (anti-spam)
     last_ts = last_fire.get(key, 0)
-    if COOLDOWN_SEC > 0 and (now_ms - last_ts) < COOLDOWN_SEC * 1000:
+    if cooldown > 0 and (now_ms - last_ts) < cooldown * 1000:
         return JSONResponse({
             "decision": "IGNORE", "confidence": 0.0,
-            "reason": f"cooldown {COOLDOWN_SEC}s",
+            "reason": f"cooldown {cooldown}s",
             "received": payload.model_dump(by_alias=True)
         })
 
     # Veto S/R adverse proche
-    if near_adverse_sr(f, payload.direction, payload.close, f.volatility_atr, NEAR_SR_ATR):
+    if near_adverse_sr(f, payload.direction, payload.close, f.volatility_atr, near_sr):
         return JSONResponse({
             "decision": "IGNORE", "confidence": 0.0,
-            "reason": f"near adverse S/R (≤ {NEAR_SR_ATR}×ATR)",
+            "reason": f"near adverse S/R (≤ {near_sr}×ATR)",
             "received": payload.model_dump(by_alias=True)
         })
 
     # Veto RR min
-    if not rr_ok(levels, payload.direction, payload.close, RR_MIN):
+    if not rr_ok(levels, payload.direction, payload.close, rr_min):
         return JSONResponse({
             "decision": "IGNORE", "confidence": 0.0,
-            "reason": f"RR to TP1 < {RR_MIN}",
+            "reason": f"RR to TP1 < {rr_min}",
             "received": payload.model_dump(by_alias=True)
         })
 
     # Confluence minimale
     score = confluence_score(f, payload.direction)
-    if score < MIN_CONFLUENCE:
+    if score < min_conf:
         return JSONResponse({
             "decision": "IGNORE", "confidence": 0.0,
-            "reason": f"low confluence ({score} < {MIN_CONFLUENCE})",
+            "reason": f"low confluence ({score} < {min_conf})",
             "received": payload.model_dump(by_alias=True)
         })
 
@@ -292,14 +326,14 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     tg.append(f"VS 5/15/60/240/D = {fmt_int(vs.f5)}/{fmt_int(vs.f15)}/{fmt_int(vs.f60)}/{fmt_int(vs.f240)}/{fmt_int(vs.D)}")
     tg.append(f"MTF 5/15/60/240/D = {fmt_int(mtf.f5)}/{fmt_int(mtf.f15)}/{fmt_int(mtf.f60)}/{fmt_int(mtf.f240)}/{fmt_int(mtf.D)}")
     tg.append(f"SL={fmt_lvl(levels.SL)}  TP1={fmt_lvl(levels.TP1)}  TP2={fmt_lvl(levels.TP2)}  TP3={fmt_lvl(levels.TP3)}")
-    tg.append(f"Confluence={score}  RR≥{RR_MIN}  Cooldown={COOLDOWN_SEC}s")
+    tg.append(f"Confluence={score}  RR≥{rr_min}  Cooldown={cooldown}s")
 
     # Envoi Telegram (option seuil de confiance)
     try:
         conf = float(verdict.get("confidence", 0))
     except Exception:
         conf = 0.0
-    if verdict.get("decision") != "IGNORE" and conf >= CONFIDENCE_MIN:
+    if verdict.get("decision") != "IGNORE" and conf >= conf_min:
         await send_telegram("\n".join(tg))
         last_fire[key] = now_ms  # mémorise le dernier envoi
 
@@ -311,9 +345,11 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "received": payload.model_dump(by_alias=True),
             "filters": {
                 "confluence": score,
-                "rr_min": RR_MIN,
-                "near_sr_atr": NEAR_SR_ATR,
-                "cooldown_sec": COOLDOWN_SEC,
+                "rr_min": rr_min,
+                "near_sr_atr": near_sr,
+                "cooldown_sec": cooldown,
+                "confidence_min": conf_min,
+                "min_confluence": min_conf,
             }
         }
     )
@@ -332,26 +368,33 @@ def openai_health(secret: Optional[str] = Query(None, description="must match WE
         raise HTTPException(status_code=401, detail="Invalid secret")
 
     try:
-        r = client.chat.completions.create(
+        r = client.chat_completions.create(  # compat: certaines stacks utilisent chat_completions
             model=LLM_MODEL,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=5,
             temperature=0
         )
-        return {
-            "ok": True,
-            "model": LLM_MODEL,
-            "sample": r.choices[0].message.content
-        }
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "error": str(e),
-                "openai_key_mask": _mask(OPENAI_API_KEY)
-            }
-        )
+        sample = r.choices[0].message.content
+    except Exception:
+        # fallback sur l'API standard si la compat échoue
+        try:
+            r = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=5,
+                temperature=0
+            )
+            sample = r.choices[0].message.content
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": str(e),
+                    "openai_key_mask": _mask(OPENAI_API_KEY)
+                }
+            )
+    return {"ok": True, "model": LLM_MODEL, "sample": sample}
 
 @app.get("/env-sanity")
 def env_sanity(secret: Optional[str] = Query(None)):
