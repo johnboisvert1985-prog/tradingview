@@ -4,15 +4,14 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
 from openai import OpenAI
 import httpx
 
-# ----------------------------------
+# =========================
 # ENV / Config
-# ----------------------------------
+# =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY in environment.")
@@ -24,25 +23,17 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Forward vers Telegram seulement si confidence >= CONFIDENCE_MIN
+# Option: envoyer sur Telegram seulement si confiance >= ce seuil
 CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
 
-# OpenAI client (lit la clé depuis l'env)
+# Client OpenAI
 client = OpenAI()
 
-app = FastAPI(title="AI Trade Pro — LLM Bridge", version="2.0.0")
+app = FastAPI(title="AI Trade Pro — LLM Bridge", version="1.3.0")
 
-# CORS pour autoriser le dashboard à appeler les endpoints
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ----------------------------------
+# =========================
 # Pydantic models
-# ----------------------------------
+# =========================
 class SR(BaseModel):
     R1: Optional[float] = None
     S1: Optional[float] = None
@@ -78,20 +69,20 @@ class Levels(BaseModel):
     TP3: Optional[float] = None
 
 class TVPayload(BaseModel):
-    tag: Optional[str] = None          # "ENTRY", "TP1_HIT", etc. (si tu l’utilises)
+    tag: Optional[str] = None
     symbol: str
     tf: str
     time: int
-    close: float                       # prix de la bougie (sert d’Entry si tu veux)
-    direction: str                     # "LONG" | "SHORT"
+    close: float               # = Entry (on masque "Close" dans le message)
+    direction: str             # "LONG" | "SHORT"
     features: Optional[Features] = None
     levels: Optional[Levels] = None
+    trade_id: Optional[str] = None
     secret: Optional[str] = None
-    trade_id: Optional[str] = None     # optionnel si tu l’utilises côté TV
 
-# ----------------------------------
+# =========================
 # Helpers
-# ----------------------------------
+# =========================
 def build_prompt(p: TVPayload) -> str:
     return f"""
 Tu es un moteur de décision de trading.
@@ -101,34 +92,44 @@ Contexte:
 - Symbole: {p.symbol}
 - TF: {p.tf}
 - Direction signal brut: {p.direction}
-- Entry (close de la bougie): {p.close}
+- Entry (close): {p.close}
 - Features: {p.features.model_dump(by_alias=True) if p.features else {}}
 - Levels: {p.levels.model_dump(by_alias=True) if p.levels else {}}
 
 Règles:
-- BUY si LONG + contexte multi-TF/volatilité/SR cohérent.
-- SELL si SHORT + contexte cohérent.
-- Sinon IGNORE.
-- Sois strict: IGNORE par défaut en cas de doute.
+- BUY si LONG + contexte multi-TF/volatilité/SR cohérent ; SELL si SHORT + contexte cohérent ; sinon IGNORE.
+- Sois strict mais pas excessif: si les niveaux sont manquants, tu peux décider IGNORE.
 - Réponse = JSON UNIQUEMENT (pas de texte avant/après).
-
-Exemple de format:
-{{"decision":"IGNORE","confidence":0.55,"reason":"MTF mitigé, volatilité élevée, S/R proche"}}
 """.strip()
 
+def _extract_text_from_responses(r) -> str:
+    # Nouvel SDK: r.output_text (pratique). Sinon, retours bruts.
+    txt = getattr(r, "output_text", None)
+    if txt:
+        return txt
+    # Fallbacks
+    try:
+        return r.output[0].content[0].text
+    except Exception:
+        pass
+    try:
+        # dernier recours: str(r)
+        return str(r)
+    except Exception:
+        return ""
+
 async def call_llm(prompt: str) -> Dict[str, Any]:
-    """
-    Utilise l'API Chat Completions (compatible large majorité des SDK).
-    IMPORTANT: pas de 'temperature' ni 'max_tokens' pour éviter les erreurs "unsupported_parameter".
-    """
-    resp = client.chat.completions.create(
+    # IMPORTANT: avec les modèles "o" (ex: gpt-4o-mini), on utilise Responses API
+    # et "max_output_tokens" (pas "max_tokens"), et on évite "temperature" si non supporté.
+    r = client.responses.create(
         model=LLM_MODEL,
-        messages=[
+        input=[
             {"role": "system", "content": "Tu es un moteur de décision qui ne renvoie que du JSON valide."},
             {"role": "user", "content": prompt},
         ],
+        max_output_tokens=200,
     )
-    txt = resp.choices[0].message.content.strip()
+    txt = _extract_text_from_responses(r).strip()
     try:
         data = json.loads(txt)
         if "decision" not in data:
@@ -157,7 +158,13 @@ async def send_telegram(text: str) -> None:
             pass
 
 def fmt_lvl(x: Optional[float]) -> str:
-    return "-" if x is None else f"{x:.4f}"
+    if x is None:
+        return "-"
+    # précision plus fine pour petits prix
+    try:
+        return f"{x:.8f}" if x < 1 else f"{x:.4f}"
+    except Exception:
+        return str(x)
 
 def fmt_int(x: Optional[int]) -> str:
     return "-" if x is None else str(x)
@@ -167,118 +174,71 @@ def _mask(s: Optional[str]) -> str:
         return "missing"
     return (s[:7] + "..." + s[-4:]) if len(s) > 12 else "***"
 
-# ----------------------------------
-# Routes — dashboard simple (GET "/")
-# ----------------------------------
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return """
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AI Trade Pro — Dashboard</title>
-<style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-  h1 { margin-bottom: 8px; }
-  .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 12px 0; }
-  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-  input[type=text] { padding: 8px; width: 360px; }
-  button { padding: 8px 12px; cursor: pointer; }
-  .ok { color: #0a7c2f; font-weight: 600; }
-  .err { color: #b00020; font-weight: 600; }
-  pre { background:#f7f7f7; padding:12px; border-radius:6px; overflow:auto; display:none; max-height:260px;}
-  small { color:#555; }
-</style>
-</head>
-<body>
-  <h1>AI Trade Pro — Dashboard</h1>
-  <div class="card">
-    <div class="row">
-      <label for="secret"><b>WEBHOOK_SECRET</b> :</label>
-      <input id="secret" type="text" placeholder="colle ton secret exact ici"/>
-      <button id="btnRun" onclick="runAll()">Lancer les checks</button>
-      <button id="btnTg" onclick="sendTgHealth()">Tester Telegram</button>
-    </div>
-    <small>Ce dashboard appelle /env-sanity, /openai-health et /tg-health avec le secret saisi.</small>
-  </div>
-
-  <div class="card">
-    <h3>Env sanity</h3>
-    <div>Statut : <span id="envStatus">—</span></div>
-    <pre id="envRaw"></pre>
-  </div>
-
-  <div class="card">
-    <h3>OpenAI health</h3>
-    <div>Statut : <span id="aiStatus">—</span></div>
-    <pre id="aiRaw"></pre>
-  </div>
-
-  <div class="card">
-    <h3>Telegram health</h3>
-    <div>Statut : <span id="tgStatus">—</span></div>
-    <pre id="tgRaw"></pre>
-  </div>
-
-<script>
-async function fetchJSON(url) {
-  const r = await fetch(url);
-  const txt = await r.text();
-  try { return [r.status, JSON.parse(txt)]; } catch (e) { return [r.status, {raw: txt}]; }
-}
-function setBlock(idStatus, idRaw, ok, data) {
-  const elS = document.getElementById(idStatus);
-  const elR = document.getElementById(idRaw);
-  elS.innerHTML = ok ? '<span class="ok">OK</span>' : '<span class="err">ERREUR</span>';
-  elR.style.display = 'block';
-  elR.textContent = JSON.stringify(data, null, 2);
-}
-async function runAll() {
-  const secret = document.getElementById('secret').value.trim();
-  if (!secret) { alert('Entre ton WEBHOOK_SECRET'); return; }
-  document.getElementById('btnRun').disabled = true;
-  try {
-    const base = new URL('.', window.location.href);
-    const envUrl = new URL('env-sanity?secret=' + encodeURIComponent(secret), base);
-    const aiUrl  = new URL('openai-health?secret=' + encodeURIComponent(secret), base);
-    let [st1, js1] = await fetchJSON(envUrl.href);
-    setBlock('envStatus', 'envRaw', st1 === 200, js1);
-    let [st2, js2] = await fetchJSON(aiUrl.href);
-    setBlock('aiStatus', 'aiRaw', st2 === 200 && js2.ok === true, js2);
-  } finally {
-    document.getElementById('btnRun').disabled = false;
-  }
-}
-async function sendTgHealth() {
-  const secret = document.getElementById('secret').value.trim();
-  if (!secret) { alert('Entre ton WEBHOOK_SECRET'); return; }
-  document.getElementById('btnTg').disabled = true;
-  try {
-    const base = new URL('.', window.location.href);
-    const tgUrl = new URL('tg-health?secret=' + encodeURIComponent(secret), base);
-    let [st, js] = await fetchJSON(tgUrl.href);
-    setBlock('tgStatus', 'tgRaw', st === 200 && js.ok === true, js);
-  } finally {
-    document.getElementById('btnTg').disabled = false;
-  }
-}
-</script>
-</body>
-</html>
-    """
-
-# ----------------------------------
-# Routes — API JSON
-# ----------------------------------
+# =========================
+# Routes
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    # Petit dashboard HTML
+    env_rows = [
+        ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
+        ("LLM_MODEL", LLM_MODEL),
+        ("WEBHOOK_SECRET_set", str(bool(WEBHOOK_SECRET))),
+        ("TELEGRAM_BOT_TOKEN_set", str(bool(TELEGRAM_BOT_TOKEN))),
+        ("TELEGRAM_CHAT_ID_set", str(bool(TELEGRAM_CHAT_ID))),
+        ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
+    ]
+    rows_html = "".join(
+        f"<tr><td style='padding:6px 10px;border-bottom:1px solid #eee'>{k}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #eee'><code>{v}</code></td></tr>"
+        for k,v in env_rows
+    )
+    html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>AI Trade Pro — Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.4;margin:20px;color:#111}}
+h1{{margin:0 0 10px}}
+.card{{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:14px 0}}
+.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111;margin-right:8px}}
+small{{color:#6b7280}}
+table{{border-collapse:collapse;width:100%;font-size:14px}}
+code{{background:#f9fafb;padding:2px 4px;border-radius:6px}}
+</style>
+</head>
+<body>
+  <h1>AI Trade Pro — Status</h1>
+  <div class="card">
+    <b>Environnement</b>
+    <table>{rows_html}</table>
+    <div style="margin-top:10px">
+      <a class="btn" href="/env-sanity">/env-sanity</a>
+      <a class="btn" href="/openai-health">/openai-health</a>
+      <a class="btn" href="/tg-health">/tg-health</a>
+    </div>
+    <small>Utilisez les endpoints ci-dessus (avec ?secret=... si nécessaire) pour tester.</small>
+  </div>
+  <div class="card">
+    <b>Webhooks</b>
+    <div>POST <code>/tv-webhook</code> (JSON TradingView)</div>
+    <div>POST <code>/verdict-test</code> (JSON manuel)</div>
+  </div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html, status_code=200)
+
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
-    # Sécurité simple: secret dans le JSON doit matcher l'env
+    # Sécurité simple: secret du JSON doit matcher l'env
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
@@ -287,16 +247,29 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     prompt = build_prompt(payload)
     verdict = await call_llm(prompt)
 
-    # Prépare message Telegram (sans "Close" affiché, on parle d'Entry)
+    # Prépare message Telegram (concis)
     f = payload.features or Features()
     levels = payload.levels or Levels()
     sr = f.sr or SR()
     vs = f.vectorStreak or VectorStreak()
     mtf = f.mtfSignal or MTFSignal()
 
+    entry = payload.close
+    def pct(v: Optional[float]) -> str:
+        try:
+            if v is None:
+                return "-"
+            return f"{((v/entry) - 1) * 100:.2f}%"
+        except Exception:
+            return "-"
+
+    header_emoji = "🟩" if payload.direction.upper() == "LONG" else "🟥"
+    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
+
     tg = []
-    tg.append(f"🚨 <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>")
-    tg.append(f"Direction script: <b>{payload.direction}</b> | Entry: <b>{payload.close:.4f}</b>")
+    tg.append(f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}")
+    # On masque "Close", on affiche "Entry"
+    tg.append(f"Direction script: <b>{payload.direction}</b> | Entry: <b>{fmt_lvl(entry)}</b>")
     tg.append(f"🤖 LLM: <b>{verdict.get('decision','?')}</b>  | Confiance: <b>{float(verdict.get('confidence',0)):.2f}</b>")
     tg.append(f"📝 Raison: {verdict.get('reason','-')}")
     tg.append("—")
@@ -304,9 +277,14 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     tg.append(f"R1={fmt_lvl(sr.R1)}  S1={fmt_lvl(sr.S1)}")
     tg.append(f"📊 VS 5/15/60/240/D = {fmt_int(vs.f5)}/{fmt_int(vs.f15)}/{fmt_int(vs.f60)}/{fmt_int(vs.f240)}/{fmt_int(vs.D)}")
     tg.append(f"🧭 MTF 5/15/60/240/D = {fmt_int(mtf.f5)}/{fmt_int(mtf.f15)}/{fmt_int(mtf.f60)}/{fmt_int(mtf.f240)}/{fmt_int(mtf.D)}")
-    tg.append(f"🎯 SL={fmt_lvl(levels.SL)} | TP1={fmt_lvl(levels.TP1)} | TP2={fmt_lvl(levels.TP2)} | TP3={fmt_lvl(levels.TP3)}")
+    tg.append(
+        f"🎯 SL={fmt_lvl(levels.SL)} ({pct(levels.SL)}) | "
+        f"TP1={fmt_lvl(levels.TP1)} ({pct(levels.TP1)}) | "
+        f"TP2={fmt_lvl(levels.TP2)} ({pct(levels.TP2)}) | "
+        f"TP3={fmt_lvl(levels.TP3)} ({pct(levels.TP3)})"
+    )
 
-    # Envoi Telegram si décision ≠ IGNORE et confiance >= seuil
+    # Envoi Telegram (seuil confiance)
     try:
         conf = float(verdict.get("confidence", 0))
     except Exception:
@@ -320,6 +298,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "confidence": float(verdict.get("confidence", 0)),
             "reason": verdict.get("reason", "no-reason"),
             "received": payload.model_dump(by_alias=True),
+            "sent_to_telegram": verdict.get("decision") != "IGNORE" and conf >= CONFIDENCE_MIN,
         }
     )
 
@@ -332,19 +311,16 @@ async def verdict_test(payload: Dict[str, Any]):
 
 @app.get("/openai-health")
 def openai_health(secret: Optional[str] = Query(None, description="must match WEBHOOK_SECRET")):
-    # Protégé par le même secret que le webhook
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     try:
-        r = client.chat.completions.create(
+        r = client.responses.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
+            input=[{"role": "user", "content": "ping"}],
+            max_output_tokens=5,
         )
-        return {
-            "ok": True,
-            "model": LLM_MODEL,
-            "sample": r.choices[0].message.content
-        }
+        sample = _extract_text_from_responses(r)
+        return {"ok": True, "model": LLM_MODEL, "sample": sample}
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -355,7 +331,6 @@ def openai_health(secret: Optional[str] = Query(None, description="must match WE
 def env_sanity(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    # Petit état des lieux, sans divulguer les secrets
     return {
         "OPENAI_API_KEY": _mask(OPENAI_API_KEY),
         "LLM_MODEL": LLM_MODEL,
@@ -366,11 +341,8 @@ def env_sanity(secret: Optional[str] = Query(None)):
     }
 
 @app.get("/tg-health")
-async def tg_health(secret: str = Query(None)):
+async def tg_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    try:
-        await send_telegram("✅ Test Telegram OK (tg-health)")
-        return {"ok": True, "sent": True}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+    await send_telegram("✅ Test Telegram: ça fonctionne.")
+    return {"ok": True, "info": "Message de test envoyé (si BOT + CHAT_ID configurés)."}
