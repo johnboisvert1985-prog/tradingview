@@ -141,7 +141,7 @@ Exemple de format:
 async def call_llm(prompt: str) -> Dict[str, Any]:
     """
     Version 100% Chat Completions (SDK openai ~1.43.x compatible).
-    IMPORTANT: ne pas utiliser max_tokens pour certains modèles 4o-mini.
+    IMPORTANT: ne pas utiliser temperature / max_tokens (certains modèles 4o-mini les refusent).
     """
     r = client.chat.completions.create(
         model=LLM_MODEL,
@@ -156,7 +156,7 @@ async def call_llm(prompt: str) -> Dict[str, Any]:
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.2,
+        # PAS de temperature / max_tokens ici
     )
     txt = (r.choices[0].message.content or "").strip()
 
@@ -228,7 +228,7 @@ def openai_health(secret: Optional[str] = Query(None, description="must match WE
         r = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": "ping"}],
-            temperature=0
+            # PAS de temperature ici non plus
         )
         sample = r.choices[0].message.content or "pong"
         return {"ok": True, "model": LLM_MODEL, "sample": sample}
