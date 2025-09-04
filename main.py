@@ -1,5 +1,6 @@
 import os
 import json
+from time import time
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -23,13 +24,20 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Option: ne forward sur Telegram que si confiance >= CONFIDENCE_MIN
-CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+# Filtres anti-bruit (tunable via ENV)
+CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.70"))   # seuil LLM pour envoyer Telegram
+MIN_CONFLUENCE = int(os.getenv("MIN_CONFLUENCE", "2"))        # 0..4 requis
+NEAR_SR_ATR    = float(os.getenv("NEAR_SR_ATR", "0.50"))      # veto si S/R adverse à <= k*ATR
+RR_MIN         = float(os.getenv("RR_MIN", "1.00"))           # TP1/risk >= RR_MIN
+COOLDOWN_SEC   = int(os.getenv("COOLDOWN_SEC", "900"))        # anti-spam (15 min)
 
 # Client OpenAI (lit la clé dans l'env)
 client = OpenAI()
 
 app = FastAPI(title="AI Trade Pro — LLM Bridge", version="1.0.0")
+
+# Mémoire en RAM pour anti-spam (par symbole/TF/direction)
+last_fire: Dict[str, int] = {}
 
 # ---------------------------
 # Pydantic models
@@ -82,6 +90,63 @@ class TVPayload(BaseModel):
 # ---------------------------
 # Helpers
 # ---------------------------
+def dir_to_int(direction: str) -> int:
+    d = (direction or "").upper()
+    return 1 if d == "LONG" else -1 if d == "SHORT" else 0
+
+def rr_ok(levels: Levels, direction: str, close: float, rr_min: float) -> bool:
+    if levels is None or levels.SL is None or levels.TP1 is None:
+        return False
+    risk = abs(close - levels.SL)
+    reward = abs(levels.TP1 - close)
+    if risk <= 0:
+        return False
+    return (reward / risk) >= rr_min
+
+def near_adverse_sr(f: Features, direction: str, close: float, atr: Optional[float], k: float) -> bool:
+    """Veto si proche d’un S/R défavorable à moins de k*ATR."""
+    if not f or not f.sr or atr is None or atr <= 0:
+        return False
+    if (direction or "").upper() == "LONG" and f.sr.R1 is not None:
+        return 0 <= (f.sr.R1 - close) <= k * atr
+    if (direction or "").upper() == "SHORT" and f.sr.S1 is not None:
+        return 0 <= (close - f.sr.S1) <= k * atr
+    return False
+
+def confluence_score(f: Features, direction: str) -> int:
+    """Score 0..4 : Trend aligné, ≥2 MTF alignés, VectorStreak court terme aligné, +1 si rejcount≥2."""
+    if not f:
+        return 0
+    s = 0
+    d = dir_to_int(direction)
+
+    # Trend
+    if f.trend is not None and ((f.trend > 0) == (d > 0)):
+        s += 1
+
+    # MTF alignement (compte des TF alignées parmi 15/60/240/D)
+    if f.mtfSignal:
+        align = 0
+        for val in [f.mtfSignal.f15, f.mtfSignal.f60, f.mtfSignal.f240, f.mtfSignal.D]:
+            if val is None:
+                continue
+            if (val > 0) == (d > 0):
+                align += 1
+        if align >= 2:
+            s += 1
+
+    # Vector streak (5m ou 15m)
+    if f.vectorStreak:
+        vs = f.vectorStreak
+        if any([(v is not None and (v > 0) == (d > 0)) for v in [vs.f5, vs.f15]]):
+            s += 1
+
+    # Bonus : rejcount significatif
+    if f.rejcount is not None and f.rejcount >= 2:
+        s += 1
+
+    return s
+
 def build_prompt(p: TVPayload) -> str:
     return f"""
 Tu es un moteur de décision de trading. 
@@ -167,13 +232,52 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # --- Anti-bruit & pré-filtres ---
+    key = f"{payload.symbol}:{payload.tf}:{payload.direction}"
+    now_ms = payload.time or int(time() * 1000)
+
+    f = payload.features or Features()
+    levels = payload.levels or Levels()
+
+    # Cooldown (anti-spam)
+    last_ts = last_fire.get(key, 0)
+    if COOLDOWN_SEC > 0 and (now_ms - last_ts) < COOLDOWN_SEC * 1000:
+        return JSONResponse({
+            "decision": "IGNORE", "confidence": 0.0,
+            "reason": f"cooldown {COOLDOWN_SEC}s",
+            "received": payload.model_dump(by_alias=True)
+        })
+
+    # Veto S/R adverse proche
+    if near_adverse_sr(f, payload.direction, payload.close, f.volatility_atr, NEAR_SR_ATR):
+        return JSONResponse({
+            "decision": "IGNORE", "confidence": 0.0,
+            "reason": f"near adverse S/R (≤ {NEAR_SR_ATR}×ATR)",
+            "received": payload.model_dump(by_alias=True)
+        })
+
+    # Veto RR min
+    if not rr_ok(levels, payload.direction, payload.close, RR_MIN):
+        return JSONResponse({
+            "decision": "IGNORE", "confidence": 0.0,
+            "reason": f"RR to TP1 < {RR_MIN}",
+            "received": payload.model_dump(by_alias=True)
+        })
+
+    # Confluence minimale
+    score = confluence_score(f, payload.direction)
+    if score < MIN_CONFLUENCE:
+        return JSONResponse({
+            "decision": "IGNORE", "confidence": 0.0,
+            "reason": f"low confluence ({score} < {MIN_CONFLUENCE})",
+            "received": payload.model_dump(by_alias=True)
+        })
+
     # Appel LLM
     prompt = build_prompt(payload)
     verdict = await call_llm(prompt)
 
     # Prépare message Telegram (concis)
-    f = payload.features or Features()
-    levels = payload.levels or Levels()
     sr = f.sr or SR()
     vs = f.vectorStreak or VectorStreak()
     mtf = f.mtfSignal or MTFSignal()
@@ -188,6 +292,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     tg.append(f"VS 5/15/60/240/D = {fmt_int(vs.f5)}/{fmt_int(vs.f15)}/{fmt_int(vs.f60)}/{fmt_int(vs.f240)}/{fmt_int(vs.D)}")
     tg.append(f"MTF 5/15/60/240/D = {fmt_int(mtf.f5)}/{fmt_int(mtf.f15)}/{fmt_int(mtf.f60)}/{fmt_int(mtf.f240)}/{fmt_int(mtf.D)}")
     tg.append(f"SL={fmt_lvl(levels.SL)}  TP1={fmt_lvl(levels.TP1)}  TP2={fmt_lvl(levels.TP2)}  TP3={fmt_lvl(levels.TP3)}")
+    tg.append(f"Confluence={score}  RR≥{RR_MIN}  Cooldown={COOLDOWN_SEC}s")
 
     # Envoi Telegram (option seuil de confiance)
     try:
@@ -196,6 +301,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         conf = 0.0
     if verdict.get("decision") != "IGNORE" and conf >= CONFIDENCE_MIN:
         await send_telegram("\n".join(tg))
+        last_fire[key] = now_ms  # mémorise le dernier envoi
 
     return JSONResponse(
         {
@@ -203,6 +309,12 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "confidence": float(verdict.get("confidence", 0)),
             "reason": verdict.get("reason", "no-reason"),
             "received": payload.model_dump(by_alias=True),
+            "filters": {
+                "confluence": score,
+                "rr_min": RR_MIN,
+                "near_sr_atr": NEAR_SR_ATR,
+                "cooldown_sec": COOLDOWN_SEC,
+            }
         }
     )
 
@@ -251,4 +363,41 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
         "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "CONFIDENCE_MIN": CONFIDENCE_MIN,
+        "MIN_CONFLUENCE": MIN_CONFLUENCE,
+        "NEAR_SR_ATR": NEAR_SR_ATR,
+        "RR_MIN": RR_MIN,
+        "COOLDOWN_SEC": COOLDOWN_SEC,
     }
+
+@app.get("/tg-health")
+async def tg_health(
+    secret: Optional[str] = Query(None),
+    chat_id: Optional[str] = Query(None, description="Override du chat_id pour le test"),
+    text: Optional[str] = Query("✅ Test Telegram depuis le serveur")
+):
+    # Protège l'endpoint
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    if not TELEGRAM_BOT_TOKEN:
+        return JSONResponse(status_code=500, content={"ok": False, "error": "TELEGRAM_BOT_TOKEN missing"})
+
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not target:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "TELEGRAM_CHAT_ID missing (et pas d'override chat_id)"})
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": target, "text": text, "disable_web_page_preview": True}
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        try:
+            r = await http.post(url, json=payload)
+            data = r.json()
+            if r.status_code == 200 and data.get("ok"):
+                return {"ok": True, "target": target, "telegram": data}
+            else:
+                return JSONResponse(status_code=502, content={"ok": False, "target": target, "telegram": data})
+        except httpx.HTTPError as e:
+            return JSONResponse(status_code=502, content={"ok": False, "target": target, "error": str(e)})
