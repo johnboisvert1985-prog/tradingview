@@ -39,7 +39,7 @@ class SR(BaseModel):
     S1: Optional[float] = None
 
 class VectorStreak(BaseModel):
-    # Pydantic v2: pas de nom commençant par "_". On mappe les clés numériques vers fX.
+    # Mappe les clés numériques vers des champs valides
     f5:   Optional[int] = Field(None, alias="5")
     f15:  Optional[int] = Field(None, alias="15")
     f60:  Optional[int] = Field(None, alias="60")
@@ -85,8 +85,11 @@ class TVPayload(BaseModel):
 # ---------------------------
 def build_prompt(p: TVPayload) -> str:
     return f"""
-Tu es un moteur de décision de trading. 
-Retourne UNIQUEMENT un JSON valide avec les clés: decision (BUY|SELL|IGNORE), confidence (0..1), reason (français).
+SYSTEM: Tu es un moteur de décision de trading. Tu renvoies STRICTEMENT un JSON valide.
+Le JSON doit contenir:
+- "decision": "BUY" | "SELL" | "IGNORE"
+- "confidence": nombre entre 0 et 1
+- "reason": explication courte en français
 
 Contexte:
 - Symbole: {p.symbol}
@@ -97,25 +100,36 @@ Contexte:
 - Levels: {p.levels.model_dump(by_alias=True) if p.levels else {}}
 
 Règles:
-- BUY si LONG + contexte multi-TF/volatilité/sr OK ; SELL si SHORT + contexte cohérent ; sinon IGNORE.
-- Sois strict: évite les faux signaux (IGNORE par défaut si doute).
+- BUY si LONG + contexte multi-TF/volatilité/SR cohérent ; SELL si SHORT + contexte cohérent ; sinon IGNORE.
+- IGNORE par défaut en cas de doute. Préfère la qualité à la quantité.
 - Réponse = JSON UNIQUEMENT (pas de texte avant/après).
 
 Exemple de format:
 {{"decision":"IGNORE","confidence":0.55,"reason":"MTF mitigé, volatilité élevée, S/R proche"}}
 """.strip()
 
+def parse_response_json_text(resp_obj) -> str:
+    # OpenAI Python SDK v1.43.0: Responses API a une propriété pratique output_text
+    try:
+        return resp_obj.output_text
+    except Exception:
+        # Fallback extrêmement prudent si jamais la lib change
+        # (La structure standard: resp.output[0].content[0].text)
+        try:
+            return resp_obj.output[0].content[0].text
+        except Exception:
+            return ""
+
 async def call_llm(prompt: str) -> Dict[str, Any]:
-    resp = client.chat.completions.create(
+    # Responses API (évite l'erreur "max_tokens non supporté")
+    resp = client.responses.create(
         model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": "Tu es un moteur de décision qui ne renvoie que du JSON valide."},
-            {"role": "user", "content": prompt},
-        ],
+        input=prompt,
         temperature=0.2,
-        max_tokens=200,
+        max_output_tokens=200,  # limite de sortie
+        response_format={"type": "json_object"},  # force JSON
     )
-    txt = resp.choices[0].message.content.strip()
+    txt = parse_response_json_text(resp).strip()
     try:
         data = json.loads(txt)
         if "decision" not in data:
@@ -261,13 +275,12 @@ def openai_health(secret: Optional[str] = Query(None, description="must match WE
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     try:
-        r = client.chat.completions.create(
+        r = client.responses.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
-            temperature=0
+            input="Dis juste un mot: ping",
+            max_output_tokens=5,
         )
-        return {"ok": True, "model": LLM_MODEL, "sample": r.choices[0].message.content}
+        return {"ok": True, "model": LLM_MODEL, "sample": parse_response_json_text(r) or "pong"}
     except Exception as e:
         return JSONResponse(
             status_code=500,
