@@ -2,7 +2,7 @@ import os
 import json
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
@@ -39,7 +39,6 @@ class SR(BaseModel):
     S1: Optional[float] = None
 
 class VectorStreak(BaseModel):
-    # Pydantic v2: pas de nom commençant par "_"
     f5:   Optional[int] = Field(None, alias="5")
     f15:  Optional[int] = Field(None, alias="15")
     f60:  Optional[int] = Field(None, alias="60")
@@ -149,6 +148,11 @@ def fmt_lvl(x: Optional[float]) -> str:
 def fmt_int(x: Optional[int]) -> str:
     return "-" if x is None else str(x)
 
+def _mask(s: Optional[str]) -> str:
+    if not s:
+        return "missing"
+    return (s[:7] + "..." + s[-4:]) if len(s) > 12 else "***"
+
 # ---------------------------
 # Routes
 # ---------------------------
@@ -162,12 +166,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
-
-    # (Exemples de hard-rules en amont si tu veux)
-    # f = payload.features or Features()
-    # levels = payload.levels or Levels()
-    # if not levels.SL or not levels.TP1:
-    #     return JSONResponse({"decision":"IGNORE","confidence":0.0,"reason":"levels incomplets","received":payload.model_dump(by_alias=True)})
 
     # Appel LLM
     prompt = build_prompt(payload)
@@ -214,60 +212,6 @@ async def verdict_test(payload: Dict[str, Any]):
     prompt = build_prompt(dummy)
     verdict = await call_llm(prompt)
     return verdict
-from fastapi import Query
-
-def _mask(s: Optional[str]) -> str:
-    if not s:
-        return "missing"
-    return (s[:7] + "..." + s[-4:]) if len(s) > 12 else "***"
-
-@app.get("/openai-health")
-def openai_health(secret: Optional[str] = Query(None, description="must match WEBHOOK_SECRET")):
-    # Protège l’endpoint avec le même secret que le webhook
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-
-    try:
-        r = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
-            temperature=0
-        )
-        return {
-            "ok": True,
-            "model": LLM_MODEL,
-            "sample": r.choices[0].message.content
-        }
-    except Exception as e:
-        # N’expose pas la clé, juste un masque utile au debug
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": False,
-                "error": str(e),
-                "openai_key_mask": _mask(OPENAI_API_KEY)
-            }
-        )
-
-@app.get("/env-sanity")
-def env_sanity(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    # Petit état des lieux, sans divulguer les secrets
-    return {
-        "OPENAI_API_KEY": _mask(OPENAI_API_KEY),
-        "LLM_MODEL": LLM_MODEL,
-        "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
-        "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
-        "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
-    }
-from fastapi import Query  # <-- ajoute cet import si absent
-
-def _mask(s: Optional[str]) -> str:
-    if not s:
-        return "missing"
-    return (s[:7] + "..." + s[-4:]) if len(s) > 12 else "***"
 
 @app.get("/openai-health")
 def openai_health(secret: Optional[str] = Query(None, description="must match WEBHOOK_SECRET")):
@@ -293,7 +237,7 @@ def openai_health(secret: Optional[str] = Query(None, description="must match WE
             content={
                 "ok": False,
                 "error": str(e),
-                "openai_key_mask": _mask(OPENAI_API_KEY),
+                "openai_key_mask": _mask(OPENAI_API_KEY)
             }
         )
 
@@ -308,5 +252,3 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
     }
-
-
