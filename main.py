@@ -1,3 +1,22 @@
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return JSONResponse({"ok": True, "service": "tv-webhook", "endpoints": ["/health", "POST /tv-webhook"]})
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
+
+@app.post("/tv-webhook")
+async def tv_webhook(req: Request):
+    data = await req.json()
+    # ... ton traitement actuel ...
+    return JSONResponse({"received": True, "kind": data.get("type")})
+
 # --- à ajouter en haut du fichier avec le reste ---
 from fastapi.responses import JSONResponse
 
@@ -414,6 +433,7 @@ async def tv_webhook(payload: TVPayload):
         send_to_telegram(msg)
 
     return {"ok": True}
+
 
 
 
