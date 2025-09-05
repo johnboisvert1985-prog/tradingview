@@ -1,18 +1,17 @@
 # main.py
 import os
-from typing import Optional, Union, Dict, Any
 import json
+from typing import Optional, Union, Dict, Any, List
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Header
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-# === LLM (OpenAI) ===
+# ============== LLM (OpenAI) ==============
 LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
 try:
     if LLM_ENABLED and OPENAI_API_KEY:
         from openai import OpenAI
@@ -23,27 +22,26 @@ except Exception:
     _openai_client = None
     LLM_ENABLED = False
 
-# =========================
-# ENV (Webhook & Telegram)
-# =========================
+# ============== ENV (Webhook & Telegram) ==============
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
+CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))
 
-CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+# ============== APP ==============
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.1.0")
 
-# =========================
-# APP
-# =========================
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.0.1")
+# ============== IN-MEMORY STORE ==============
+# Remarque: en free tier Render, ça se réinitialise si l’instance redémarre.
+TRADES: List[Dict[str, Any]] = []
+MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 
-# =========================
-# MODELS
-# =========================
+# ============== MODELS ==============
 Number = Optional[Union[float, int, str]]
 
 class TVPayload(BaseModel):
+    # On tolère "type" ou "tag"
     type: Optional[str] = None
     tag:  Optional[str] = None
     symbol: str
@@ -60,6 +58,7 @@ class TVPayload(BaseModel):
     s1: Number = None
     trade_id: Optional[str] = None
     secret: Optional[str] = None
+    # Terminaison + LLM facultatifs
     term_reason: Optional[str] = None
     decision: Optional[str] = None
     confidence: Optional[float] = None
@@ -68,9 +67,7 @@ class TVPayload(BaseModel):
     class Config:
         extra = "allow"
 
-# =========================
-# HELPERS
-# =========================
+# ============== HELPERS ==============
 def _mask(val: Optional[str]) -> str:
     if not val:
         return "missing"
@@ -89,12 +86,7 @@ async def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
@@ -103,9 +95,7 @@ async def send_telegram(text: str) -> None:
         except httpx.HTTPError:
             pass
 
-# =========================
-# LLM
-# =========================
+# ============== LLM ==============
 def _build_llm_prompt(p: TVPayload) -> str:
     body = {
         "symbol": p.symbol,
@@ -143,7 +133,6 @@ def _safe_json_parse(txt: str) -> Dict[str, Any]:
 async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     if not (LLM_ENABLED and _openai_client):
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
-
     prompt = _build_llm_prompt(p)
     try:
         r = _openai_client.responses.create(
@@ -157,10 +146,9 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
         txt = getattr(r, "output_text", None)
         if not txt:
             try:
-                txt = r.output[0].content[0].text  # type: ignore[attr-defined]
+                txt = r.output[0].content[0].text  # type: ignore
             except Exception:
                 txt = str(r)
-
         data = _safe_json_parse((txt or "").strip())
         decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
         confidence = float(data.get("confidence", 0.0)) if isinstance(data.get("confidence"), (int, float, str)) else None
@@ -178,9 +166,32 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     except Exception as e:
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False, "error": str(e)}
 
-# =========================
-# ROUTES — STATUS
-# =========================
+# ============== RECORDING (Dashboard) ==============
+def _push_trade(row: Dict[str, Any]) -> None:
+    TRADES.append(row)
+    if len(TRADES) > MAX_TRADES:
+        del TRADES[: len(TRADES) - MAX_TRADES]
+
+def _basic_stats() -> Dict[str, Any]:
+    entries = [t for t in TRADES if t.get("event") == "ENTRY"]
+    tp_hits = [t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")]
+    sl_hits = [t for t in TRADES if t.get("event") == "SL_HIT"]
+    # Winrate approximatif: on compte TP1_HIT comme win, SL_HIT comme loss (simple)
+    wins = len([t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")])
+    losses = len(sl_hits)
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+    return {
+        "entries": len(entries),
+        "tp_hits": len(tp_hits),
+        "sl_hits": len(sl_hits),
+        "wins": wins,
+        "losses": losses,
+        "winrate_pct": round(winrate, 2),
+        "events_total": len(TRADES),
+    }
+
+# ============== ROUTES — STATUS ==============
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -226,6 +237,7 @@ def home():
       <a class="btn" href="/env-sanity">/env-sanity</a>
       <a class="btn" href="/tg-health">/tg-health</a>
       <a class="btn" href="/openai-health">/openai-health</a>
+      <a class="btn" href="/trades">/trades</a>
     </div>
   </div>
   <div class="card">
@@ -274,28 +286,133 @@ def openai_health(secret: Optional[str] = Query(None)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
-# =========================
-# ROUTE — WEBHOOK
-# =========================
+@app.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
+
+# ============== ROUTE — TRADES DASHBOARD ==============
+@app.get("/trades")
+def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(None)):
+    if format == "json":
+        return {"stats": _basic_stats(), "trades": TRADES}
+
+    stats = _basic_stats()
+    rows = []
+    for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
+        conf = t.get("confidence")
+        conf_txt = "-" if conf is None else f"{float(conf)*100:.0f}%"
+        rsn = t.get("reason") or "-"
+        price_line = ""
+        if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
+            price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('hit_price'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
+        line = f"""
+<tr>
+  <td style="padding:6px;border-bottom:1px solid #eee">{t.get('time')}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee"><code>{t.get('event')}</code></td>
+  <td style="padding:6px;border-bottom:1px solid #eee">{t.get('symbol')}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee">{t.get('tf')}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee">{t.get('side','-')}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee">{_fmt_num(t.get('entry'))}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee">{t.get('trade_id','-')}</td>
+  <td style="padding:6px;border-bottom:1px solid #eee">
+    <div>SL: <b>{_fmt_num(t.get('sl'))}</b> | TP1: <b>{_fmt_num(t.get('tp1'))}</b> | TP2: <b>{_fmt_num(t.get('tp2'))}</b> | TP3: <b>{_fmt_num(t.get('tp3'))}</b></div>
+    <div>R1: <b>{_fmt_num(t.get('r1'))}</b> • S1: <b>{_fmt_num(t.get('s1'))}</b></div>
+    {price_line}
+    <div>LLM: <b>{t.get('decision','-')}</b> • Confiance: <b>{conf_txt}</b></div>
+    <div>Raison: {rsn}</div>
+  </td>
+</tr>
+"""
+        rows.append(line)
+
+    clear_btn = ""
+    if WEBHOOK_SECRET:
+        clear_btn = f'<a class="btn" href="/trades/clear?secret={WEBHOOK_SECRET}">Vider l’historique</a>'
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Trades — AI Trader PRO</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.5;margin:20px;color:#111}}
+.card{{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:14px 0}}
+.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111;margin-right:8px}}
+table{{border-collapse:collapse;width:100%;font-size:14px}}
+code{{background:#f9fafb;padding:2px 4px;border-radius:6px}}
+th,td{{vertical-align:top}}
+</style>
+</head>
+<body>
+  <h1>Trades — AI Trader PRO</h1>
+
+  <div class="card">
+    <b>Stats</b>
+    <div>Entrées: <b>{stats['entries']}</b> • TP hits: <b>{stats['tp_hits']}</b> • SL hits: <b>{stats['sl_hits']}</b></div>
+    <div>Wins: <b>{stats['wins']}</b> • Losses: <b>{stats['losses']}</b> • Winrate: <b>{stats['winrate_pct']}%</b></div>
+    <div>Événements total: <b>{stats['events_total']}</b></div>
+    <div style="margin-top:8px">
+      <a class="btn" href="/trades?format=json">JSON</a>
+      <a class="btn" href="/">Status</a>
+      {clear_btn}
+    </div>
+  </div>
+
+  <div class="card">
+    <b>Derniers événements</b>
+    <table>
+      <thead>
+        <tr>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Time</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Event</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Symbol</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">TF</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Side</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Entry</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Trade ID</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Details</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows) if rows else '<tr><td colspan="8" style="padding:10px">Aucun évènement encore.</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html, status_code=200)
+
+@app.get("/trades/clear")
+def trades_clear(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    TRADES.clear()
+    return {"ok": True, "cleared": True}
+
+# ============== ROUTE — WEBHOOK ==============
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
+    # Secret check
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
     t = (payload.type or payload.tag or "").upper()
+    header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
+    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
-    # ENTRY → appel LLM si pas déjà fourni
+    # LLM pour ENTRY si manquant
     llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason}
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
-    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
-
+    # -------- Telegram + enregistrement --------
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
-        conf_val = llm_out.get("confidence", None)
+        conf_val = llm_out.get("confidence")
         conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
         rsn = llm_out.get("reason") or "-"
 
@@ -311,6 +428,19 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"📝 Raison: {rsn}"
         )
         await send_telegram(msg)
+
+        _push_trade({
+            "event": "ENTRY",
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "").upper(),
+            "entry": payload.entry,
+            "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
+            "r1": payload.r1, "s1": payload.s1,
+            "trade_id": payload.trade_id,
+            "decision": dec, "confidence": conf_val, "reason": rsn,
+        })
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
         nice = {
@@ -338,6 +468,18 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         )
         await send_telegram(msg)
 
+        _push_trade({
+            "event": t,
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "").upper() if payload.side else None,
+            "entry": hit_price,
+            "target_price": target_price,
+            "trade_id": payload.trade_id,
+            "decision": None, "confidence": None, "reason": None,
+        })
+
     elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
@@ -355,20 +497,31 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         )
         await send_telegram(msg)
 
+        _push_trade({
+            "event": "TRADE_TERMINATED",
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "").upper() if payload.side else None,
+            "entry": payload.entry,
+            "trade_id": payload.trade_id,
+            "term_reason": reason,
+            "decision": None, "confidence": None, "reason": None,
+        })
+
     else:
         print("[tv-webhook] type non géré:", t)
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "event": t,
-            "received": payload.dict(),
-            "llm": {
-                "enabled": bool(LLM_ENABLED and _openai_client),
-                "decision": llm_out.get("decision"),
-                "confidence": llm_out.get("confidence"),
-                "reason": llm_out.get("reason"),
-            },
-            "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-        }
-    )
+    return JSONResponse({
+        "ok": True,
+        "event": t,
+        "received": payload.dict(),
+        "llm": {
+            "enabled": bool(LLM_ENABLED and _openai_client),
+            "decision": llm_out.get("decision"),
+            "confidence": llm_out.get("confidence"),
+            "reason": llm_out.get("reason"),
+        },
+        "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "stats": _basic_stats(),
+    })
