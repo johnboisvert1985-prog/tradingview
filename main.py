@@ -13,7 +13,10 @@ LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
-# Essaye d'utiliser le SDK; sinon on passera en fallback HTTP
+# Si le LLM ne renvoie pas de confidence, on utilisera cette valeur par défaut (0..1)
+DEFAULT_CONFIDENCE = float(os.getenv("DEFAULT_CONFIDENCE", "0.50"))
+
+# Essaye d'utiliser le SDK; sinon fallback HTTP
 _openai_client = None
 if LLM_ENABLED and OPENAI_API_KEY:
     try:
@@ -30,7 +33,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.2.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.3.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -177,25 +180,29 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
     prompt = _build_llm_prompt(p)
     try:
-        # priorité SDK, sinon HTTP
         data = await _call_llm_via_sdk(prompt) if _openai_client else await _call_llm_via_http(prompt)
     except Exception:
         try:
             data = await _call_llm_via_http(prompt)
         except Exception as e:
-            return {"decision": None, "confidence": None, "reason": f"llm-error: {e}", "llm_used": False}
+            # Pas de LLM => pas de blocage, mais on fournit une raison
+            return {"decision": "IGNORE", "confidence": DEFAULT_CONFIDENCE, "reason": f"llm-error: {e}", "llm_used": False}
 
     decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
     confidence = data.get("confidence", None)
     reason = str(data.get("reason")) if data.get("reason") is not None else None
 
+    # Normalisations
     if decision not in ("BUY", "SELL", "IGNORE"):
         decision = "IGNORE"
-    if confidence is not None:
-        try:
-            confidence = max(0.0, min(1.0, float(confidence)))
-        except Exception:
-            confidence = None
+
+    # Si le LLM oublie confidence -> on applique DEFAULT_CONFIDENCE
+    try:
+        confidence = float(confidence) if confidence is not None else DEFAULT_CONFIDENCE
+    except Exception:
+        confidence = DEFAULT_CONFIDENCE
+    # Bornage 0..1
+    confidence = max(0.0, min(1.0, float(confidence)))
 
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
@@ -239,6 +246,7 @@ def home():
         ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and OPENAI_API_KEY) else "-"),
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
         ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
+        ("DEFAULT_CONFIDENCE", str(DEFAULT_CONFIDENCE)),
         ("PORT", str(PORT)),
     ]
     rows_html = "".join(
@@ -293,6 +301,7 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "LLM_CLIENT": "sdk" if _openai_client else ("http" if (LLM_ENABLED and OPENAI_API_KEY) else None),
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and OPENAI_API_KEY) else None,
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
+        "DEFAULT_CONFIDENCE": DEFAULT_CONFIDENCE,
         "PORT": PORT,
     }
 
@@ -310,7 +319,6 @@ async def openai_health(secret: Optional[str] = Query(None)):
     if not (LLM_ENABLED and OPENAI_API_KEY):
         return {"ok": False, "enabled": False, "why": "LLM off or API key missing"}
     try:
-        # ping via HTTP (plus universel)
         data = await _call_llm_via_http('{"ping":"pong"}')
         return {"ok": True, "model": LLM_MODEL, "sample": data}
     except Exception as e:
@@ -369,7 +377,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 <style>
 body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.5;margin:20px;color:#111}}
 .card{{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:14px 0}}
-.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111;margin-right:8px}}
+.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111}}
 table{{border-collapse:collapse;width:100%;font-size:14px}}
 code{{background:#f9fafb;padding:2px 4px;border-radius:6px}}
 th,td{{vertical-align:top}}
@@ -447,7 +455,8 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
         conf_val = llm_out.get("confidence")
-        conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
+        # conf_val ne sera jamais None maintenant (DEFAULT_CONFIDENCE sinon)
+        conf_pct = f"{float(conf_val)*100:.0f}%" if conf_val is not None else "—"
         rsn = llm_out.get("reason") or "-"
 
         msg = (
