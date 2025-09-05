@@ -5,8 +5,7 @@ from typing import Optional, Union, Dict, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Header, Request
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 
 # =========================
 # ENV
@@ -14,60 +13,18 @@ from pydantic import BaseModel
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # ex: nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 PORT = int(os.getenv("PORT", "8000"))
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="AI Trader PRO - Webhook", version="2.0.0")
-
-# =========================
-# MODELS
-# =========================
-Number = Optional[Union[float, int, str]]
-
-class TVPayload(BaseModel):
-    """
-    Modèle aligné avec l’indicateur Pine:
-    {
-      "type": "ENTRY" | "TP1_HIT" | "TP2_HIT" | "TP3_HIT" | "SL_HIT" | "TRADE_TERMINATED",
-      "symbol": "BTCUSDT",
-      "tf": "15",
-      "time": 1717777777,
-      "side": "LONG" | "SHORT",         # seulement pour ENTRY
-      "entry": 67000.12,                # prix d'insert (ENTRY) ou dernier prix (events)
-      "sl": 64000.0,
-      "tp1": 68000.0,
-      "tp2": 69000.0,
-      "tp3": 70000.0,
-      "r1": 70500.0,
-      "s1": 66500.0,
-      "secret": "....",
-      "trade_id": "abc-123"
-    }
-    """
-    type: str
-    symbol: str
-    tf: str
-    time: int
-    side: Optional[str] = None
-    entry: Number = None
-    sl: Number = None
-    tp1: Number = None
-    tp2: Number = None
-    tp3: Number = None
-    r1: Number = None
-    s1: Number = None
-    secret: Optional[str] = None
-    trade_id: Optional[str] = None
-
-    class Config:
-        extra = "allow"  # tolère des champs en plus au cas où
+app = FastAPI(title="AI Trader PRO - Webhook", version="2.1.0")
 
 # =========================
 # HELPERS
 # =========================
+Number = Optional[Union[float, int, str]]
+
 def _mask(val: Optional[str]) -> str:
     if not val:
         return "missing"
@@ -99,8 +56,86 @@ async def send_telegram(text: str) -> None:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
-            # on ne casse pas le webhook si Telegram échoue
+            # ne casse pas le webhook si Telegram échoue
             pass
+
+def normalize_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accepte les 2 schémas :
+    - Pine 'nouveau' : {"tag":"ENTRY","symbol","tf","time","close","direction","levels":{SL,TP1,TP2,TP3}, "trade_id","secret"}
+    - Schéma 'plat'  : {"type":"ENTRY","symbol","tf","time","side","entry","sl","tp1","tp2","tp3","r1","s1","trade_id","secret"}
+    Retourne un dict normalisé :
+    {
+      type, symbol, tf, time, side, entry, sl, tp1, tp2, tp3, r1, s1, trade_id, secret
+    }
+    """
+    # type / tag
+    t = (d.get("type") or d.get("tag") or "").upper()
+
+    # symbol / ticker
+    symbol = d.get("symbol") or d.get("ticker") or ""
+
+    # tf
+    tf = str(d.get("tf") or d.get("timeframe") or "")
+
+    # time (int)
+    _time = d.get("time")
+    try:
+        time_int = int(float(_time)) if _time is not None else 0
+    except Exception:
+        time_int = 0
+
+    # side / direction
+    side = (d.get("side") or d.get("direction") or "").upper()
+
+    # entry / close
+    entry = d.get("entry")
+    if entry is None:
+        entry = d.get("close")
+
+    # niveaux : à plat OU dans levels.{}
+    levels = d.get("levels") or {}
+    def pick(*keys):
+        for k in keys:
+            if k in d and d.get(k) is not None:
+                return d.get(k)
+        return None
+
+    sl  = pick("sl")
+    tp1 = pick("tp1")
+    tp2 = pick("tp2")
+    tp3 = pick("tp3")
+    r1  = pick("r1")
+    s1  = pick("s1")
+
+    # fallback depuis levels{}
+    if sl  is None: sl  = levels.get("SL")
+    if tp1 is None: tp1 = levels.get("TP1")
+    if tp2 is None: tp2 = levels.get("TP2")
+    if tp3 is None: tp3 = levels.get("TP3")
+    if r1  is None: r1  = levels.get("R1")
+    if s1  is None: s1  = levels.get("S1")
+
+    trade_id = d.get("trade_id") or d.get("tradeId") or None
+    secret   = d.get("secret") or None
+
+    return {
+        "type": t,
+        "symbol": symbol,
+        "tf": tf,
+        "time": time_int,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "r1": r1,
+        "s1": s1,
+        "trade_id": trade_id,
+        "secret": secret,
+        "raw": d,  # pour debug/retour
+    }
 
 # =========================
 # ROUTES — STATUS
@@ -108,6 +143,11 @@ async def send_telegram(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# Évite le 404 favicon dans les logs
+@app.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -177,34 +217,38 @@ async def tg_health(secret: Optional[str] = Query(None)):
 # ROUTE — WEBHOOK
 # =========================
 @app.post("/tv-webhook")
-async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
-    # 1) Sécurité: secret
+async def tv_webhook(req: Request, x_render_signature: Optional[str] = Header(None)):
+    # 1) JSON brut
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # 2) Normalisation (accepte tag/close/direction/levels ou type/entry/side/…)
+    norm = normalize_payload(data)
+
+    # 3) Sécurité: secret
     if WEBHOOK_SECRET:
-        if not payload.secret or payload.secret != WEBHOOK_SECRET:
+        if not norm["secret"] or norm["secret"] != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # 2) Log simple
-    print("[tv-webhook] payload:", payload.dict())
+    # 4) Log
+    print("[tv-webhook] normalized:", {k: v for k, v in norm.items() if k != "raw"})
 
-    # 3) Compose message Telegram
-    #   - ENTRY => message complet avec niveaux
-    #   - TP*/SL_HIT => évènement
-    #   - TRADE_TERMINATED => message de clôture
-    t = payload.type.upper()
-
-    # Petit header visuel
-    header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
-    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
+    # 5) Message Telegram
+    t = norm["type"]
+    header_emoji = "🟩" if norm["side"] == "LONG" else ("🟥" if norm["side"] == "SHORT" else "▫️")
+    trade_id_txt = f" • ID: <code>{norm['trade_id']}</code>" if norm["trade_id"] else ""
 
     if t == "ENTRY":
         msg = (
-            f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
-            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
-            f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
-            f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>"
+            f"{header_emoji} <b>ALERTE</b> • <b>{norm['symbol']}</b> • <b>{norm['tf']}</b>{trade_id_txt}\n"
+            f"Direction: <b>{(norm['side'] or '—')}</b> | Entry: <b>{_fmt_num(norm['entry'])}</b>\n"
+            f"🎯 SL: <b>{_fmt_num(norm['sl'])}</b> | "
+            f"TP1: <b>{_fmt_num(norm['tp1'])}</b> | "
+            f"TP2: <b>{_fmt_num(norm['tp2'])}</b> | "
+            f"TP3: <b>{_fmt_num(norm['tp3'])}</b>\n"
+            f"R1: <b>{_fmt_num(norm['r1'])}</b>  •  S1: <b>{_fmt_num(norm['s1'])}</b>"
         )
         await send_telegram(msg)
 
@@ -216,16 +260,15 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "SL_HIT":  "✖️ SL touché",
         }.get(t, t)
         msg = (
-            f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Prix: <b>{_fmt_num(payload.entry)}</b>"
+            f"{nice} • <b>{norm['symbol']}</b> • <b>{norm['tf']}</b>{trade_id_txt}\n"
+            f"Prix: <b>{_fmt_num(norm['entry'])}</b>"
         )
         await send_telegram(msg)
 
     elif t == "TRADE_TERMINATED":
-        # message demandé: "TRADE TERMINER VEUILLEZ FERMER ..."
         msg = (
             f"⏹ <b>TRADE TERMINÉ — VEUILLEZ FERMER</b>\n"
-            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
+            f"Instrument: <b>{norm['symbol']}</b> • TF: <b>{norm['tf']}</b>{trade_id_txt}"
         )
         await send_telegram(msg)
 
@@ -233,11 +276,12 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         # Type inconnu -> on ne bloque pas, on log seulement
         print("[tv-webhook] type non géré:", t)
 
-    # 4) Réponse API
+    # 6) Réponse API
     return JSONResponse(
         {
             "ok": True,
-            "received": payload.dict(),
+            "normalized": {k: v for k, v in norm.items() if k != "raw"},
+            "received_raw": norm["raw"],
             "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         }
     )
