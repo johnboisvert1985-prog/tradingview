@@ -31,13 +31,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
 
-# Seuil d'affichage facultatif (si tu veux filtrer les messages envoyés au Telegram)
 CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.0.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.0.1")
 
 # =========================
 # MODELS
@@ -45,32 +44,23 @@ app = FastAPI(title="AI Trader PRO - Webhook", version="3.0.0")
 Number = Optional[Union[float, int, str]]
 
 class TVPayload(BaseModel):
-    # Évènements possibles
     type: Optional[str] = None
     tag:  Optional[str] = None
-
-    # Contexte trade
     symbol: str
     tf: str
     time: int
     side: Optional[str] = None
-
-    # Prix & niveaux
-    entry: Number = None        # prix touché / prix d'entrée selon l’évènement
-    tp: Number = None           # niveau cible envoyé lors des TPx_HIT
+    entry: Number = None
+    tp: Number = None
     sl: Number = None
     tp1: Number = None
     tp2: Number = None
     tp3: Number = None
     r1: Number = None
     s1: Number = None
-
-    # Admin
     trade_id: Optional[str] = None
     secret: Optional[str] = None
-    term_reason: Optional[str] = None  # pour TRADE_TERMINATED
-
-    # Champs LLM (si jamais fournis par ailleurs)
+    term_reason: Optional[str] = None
     decision: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
@@ -96,7 +86,6 @@ def _fmt_num(x: Number) -> str:
         return str(x)
 
 async def send_telegram(text: str) -> None:
-    """Envoie un message Telegram si BOT + CHAT_ID configurés (non bloquant)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -112,14 +101,12 @@ async def send_telegram(text: str) -> None:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
-            # Ne bloque pas le webhook si Telegram échoue
             pass
 
 # =========================
-# LLM: prompt & appel
+# LLM
 # =========================
 def _build_llm_prompt(p: TVPayload) -> str:
-    # On construit un prompt simple, robuste, en français
     body = {
         "symbol": p.symbol,
         "tf": p.tf,
@@ -134,17 +121,16 @@ def _build_llm_prompt(p: TVPayload) -> str:
         '  {"decision": "BUY|SELL|IGNORE", "confidence": 0..1, "reason": "français"}\n\n'
         f"Contexte JSON:\n{json.dumps(body, ensure_ascii=False)}\n\n"
         "Règles:\n"
-        "- BUY si direction_raw == LONG et le contexte (SR, niveaux, cohérence) est favorable.\n"
+        "- BUY si direction_raw == LONG et le contexte est favorable.\n"
         "- SELL si direction_raw == SHORT et le contexte est favorable.\n"
-        "- Sinon IGNORE (doute, données incomplètes, incohérence, proximité SR défavorable, etc.).\n"
-        "- Sois concis dans 'reason'. Réponse = JSON UNIQUEMENT."
+        "- Sinon IGNORE.\n"
+        "- Réponse = JSON UNIQUEMENT."
     )
 
 def _safe_json_parse(txt: str) -> Dict[str, Any]:
     try:
         return json.loads(txt)
     except Exception:
-        # tente d'extraire un bloc JSON
         start = txt.find("{")
         end = txt.rfind("}")
         if 0 <= start < end:
@@ -155,7 +141,6 @@ def _safe_json_parse(txt: str) -> Dict[str, Any]:
     return {}
 
 async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
-    """Appelle le LLM pour un évènement ENTRY. Retourne {decision, confidence, reason} (défauts si indisponible)."""
     if not (LLM_ENABLED and _openai_client):
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
 
@@ -169,10 +154,8 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
             ],
             max_output_tokens=200,
         )
-        # Essaye de lire le texte de sortie
         txt = getattr(r, "output_text", None)
         if not txt:
-            # fallback anciens champs possibles
             try:
                 txt = r.output[0].content[0].text  # type: ignore[attr-defined]
             except Exception:
@@ -183,7 +166,6 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
         confidence = float(data.get("confidence", 0.0)) if isinstance(data.get("confidence"), (int, float, str)) else None
         reason = str(data.get("reason")) if data.get("reason") is not None else None
 
-        # Normalisations & garde-fous
         if decision not in ("BUY", "SELL", "IGNORE"):
             decision = "IGNORE"
         if confidence is not None:
@@ -297,32 +279,25 @@ def openai_health(secret: Optional[str] = Query(None)):
 # =========================
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
-    # 1) Secret
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # 2) Type d’évènement
     t = (payload.type or payload.tag or "").upper()
 
-    # 3) Si ENTRY => on appelle le LLM (sauf si déjà fourni)
+    # ENTRY → appel LLM si pas déjà fourni
     llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason}
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # 4) Compose & envoie Telegram
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
     trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
     if t == "ENTRY":
-        # Ligne LLM
-        llm_lines = ""
         dec = (llm_out.get("decision") or "—")
         conf_val = llm_out.get("confidence", None)
-        conf = "—" if conf_val is None else f"{float(conf_val):.2f}"
+        conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
         rsn = llm_out.get("reason") or "-"
-
-        llm_lines = f"\n🤖 LLM: <b>{dec}</b>  | Confiance: <b>{conf}</b>\n📝 Raison: {rsn}"
 
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -331,15 +306,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
             f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
             f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>"
-            f"{llm_lines}"
+            f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>\n"
+            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b>\n"
+            f"📝 Raison: {rsn}"
         )
-
-        # envoi — si tu veux filtrer par confiance, décommente ci-dessous:
-        # if (llm_out.get("decision") or "").upper() != "IGNORE" and (conf_val or 0) >= CONFIDENCE_MIN:
-        #     await send_telegram(msg)
-        # else:
-        #     pass
         await send_telegram(msg)
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
@@ -350,10 +320,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "SL_HIT":  "✖️ SL touché",
         }.get(t, t)
 
-        # Prix touché (TradingView -> entry), fallback 'close' si jamais
         hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
-
-        # Cible exacte (tp/sl)
         target_price = payload.tp
         if target_price is None:
             if t == "TP1_HIT":
@@ -391,7 +358,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
-    # 5) Réponse API
     return JSONResponse(
         {
             "ok": True,
