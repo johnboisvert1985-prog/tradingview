@@ -1,13 +1,13 @@
 # main.py
 import os
 import json
-from typing import Optional, Union, Dict, Any, List
-from collections import deque
+import time
+from typing import Optional, Union, Dict, Any, List, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # =========================
 # ENV
@@ -20,23 +20,24 @@ PORT = int(os.getenv("PORT", "8000"))
 # =========================
 # APP
 # =========================
-app = FastAPI(title="AI Trader PRO - Webhook", version="2.1.0")
+app = FastAPI(title="AI Trader PRO - Webhook + Dashboard", version="2.2.0")
 
 # =========================
 # MODELS
 # =========================
 Number = Optional[Union[float, int, str]]
+EventType = Literal["ENTRY", "TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "TRADE_TERMINATED"]
 
 class TVPayload(BaseModel):
     """
-    Aligné avec ton indicateur (version simple) :
+    JSON attendu depuis TradingView (aligné à ton indicateur):
     {
       "type": "ENTRY" | "TP1_HIT" | "TP2_HIT" | "TP3_HIT" | "SL_HIT" | "TRADE_TERMINATED",
       "symbol": "BTCUSDT",
       "tf": "15",
       "time": 1717777777,
-      "side": "LONG" | "SHORT",           # pour ENTRY
-      "entry": 67000.12,                  # prix (ENTRY ou event)
+      "side": "LONG" | "SHORT",         # seulement pour ENTRY
+      "entry": 67000.12,                # prix d'insert (ENTRY) ou dernier prix (events)
       "sl": 64000.0,
       "tp1": 68000.0,
       "tp2": 69000.0,
@@ -47,7 +48,7 @@ class TVPayload(BaseModel):
       "trade_id": "abc-123"
     }
     """
-    type: str
+    type: EventType
     symbol: str
     tf: str
     time: int
@@ -63,175 +64,122 @@ class TVPayload(BaseModel):
     trade_id: Optional[str] = None
 
     class Config:
-        extra = "allow"  # tolère des champs en plus
+        extra = "allow"  # tolère des champs supplémentaires
+
 
 # =========================
-# STORAGE (in-memory)
+# IN-MEMORY STORE (volatile)
 # =========================
-MAX_EVENTS = 5000
-EVENTS: deque = deque(maxlen=MAX_EVENTS)      # journal brut des évènements
-TRADES: Dict[str, Dict[str, Any]] = {}        # trade_id -> état du trade
+# Render a un système de fichiers éphémère : on garde en mémoire pendant le runtime.
+# Structure :
+# TRADES: { trade_id: { ...infos d'entrée..., status, timestamps hits, events[] } }
+TRADES: Dict[str, Dict[str, Any]] = {}
+EVENTS: List[Dict[str, Any]] = []  # historique brut des évènements pour debug/stats
 
-def _safe_float(x: Number) -> Optional[float]:
-    try:
-        return float(x) if x is not None else None
-    except Exception:
-        return None
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
-def _get_tid(p: TVPayload) -> str:
-    # Toujours avoir un ID exploitable
-    return p.trade_id or f"{p.symbol}-{p.tf}-{p.time}"
+def _ensure_trade_id(p: TVPayload) -> str:
+    if p.trade_id:
+        return p.trade_id
+    # fallback si l’indicateur n’envoie pas de trade_id
+    # unique-ish: SYMBOL-TF-UNIX
+    return f"{p.symbol}-{p.tf}-{p.time}"
 
-def _risk_multiple(side: Optional[str], entry: Optional[float], sl: Optional[float], exit_price: Optional[float]) -> Optional[float]:
-    if side is None or entry is None or sl is None or exit_price is None:
-        return None
-    side = side.upper()
-    if side == "LONG":
-        risk = entry - sl
-        if risk <= 0:
-            return None
-        return (exit_price - entry) / risk
-    elif side == "SHORT":
-        risk = sl - entry
-        if risk <= 0:
-            return None
-        return (entry - exit_price) / risk
-    return None
+def _status_after_event(ev_type: EventType, current: str) -> str:
+    # Règle simple : SL_HIT ou TRADE_TERMINATED -> CLOSED
+    # TP1/TP2 -> PARTIAL si pas déjà CLOSED
+    # TP3 -> CLOSED
+    if ev_type in ("SL_HIT", "TRADE_TERMINATED", "TP3_HIT"):
+        return "CLOSED"
+    if ev_type in ("TP1_HIT", "TP2_HIT"):
+        return "PARTIAL" if current != "CLOSED" else "CLOSED"
+    return current
 
-def _update_trade_state(p: TVPayload):
-    """
-    Met à jour TRADES selon l'évènement reçu.
-    """
-    tid = _get_tid(p)
-    t = p.type.upper()
-    side = (p.side or "").upper() if p.side else None
-    entry = _safe_float(p.entry)
-    sl = _safe_float(p.sl)
-    tp1 = _safe_float(p.tp1)
-    tp2 = _safe_float(p.tp2)
-    tp3 = _safe_float(p.tp3)
-
-    if t == "ENTRY":
-        TRADES[tid] = {
-            "trade_id": tid,
-            "symbol": p.symbol,
-            "tf": p.tf,
-            "open_time": p.time,
-            "side": side,
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "r1": _safe_float(p.r1), "s1": _safe_float(p.s1),
-            "status": "open",           # open | closed
-            "outcome": None,            # win/loss/terminated
-            "exit_time": None,
-            "exit_price": None,
-            "best_tp": 0,               # 0,1,2,3 (meilleur TP atteint)
-            "best_r": None,             # R multiple au meilleur TP
-            "events": []
-        }
-
-    # Si pas d'ENTRY préalable, on initialise un shell minimal
-    if tid not in TRADES:
-        TRADES[tid] = {
-            "trade_id": tid,
-            "symbol": p.symbol,
-            "tf": p.tf,
-            "open_time": p.time,
-            "side": side,
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-            "r1": _safe_float(p.r1), "s1": _safe_float(p.s1),
-            "status": "open",
-            "outcome": None,
-            "exit_time": None,
-            "exit_price": None,
-            "best_tp": 0,
-            "best_r": None,
-            "events": []
-        }
-
-    trade = TRADES[tid]
-    trade["events"].append({"type": t, "time": p.time, "price": entry})
-
-    # Propagation éventuelle des niveaux (si re­envoyés)
-    if sl is not None:  trade["sl"]  = sl
-    if tp1 is not None: trade["tp1"] = tp1
-    if tp2 is not None: trade["tp2"] = tp2
-    if tp3 is not None: trade["tp3"] = tp3
-    if side:            trade["side"] = side
-    if entry is not None and trade.get("entry") is None:
-        trade["entry"] = entry
-
-    # Gestion des événements
-    if t in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
-        k = 1 if t == "TP1_HIT" else (2 if t == "TP2_HIT" else 3)
-        if k > trade["best_tp"]:
-            trade["best_tp"] = k
-            tp_price = trade.get(f"tp{k}")
-            # Calcule le R multiple au TPk (si possible)
-            trade["best_r"] = _risk_multiple(trade["side"], trade["entry"], trade["sl"], tp_price if tp_price else entry)
-
-    elif t == "SL_HIT":
-        trade["status"] = "closed"
-        trade["outcome"] = "loss"
-        trade["exit_time"] = p.time
-        trade["exit_price"] = entry
-        trade["best_r"] = _risk_multiple(trade["side"], trade["entry"], trade["sl"], entry)
-
-    elif t == "TRADE_TERMINATED":
-        trade["status"] = "closed"
-        trade["exit_time"] = p.time
-        # Si TP touché au préalable -> win, sinon "terminated"
-        if trade["best_tp"] >= 1:
-            trade["outcome"] = "win"
-            # Place la sortie sur le meilleur TP connu si on l’a
-            best_tp_price = trade.get(f"tp{trade['best_tp']}")
-            trade["exit_price"] = best_tp_price if best_tp_price is not None else entry
-        else:
-            trade["outcome"] = "terminated"
-            trade["exit_price"] = entry
-
-def _compute_stats() -> Dict[str, Any]:
-    total = len(TRADES)
-    closed = sum(1 for t in TRADES.values() if t["status"] == "closed")
-    wins = sum(1 for t in TRADES.values() if t.get("outcome") == "win" or t.get("best_tp", 0) >= 1 and t["status"] == "closed")
-    losses = sum(1 for t in TRADES.values() if t.get("outcome") == "loss")
-    termi = sum(1 for t in TRADES.values() if t.get("outcome") == "terminated")
-
-    # R multiples fermés
-    r_values: List[float] = []
-    for t in TRADES.values():
-        if t["status"] == "closed" and t.get("best_r") is not None:
-            try:
-                r_values.append(float(t["best_r"]))
-            except Exception:
-                pass
-
-    winrate = (wins / max(1, (wins + losses))) * 100.0
-    avg_r = (sum(r_values) / len(r_values)) if r_values else 0.0
-    best_r = max(r_values) if r_values else 0.0
-    worst_r = min(r_values) if r_values else 0.0
-
-    tp1_hits = sum(1 for t in TRADES.values() if t.get("best_tp", 0) >= 1)
-    tp2_hits = sum(1 for t in TRADES.values() if t.get("best_tp", 0) >= 2)
-    tp3_hits = sum(1 for t in TRADES.values() if t.get("best_tp", 0) >= 3)
-
-    return {
-        "total_trades": total,
-        "closed_trades": closed,
-        "wins": wins,
-        "losses": losses,
-        "terminated": termi,
-        "winrate_percent": round(winrate, 2),
-        "avg_r_closed": round(avg_r, 3),
-        "best_r": round(best_r, 3),
-        "worst_r": round(worst_r, 3),
-        "tp1_or_better": tp1_hits,
-        "tp2_or_better": tp2_hits,
-        "tp3_or_better": tp3_hits,
+def _record_entry(p: TVPayload):
+    tid = _ensure_trade_id(p)
+    TRADES[tid] = {
+        "trade_id": tid,
+        "symbol": p.symbol,
+        "tf": p.tf,
+        "time": p.time,
+        "side": (p.side or "").upper(),
+        "entry": p.entry,
+        "sl": p.sl,
+        "tp1": p.tp1,
+        "tp2": p.tp2,
+        "tp3": p.tp3,
+        "r1": p.r1,
+        "s1": p.s1,
+        "status": "OPEN",
+        # events/hits
+        "tp1_hit_time": None,
+        "tp2_hit_time": None,
+        "tp3_hit_time": None,
+        "sl_hit_time": None,
+        "terminated_time": None,
+        "last_event_time": p.time,
+        "events": [{"type": "ENTRY", "t": p.time, "price": p.entry}],
     }
+
+def _record_event(p: TVPayload):
+    tid = _ensure_trade_id(p)
+    if tid not in TRADES and p.type == "ENTRY":
+        _record_entry(p)
+        return
+
+    if tid not in TRADES and p.type != "ENTRY":
+        # On crée une coquille minimale pour ne pas 422 côté TV si évènement tardif
+        TRADES[tid] = {
+            "trade_id": tid,
+            "symbol": p.symbol,
+            "tf": p.tf,
+            "time": p.time,
+            "side": (p.side or "").upper(),
+            "entry": p.entry,
+            "sl": p.sl,
+            "tp1": p.tp1,
+            "tp2": p.tp2,
+            "tp3": p.tp3,
+            "r1": p.r1,
+            "s1": p.s1,
+            "status": "OPEN",
+            "tp1_hit_time": None,
+            "tp2_hit_time": None,
+            "tp3_hit_time": None,
+            "sl_hit_time": None,
+            "terminated_time": None,
+            "last_event_time": p.time,
+            "events": [],
+        }
+
+    tr = TRADES[tid]
+    tr["last_event_time"] = p.time
+    tr["events"].append({"type": p.type, "t": p.time, "price": p.entry})
+
+    if p.type == "TP1_HIT":
+        tr["tp1_hit_time"] = tr.get("tp1_hit_time") or p.time
+    elif p.type == "TP2_HIT":
+        tr["tp2_hit_time"] = tr.get("tp2_hit_time") or p.time
+    elif p.type == "TP3_HIT":
+        tr["tp3_hit_time"] = tr.get("tp3_hit_time") or p.time
+    elif p.type == "SL_HIT":
+        tr["sl_hit_time"] = tr.get("sl_hit_time") or p.time
+    elif p.type == "TRADE_TERMINATED":
+        tr["terminated_time"] = tr.get("terminated_time") or p.time
+
+    tr["status"] = _status_after_event(p.type, tr.get("status", "OPEN"))
+    TRADES[tid] = tr
+
+    # Historique global
+    EVENTS.append({
+        "trade_id": tid,
+        "type": p.type,
+        "symbol": p.symbol,
+        "tf": p.tf,
+        "t": p.time,
+        "price": p.entry,
+    })
 
 # =========================
 # HELPERS
@@ -251,24 +199,36 @@ def _fmt_num(x: Number) -> str:
         return str(x)
 
 async def send_telegram(text: str) -> None:
+    """Envoie un message Telegram si BOT + CHAT_ID configurés (non bloquant)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
+            # on ne casse pas le webhook si Telegram échoue
             pass
 
 # =========================
-# ROUTES — STATUS
+# ROUTES — STATUS / HOME
 # =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/favicon.ico")
+def favicon():
+    # supprime le bruit 404 favicon
+    return HTMLResponse(status_code=204)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -306,12 +266,14 @@ def home():
     <div style="margin-top:10px">
       <a class="btn" href="/env-sanity">/env-sanity</a>
       <a class="btn" href="/tg-health">/tg-health</a>
+      <a class="btn" href="/docs">/docs</a>
       <a class="btn" href="/trades">/trades (dashboard)</a>
     </div>
   </div>
   <div class="card">
     <b>Webhooks</b>
     <div>POST <code>/tv-webhook</code> (JSON TradingView)</div>
+    <small>Rappel: <code>GET /tv-webhook</code> renverra 405 — c'est normal, seule la méthode POST est autorisée.</small>
   </div>
 </body>
 </html>
@@ -336,26 +298,28 @@ async def tg_health(secret: Optional[str] = Query(None)):
     return {"ok": True, "info": "Message Telegram envoyé (si BOT + CHAT_ID configurés)."}
 
 # =========================
-# ROUTE — WEBHOOK
+# ROUTE — TV WEBHOOK
 # =========================
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
-    # 1) Sécurité
+    # 1) Sécurité: secret
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # 2) Log
+    # 2) Log simple (console)
     print("[tv-webhook] payload:", payload.dict())
 
-    # 3) Mémorise l'évènement pour le dashboard
-    EVENTS.append({"type": payload.type, "trade_id": _get_tid(payload), "time": payload.time, "symbol": payload.symbol, "tf": payload.tf, "price": _safe_float(payload.entry)})
-    _update_trade_state(payload)
+    # 3) Enregistre en mémoire
+    if payload.type == "ENTRY":
+        _record_entry(payload)
+    else:
+        _record_event(payload)
 
-    # 4) Telegram
-    t = payload.type.upper()
+    # 4) Compose message Telegram
+    t = payload.type
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
-    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
+    trade_id_txt = f" • ID: <code>{_ensure_trade_id(payload)}</code>"
 
     if t == "ENTRY":
         msg = (
@@ -376,153 +340,200 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "TP3_HIT": "🎯 TP3 touché",
             "SL_HIT":  "✖️ SL touché",
         }.get(t, t)
-        msg = f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\nPrix: <b>{_fmt_num(payload.entry)}</b>"
+        msg = (
+            f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
+            f"Prix: <b>{_fmt_num(payload.entry)}</b>"
+        )
         await send_telegram(msg)
 
     elif t == "TRADE_TERMINATED":
-        msg = f"⏹ <b>TRADE TERMINÉ — VEUILLEZ FERMER</b>\nInstrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
+        # Message demandé : “TRADE TERMINÉ — VEUILLEZ FERMER …”
+        msg = (
+            f"⏹ <b>TRADE TERMINÉ — VEUILLEZ FERMER</b>\n"
+            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
+        )
         await send_telegram(msg)
 
     # 5) Réponse API
+    tid = _ensure_trade_id(payload)
     return JSONResponse(
         {
             "ok": True,
             "received": payload.dict(),
+            "trade_id": tid,
             "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         }
     )
 
 # =========================
-# ROUTES — DASHBOARD TRADES
+# ROUTES — DASHBOARD
 # =========================
 @app.get("/trades", response_class=HTMLResponse)
 def trades_page():
-    # Simple dashboard HTML (vanilla JS) lisant /trades-stats et /trades-data
-    return HTMLResponse(f"""
+    # dashboard minimal HTML + JS (fetch /trades-data & /trades-stats)
+    html = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Trades & Stats</title>
+  <title>AI Trader PRO — Trades</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;margin:18px;color:#111}}
-    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}
-    .card{{border:1px solid #e5e7eb;border-radius:12px;padding:12px}}
-    .muted{{color:#6b7280}}
-    table{{border-collapse:collapse;width:100%;font-size:14px;margin-top:12px}}
-    th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left;white-space:nowrap}}
-    code{{background:#f9fafb;padding:2px 4px;border-radius:6px}}
-    .pill{{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #ddd;font-size:12px}}
-    .ok{{background:#e8faf0}}
-    .bad{{background:#fde8e8}}
-    .warn{{background:#fff7e6}}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.4;margin:20px;color:#111;background:#fafafa}
+    .row{display:flex;gap:14px;flex-wrap:wrap}
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fff}
+    .stat{min-width:180px}
+    table{border-collapse:collapse;width:100%;font-size:14px}
+    th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:left}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #e5e7eb}
+    .pill.open{background:#ecfdf5;border-color:#10b981}
+    .pill.partial{background:#fff7ed;border-color:#f59e0b}
+    .pill.closed{background:#fef2f2;border-color:#ef4444}
+    .sideL{color:#10b981;font-weight:600}
+    .sideS{color:#ef4444;font-weight:600}
+    .muted{color:#6b7280}
+    .small{font-size:12px}
+    .nowrap{white-space:nowrap}
   </style>
 </head>
 <body>
-  <h2>📈 Trades & Statistiques</h2>
-  <div id="stats" class="grid" style="margin:12px 0"></div>
-
-  <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <b>Historique des trades</b>
-      <button id="refresh">Rafraîchir</button>
+  <h1>AI Trader PRO — Trades</h1>
+  <div class="row">
+    <div class="card stat">
+      <div id="stat_total" class="big">—</div>
+      <div class="muted small">Total trades</div>
     </div>
-    <div class="muted">Agrégation en mémoire depuis les évènements reçus par <code>/tv-webhook</code>.</div>
-    <div style="overflow:auto">
-      <table id="tbl">
-        <thead>
-          <tr>
-            <th>Ouverture</th>
-            <th>ID</th>
-            <th>Symbole</th>
-            <th>TF</th>
-            <th>Side</th>
-            <th>Entry</th>
-            <th>SL</th>
-            <th>TP1</th><th>TP2</th><th>TP3</th>
-            <th>Best TP</th>
-            <th>Status</th>
-            <th>Outcome</th>
-            <th>Best R</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+    <div class="card stat">
+      <div id="stat_open" class="big">—</div>
+      <div class="muted small">Ouverts</div>
+    </div>
+    <div class="card stat">
+      <div id="stat_closed" class="big">—</div>
+      <div class="muted small">Fermés</div>
+    </div>
+    <div class="card stat">
+      <div id="stat_win" class="big">—</div>
+      <div class="muted small">TP3 (victoires)</div>
+    </div>
+    <div class="card stat">
+      <div id="stat_loss" class="big">—</div>
+      <div class="muted small">SL (pertes)</div>
     </div>
   </div>
 
-<script>
-async function loadStats(){
-  const res = await fetch('/trades-stats');
-  const s = await res.json();
-  const box = (label,val,cls="") => `
-    <div class="card ${cls}">
-      <div class="muted">${label}</div>
-      <div style="font-size:18px;font-weight:600">${val}</div>
-    </div>`;
-  document.getElementById('stats').innerHTML =
-    box("Total trades", s.total_trades) +
-    box("Fermés", s.closed_trades) +
-    box("Wins", s.wins, "ok") +
-    box("Losses", s.losses, "bad") +
-    box("Terminés", s.terminated, "warn") +
-    box("Winrate", s.winrate_percent + "%") +
-    box("Avg R (fermés)", s.avg_r_closed) +
-    box("Best R", s.best_r) +
-    box("Worst R", s.worst_r) +
-    box("≥ TP1", s.tp1_or_better) +
-    box("≥ TP2", s.tp2_or_better) +
-    box("≥ TP3", s.tp3_or_better);
-}
-function fmtTs(ts){
-  try{{ return new Date(ts*1000).toLocaleString(); }}catch(e){{ return ts; }}
-}
-function pill(txt, kind){
-  const cls = kind==="open"?"warn":(kind==="win"?"ok":(kind==="loss"?"bad":""));
-  return `<span class="pill ${cls}">${txt}</span>`;
-}
-async function loadTrades(){
-  const res = await fetch('/trades-data');
-  const data = await res.json();
-  const tbody = document.querySelector('#tbl tbody');
-  tbody.innerHTML = (data.trades || []).map(t => `
-    <tr>
-      <td>${fmtTs(t.open_time)}</td>
-      <td><code>${t.trade_id}</code></td>
-      <td>${t.symbol}</td>
-      <td>${t.tf}</td>
-      <td>${t.side || '-'}</td>
-      <td>${t.entry ?? '-'}</td>
-      <td>${t.sl ?? '-'}</td>
-      <td>${t.tp1 ?? '-'}</td>
-      <td>${t.tp2 ?? '-'}</td>
-      <td>${t.tp3 ?? '-'}</td>
-      <td>${t.best_tp}</td>
-      <td>${pill(t.status, t.status)}</td>
-      <td>${t.outcome ? pill(t.outcome, t.outcome) : '-'}</td>
-      <td>${t.best_r ?? '-'}</td>
-    </tr>
-  `).join('');
-}
+  <div class="card" style="margin-top:14px">
+    <table id="tbl"><thead>
+      <tr>
+        <th>Heure</th>
+        <th>Symbole</th>
+        <th>TF</th>
+        <th>Side</th>
+        <th>Entry</th>
+        <th>SL</th>
+        <th>TP1</th>
+        <th>TP2</th>
+        <th>TP3</th>
+        <th>Status</th>
+        <th class="nowrap">Dernier évènement</th>
+        <th>ID</th>
+      </tr>
+    </thead><tbody id="rows"></tbody></table>
+  </div>
 
-document.getElementById('refresh').addEventListener('click', () => {{ loadStats(); loadTrades(); }});
-loadStats(); loadTrades();
-</script>
+  <script>
+  async function fetchJSON(url){
+    const r = await fetch(url);
+    if(!r.ok) throw new Error(url+" => "+r.status);
+    return r.json();
+  }
+  function fmtN(x){
+    if(x===null || x===undefined) return "-";
+    const v = Number(x);
+    if(!isFinite(v)) return String(x);
+    return (v < 1 ? v.toFixed(8) : v.toFixed(4));
+  }
+  function tsToTime(t){
+    try{
+      const d = new Date((String(t).length>10? t : t*1000));
+      return d.toLocaleString();
+    }catch(e){ return String(t); }
+  }
+  function pill(s){
+    const st = (s||"").toUpperCase();
+    if(st==="OPEN") return '<span class="pill open">OPEN</span>';
+    if(st==="PARTIAL") return '<span class="pill partial">PARTIAL</span>';
+    if(st==="CLOSED") return '<span class="pill closed">CLOSED</span>';
+    return '<span class="pill">'+(s||"-")+'</span>';
+  }
+  function side(s){
+    s = (s||"").toUpperCase();
+    if(s==="LONG") return '<span class="sideL">LONG</span>';
+    if(s==="SHORT") return '<span class="sideS">SHORT</span>';
+    return '—';
+  }
+
+  async function refresh(){
+    try{
+      const stats = await fetchJSON("/trades-stats");
+      document.getElementById("stat_total").textContent = stats.total;
+      document.getElementById("stat_open").textContent = stats.open;
+      document.getElementById("stat_closed").textContent = stats.closed;
+      document.getElementById("stat_win").textContent = stats.win_tp3;
+      document.getElementById("stat_loss").textContent = stats.loss_sl;
+
+      const data = await fetchJSON("/trades-data");
+      const tbody = document.getElementById("rows");
+      tbody.innerHTML = "";
+      data.trades.sort((a,b)=> (b.time||0)-(a.time||0)).forEach(tr=>{
+        const trEl = document.createElement("tr");
+        trEl.innerHTML = `
+          <td class="nowrap">${tsToTime(tr.time)}</td>
+          <td>${tr.symbol||"-"}</td>
+          <td>${tr.tf||"-"}</td>
+          <td>${side(tr.side)}</td>
+          <td>${fmtN(tr.entry)}</td>
+          <td>${fmtN(tr.sl)}</td>
+          <td>${fmtN(tr.tp1)}</td>
+          <td>${fmtN(tr.tp2)}</td>
+          <td>${fmtN(tr.tp3)}</td>
+          <td>${pill(tr.status)}</td>
+          <td class="nowrap">${tsToTime(tr.last_event_time||tr.time)}</td>
+          <td class="small muted">${tr.trade_id||"-"}</td>
+        `;
+        tbody.appendChild(trEl);
+      });
+    }catch(e){
+      console.error(e);
+    }
+  }
+  refresh();
+  setInterval(refresh, 10000);
+  </script>
 </body>
 </html>
-""")
+"""
+    return HTMLResponse(content=html, status_code=200)
 
 @app.get("/trades-data")
 def trades_data(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    # renvoie les trades triés (du plus récent)
-    trades = sorted(TRADES.values(), key=lambda x: x.get("open_time", 0), reverse=True)
-    return {"trades": trades, "events_count": len(EVENTS)}
+    # (Optionnel) protéger /trades-data derrière le secret :
+    # if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+    #     raise HTTPException(status_code=401, detail="Invalid secret")
+    return {"trades": list(TRADES.values()), "events_count": len(EVENTS)}
 
 @app.get("/trades-stats")
 def trades_stats(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    return _compute_stats()
+    # if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+    #     raise HTTPException(status_code=401, detail="Invalid secret")
+    total = len(TRADES)
+    open_cnt = sum(1 for t in TRADES.values() if t.get("status") == "OPEN")
+    closed_cnt = sum(1 for t in TRADES.values() if t.get("status") == "CLOSED")
+    win_tp3 = sum(1 for t in TRADES.values() if t.get("tp3_hit_time"))
+    loss_sl = sum(1 for t in TRADES.values() if t.get("sl_hit_time"))
+    return {
+        "total": total,
+        "open": open_cnt,
+        "closed": closed_cnt,
+        "win_tp3": win_tp3,
+        "loss_sl": loss_sl,
+    }
