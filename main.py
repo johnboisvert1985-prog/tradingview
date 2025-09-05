@@ -13,9 +13,6 @@ LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
-# Si le LLM ne renvoie pas de confidence, on utilisera cette valeur par défaut (0..1)
-DEFAULT_CONFIDENCE = float(os.getenv("DEFAULT_CONFIDENCE", "0.50"))
-
 # Essaye d'utiliser le SDK; sinon fallback HTTP
 _openai_client = None
 if LLM_ENABLED and OPENAI_API_KEY:
@@ -30,10 +27,17 @@ WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
-CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+
+# CONFIDENCE_MIN accepte "0.8" ou "80"
+_conf_raw = os.getenv("CONFIDENCE_MIN", "0")
+try:
+    _conf_val = float(_conf_raw)
+except Exception:
+    _conf_val = 0.0
+CONFIDENCE_MIN = _conf_val/100.0 if _conf_val > 1.0 else _conf_val
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.3.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.4.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -107,11 +111,14 @@ def _build_llm_prompt(p: TVPayload) -> str:
         "levels": {"sl": p.sl, "tp1": p.tp1, "tp2": p.tp2, "tp3": p.tp3},
         "sr": {"R1": p.r1, "S1": p.s1},
     }
+    # Instruction stricte : on exige bien "confidence" numérique 0..1
     return (
         "Tu es un moteur de décision de trading.\n"
-        "Retourne UNIQUEMENT un JSON valide avec les clés:\n"
-        '  {"decision": "BUY|SELL|IGNORE", "confidence": 0..1, "reason": "français"}\n\n'
-        f"Contexte JSON:\n{json.dumps(body, ensure_ascii=False)}\n\n"
+        "Retourne UNIQUEMENT un JSON strict à la racine, avec exactement ces clés:\n"
+        '  {"decision": "BUY|SELL|IGNORE", "confidence": 0..1, "reason": "français"}\n'
+        "- \"confidence\" DOIT être un nombre (float) entre 0 et 1, ex: 0.95\n"
+        "- Ne renvoie aucun texte en dehors du JSON.\n\n"
+        f"Contexte:\n{json.dumps(body, ensure_ascii=False)}\n\n"
         "Règles:\n"
         "- BUY si direction_raw == LONG et le contexte est favorable.\n"
         "- SELL si direction_raw == SHORT et le contexte est favorable.\n"
@@ -179,30 +186,33 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     if not (LLM_ENABLED and OPENAI_API_KEY):
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
     prompt = _build_llm_prompt(p)
+    # On tente SDK, puis HTTP en secours
     try:
         data = await _call_llm_via_sdk(prompt) if _openai_client else await _call_llm_via_http(prompt)
     except Exception:
         try:
             data = await _call_llm_via_http(prompt)
         except Exception as e:
-            # Pas de LLM => pas de blocage, mais on fournit une raison
-            return {"decision": "IGNORE", "confidence": DEFAULT_CONFIDENCE, "reason": f"llm-error: {e}", "llm_used": False}
+            return {"decision": None, "confidence": None, "reason": f"llm-error: {e}", "llm_used": False}
 
+    # Extraction stricte SANS valeur par défaut
     decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
-    confidence = data.get("confidence", None)
+    conf_raw = data.get("confidence", None)
     reason = str(data.get("reason")) if data.get("reason") is not None else None
 
-    # Normalisations
+    # decision normalisée
     if decision not in ("BUY", "SELL", "IGNORE"):
         decision = "IGNORE"
 
-    # Si le LLM oublie confidence -> on applique DEFAULT_CONFIDENCE
-    try:
-        confidence = float(confidence) if confidence is not None else DEFAULT_CONFIDENCE
-    except Exception:
-        confidence = DEFAULT_CONFIDENCE
-    # Bornage 0..1
-    confidence = max(0.0, min(1.0, float(confidence)))
+    # confidence : si non numérique → None (pas de bidouille)
+    confidence = None
+    if isinstance(conf_raw, (int, float, str)):
+        try:
+            confidence = float(conf_raw)
+            if not (0.0 <= confidence <= 1.0):
+                confidence = None
+        except Exception:
+            confidence = None
 
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
@@ -245,8 +255,7 @@ def home():
         ("LLM_CLIENT", "sdk" if _openai_client else ("http" if (LLM_ENABLED and OPENAI_API_KEY) else "-")),
         ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and OPENAI_API_KEY) else "-"),
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
-        ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
-        ("DEFAULT_CONFIDENCE", str(DEFAULT_CONFIDENCE)),
+        ("CONFIDENCE_MIN (0..1)", f"{CONFIDENCE_MIN:.2f}"),
         ("PORT", str(PORT)),
     ]
     rows_html = "".join(
@@ -300,8 +309,7 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "LLM_ENABLED": bool(LLM_ENABLED),
         "LLM_CLIENT": "sdk" if _openai_client else ("http" if (LLM_ENABLED and OPENAI_API_KEY) else None),
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and OPENAI_API_KEY) else None,
-        "CONFIDENCE_MIN": CONFIDENCE_MIN,
-        "DEFAULT_CONFIDENCE": DEFAULT_CONFIDENCE,
+        "CONFIDENCE_MIN (0..1)": CONFIDENCE_MIN,
         "PORT": PORT,
     }
 
@@ -442,7 +450,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
     trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
-    # LLM pour ENTRY si manquant
+    # LLM pour ENTRY si manquant/incomplet
     llm_out: Dict[str, Any] = {
         "decision": payload.decision,
         "confidence": payload.confidence,
@@ -451,12 +459,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # -------- Telegram + enregistrement --------
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
-        conf_val = llm_out.get("confidence")
-        # conf_val ne sera jamais None maintenant (DEFAULT_CONFIDENCE sinon)
-        conf_pct = f"{float(conf_val)*100:.0f}%" if conf_val is not None else "—"
+        conf_val = llm_out.get("confidence")  # peut être None si le LLM n'a pas renvoyé
+        conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
         rsn = llm_out.get("reason") or "-"
 
         msg = (
