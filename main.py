@@ -1,23 +1,43 @@
 # main.py
 import os
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
+import json
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
+# === LLM (OpenAI) ===
+LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+try:
+    if LLM_ENABLED and OPENAI_API_KEY:
+        from openai import OpenAI
+        _openai_client = OpenAI()
+    else:
+        _openai_client = None
+except Exception:
+    _openai_client = None
+    LLM_ENABLED = False
+
 # =========================
-# ENV
+# ENV (Webhook & Telegram)
 # =========================
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")   # ex: nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg
+WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-PORT = int(os.getenv("PORT", "8000"))
+PORT               = int(os.getenv("PORT", "8000"))
+
+# Seuil d'affichage facultatif (si tu veux filtrer les messages envoyés au Telegram)
+CONFIDENCE_MIN = float(os.getenv("CONFIDENCE_MIN", "0.0"))
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="AI Trader PRO - Webhook", version="2.2.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.0.0")
 
 # =========================
 # MODELS
@@ -25,39 +45,19 @@ app = FastAPI(title="AI Trader PRO - Webhook", version="2.2.0")
 Number = Optional[Union[float, int, str]]
 
 class TVPayload(BaseModel):
-    """
-    Modèle aligné avec l’indicateur Pine patché.
-    Champs possibles envoyés par le Pine:
-
-    type: "ENTRY" | "TP1_HIT" | "TP2_HIT" | "TP3_HIT" | "SL_HIT" | "TRADE_TERMINATED"
-    (compat) tag:  même valeur que type, pour compatibilité si le Pine envoie 'tag'
-
-    symbol: "BTCUSDT"
-    tf: "15"
-    time: 1717777777
-    side: "LONG" | "SHORT"   (ENTRY/terminé)
-    entry: prix touché / prix d’entrée selon l’évènement
-    tp: valeur cible (quand TPx_HIT, le niveau exact TPx)
-    sl, tp1, tp2, tp3, r1, s1: niveaux
-    trade_id: identifiant
-    secret: doit matcher WEBHOOK_SECRET
-    term_reason: "REVERSAL" | "TP3_HIT" | "SL_HIT" | ...  (pour TRADE_TERMINATED)
-
-    (optionnel si vous réactivez le LLM côté backend):
-    decision: "BUY" | "SELL" | "IGNORE"
-    confidence: float 0..1
-    reason: str (explication)
-    """
+    # Évènements possibles
     type: Optional[str] = None
     tag:  Optional[str] = None
+
+    # Contexte trade
     symbol: str
     tf: str
     time: int
     side: Optional[str] = None
 
-    entry: Number = None
-    tp: Number = None
-
+    # Prix & niveaux
+    entry: Number = None        # prix touché / prix d'entrée selon l’évènement
+    tp: Number = None           # niveau cible envoyé lors des TPx_HIT
     sl: Number = None
     tp1: Number = None
     tp2: Number = None
@@ -65,11 +65,12 @@ class TVPayload(BaseModel):
     r1: Number = None
     s1: Number = None
 
+    # Admin
     trade_id: Optional[str] = None
     secret: Optional[str] = None
-    term_reason: Optional[str] = None
+    term_reason: Optional[str] = None  # pour TRADE_TERMINATED
 
-    # Champs LLM facultatifs (si fournis on les affiche)
+    # Champs LLM (si jamais fournis par ailleurs)
     decision: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
@@ -111,8 +112,89 @@ async def send_telegram(text: str) -> None:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
-            # On ne casse pas le webhook si Telegram échoue
+            # Ne bloque pas le webhook si Telegram échoue
             pass
+
+# =========================
+# LLM: prompt & appel
+# =========================
+def _build_llm_prompt(p: TVPayload) -> str:
+    # On construit un prompt simple, robuste, en français
+    body = {
+        "symbol": p.symbol,
+        "tf": p.tf,
+        "direction_raw": (p.side or "").upper(),
+        "entry": p.entry,
+        "levels": {"sl": p.sl, "tp1": p.tp1, "tp2": p.tp2, "tp3": p.tp3},
+        "sr": {"R1": p.r1, "S1": p.s1},
+    }
+    return (
+        "Tu es un moteur de décision de trading.\n"
+        "Retourne UNIQUEMENT un JSON valide avec les clés:\n"
+        '  {"decision": "BUY|SELL|IGNORE", "confidence": 0..1, "reason": "français"}\n\n'
+        f"Contexte JSON:\n{json.dumps(body, ensure_ascii=False)}\n\n"
+        "Règles:\n"
+        "- BUY si direction_raw == LONG et le contexte (SR, niveaux, cohérence) est favorable.\n"
+        "- SELL si direction_raw == SHORT et le contexte est favorable.\n"
+        "- Sinon IGNORE (doute, données incomplètes, incohérence, proximité SR défavorable, etc.).\n"
+        "- Sois concis dans 'reason'. Réponse = JSON UNIQUEMENT."
+    )
+
+def _safe_json_parse(txt: str) -> Dict[str, Any]:
+    try:
+        return json.loads(txt)
+    except Exception:
+        # tente d'extraire un bloc JSON
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if 0 <= start < end:
+            try:
+                return json.loads(txt[start:end+1])
+            except Exception:
+                pass
+    return {}
+
+async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
+    """Appelle le LLM pour un évènement ENTRY. Retourne {decision, confidence, reason} (défauts si indisponible)."""
+    if not (LLM_ENABLED and _openai_client):
+        return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
+
+    prompt = _build_llm_prompt(p)
+    try:
+        r = _openai_client.responses.create(
+            model=LLM_MODEL,
+            input=[
+                {"role": "system", "content": "Tu es un moteur de décision qui NE renvoie que du JSON valide."},
+                {"role": "user", "content": prompt},
+            ],
+            max_output_tokens=200,
+        )
+        # Essaye de lire le texte de sortie
+        txt = getattr(r, "output_text", None)
+        if not txt:
+            # fallback anciens champs possibles
+            try:
+                txt = r.output[0].content[0].text  # type: ignore[attr-defined]
+            except Exception:
+                txt = str(r)
+
+        data = _safe_json_parse((txt or "").strip())
+        decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
+        confidence = float(data.get("confidence", 0.0)) if isinstance(data.get("confidence"), (int, float, str)) else None
+        reason = str(data.get("reason")) if data.get("reason") is not None else None
+
+        # Normalisations & garde-fous
+        if decision not in ("BUY", "SELL", "IGNORE"):
+            decision = "IGNORE"
+        if confidence is not None:
+            try:
+                confidence = max(0.0, min(1.0, float(confidence)))
+            except Exception:
+                confidence = None
+
+        return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True, "raw": txt}
+    except Exception as e:
+        return {"decision": None, "confidence": None, "reason": None, "llm_used": False, "error": str(e)}
 
 # =========================
 # ROUTES — STATUS
@@ -127,6 +209,10 @@ def home():
         ("WEBHOOK_SECRET_set", str(bool(WEBHOOK_SECRET))),
         ("TELEGRAM_BOT_TOKEN_set", str(bool(TELEGRAM_BOT_TOKEN))),
         ("TELEGRAM_CHAT_ID_set", str(bool(TELEGRAM_CHAT_ID))),
+        ("LLM_ENABLED", str(bool(LLM_ENABLED and _openai_client))),
+        ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and _openai_client) else "-"),
+        ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
+        ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
         ("PORT", str(PORT)),
     ]
     rows_html = "".join(
@@ -157,6 +243,7 @@ def home():
     <div style="margin-top:10px">
       <a class="btn" href="/env-sanity">/env-sanity</a>
       <a class="btn" href="/tg-health">/tg-health</a>
+      <a class="btn" href="/openai-health">/openai-health</a>
     </div>
   </div>
   <div class="card">
@@ -175,6 +262,9 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
         "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "LLM_ENABLED": bool(LLM_ENABLED and _openai_client),
+        "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and _openai_client) else None,
+        "CONFIDENCE_MIN": CONFIDENCE_MIN,
         "PORT": PORT,
     }
 
@@ -184,6 +274,23 @@ async def tg_health(secret: Optional[str] = Query(None)):
         raise HTTPException(status_code=401, detail="Invalid secret")
     await send_telegram("✅ Test Telegram: ça fonctionne.")
     return {"ok": True, "info": "Message Telegram envoyé (si BOT + CHAT_ID configurés)."}
+
+@app.get("/openai-health")
+def openai_health(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    if not (LLM_ENABLED and _openai_client):
+        return {"ok": False, "enabled": False, "why": "LLM off or API key missing"}
+    try:
+        r = _openai_client.responses.create(
+            model=LLM_MODEL,
+            input=[{"role": "user", "content": "ping"}],
+            max_output_tokens=5,
+        )
+        txt = getattr(r, "output_text", None) or str(r)
+        return {"ok": True, "model": LLM_MODEL, "sample": txt[:120]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 # =========================
 # ROUTE — WEBHOOK
@@ -195,24 +302,27 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # 2) Log
-    print("[tv-webhook] payload:", payload.dict())
-
-    # 3) Type d’évènement (accepte 'type' OU 'tag')
+    # 2) Type d’évènement
     t = (payload.type or payload.tag or "").upper()
 
-    # 4) Format Telegram
+    # 3) Si ENTRY => on appelle le LLM (sauf si déjà fourni)
+    llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason}
+    if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
+        llm_out = await call_llm_for_entry(payload)
+
+    # 4) Compose & envoie Telegram
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
     trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
     if t == "ENTRY":
-        # Ligne LLM si fournie
+        # Ligne LLM
         llm_lines = ""
-        if payload.decision or payload.confidence is not None or payload.reason:
-            dec = (payload.decision or "—").upper()
-            conf = "—" if payload.confidence is None else f"{float(payload.confidence):.2f}"
-            rsn = payload.reason or "-"
-            llm_lines = f"\n🤖 LLM: <b>{dec}</b>  | Confiance: <b>{conf}</b>\n📝 Raison: {rsn}"
+        dec = (llm_out.get("decision") or "—")
+        conf_val = llm_out.get("confidence", None)
+        conf = "—" if conf_val is None else f"{float(conf_val):.2f}"
+        rsn = llm_out.get("reason") or "-"
+
+        llm_lines = f"\n🤖 LLM: <b>{dec}</b>  | Confiance: <b>{conf}</b>\n📝 Raison: {rsn}"
 
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -224,6 +334,12 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>"
             f"{llm_lines}"
         )
+
+        # envoi — si tu veux filtrer par confiance, décommente ci-dessous:
+        # if (llm_out.get("decision") or "").upper() != "IGNORE" and (conf_val or 0) >= CONFIDENCE_MIN:
+        #     await send_telegram(msg)
+        # else:
+        #     pass
         await send_telegram(msg)
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
@@ -234,10 +350,8 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "SL_HIT":  "✖️ SL touché",
         }.get(t, t)
 
-        # Prix touché (le Pine l’envoie dans 'entry'; fallback 'close' si jamais)
-        hit_price = payload.entry
-        if hit_price is None:
-            hit_price = payload.dict().get("close")
+        # Prix touché (TradingView -> entry), fallback 'close' si jamais
+        hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
 
         # Cible exacte (tp/sl)
         target_price = payload.tp
@@ -253,13 +367,11 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
 
         msg = (
             f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Prix touché: <b>{_fmt_num(hit_price)}</b> • "
-            f"Cible: <b>{_fmt_num(target_price)}</b>"
+            f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
         )
         await send_telegram(msg)
 
     elif t == "TRADE_TERMINATED":
-        # Raison lisible
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
             title = "TRADE TERMINÉ — TP3 ATTEINT"
@@ -279,12 +391,18 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
-    # 5) Réponse
+    # 5) Réponse API
     return JSONResponse(
         {
             "ok": True,
             "event": t,
             "received": payload.dict(),
+            "llm": {
+                "enabled": bool(LLM_ENABLED and _openai_client),
+                "decision": llm_out.get("decision"),
+                "confidence": llm_out.get("confidence"),
+                "reason": llm_out.get("reason"),
+            },
             "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         }
     )
