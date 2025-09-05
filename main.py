@@ -346,3 +346,61 @@ async def tg_health(secret: Optional[str] = Query(None)):
         raise HTTPException(status_code=401, detail="Invalid secret")
     await send_telegram("✅ Test Telegram: ça fonctionne.")
     return {"ok": True, "info": "Message de test envoyé (si BOT + CHAT_ID configurés)."}
+
+# main.py (ou app.py)
+from typing import Optional, Union
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+
+app = FastAPI()
+
+Number = Optional[Union[float, int, str]]
+
+class TVPayload(BaseModel):
+    type: str                         # "ENTRY", "TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "TRADE_TERMINATED"
+    symbol: str
+    tf: str
+    time: int
+    side: Optional[str] = None
+    entry: Number = None
+    sl: Number = None
+    tp1: Number = None
+    tp2: Number = None
+    tp3: Number = None
+    r1: Number = None
+    s1: Number = None
+    secret: Optional[str] = None
+    trade_id: Optional[str] = None
+
+def send_to_telegram(text: str) -> None:
+    # ⬇️ Mets ici TON code qui envoie le message au bot Telegram
+    print("[TELEGRAM]", text)
+
+@app.post("/tv-webhook")
+async def tv_webhook(payload: TVPayload):
+    # 1) Log pour debug
+    print("Payload reçu:", payload.dict())
+
+    # 2) (Optionnel) vérifie le secret si tu en utilises un
+    # if payload.secret != "TON_SECRET": return {"ok": False, "error": "bad secret"}
+
+    # 3) Formate et envoie à Telegram
+    if payload.type == "ENTRY":
+        msg = (
+            f"🚨 ALERTE • {payload.symbol} • {payload.tf}\n"
+            f"Direction: {payload.side or '—'} | Entry: {payload.entry}\n"
+            f"SL: {payload.sl} | TP1: {payload.tp1} | TP2: {payload.tp2} | TP3: {payload.tp3}\n"
+            f"R1: {payload.r1} | S1: {payload.s1}\n"
+            f"ID: {payload.trade_id or '—'}"
+        )
+        send_to_telegram(msg)
+    elif payload.type in ("TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT"):
+        msg = f"🎯 {payload.type} • {payload.symbol} • {payload.tf} • Prix: {payload.entry or '—'} (ID {payload.trade_id or '—'})"
+        send_to_telegram(msg)
+    elif payload.type == "TRADE_TERMINATED":
+        msg = f"⏹ TRADE TERMINÉ — VEUILLEZ FERMER • {payload.symbol} • {payload.tf} (ID {payload.trade_id or '—'})"
+        send_to_telegram(msg)
+
+    return {"ok": True}
+
+
