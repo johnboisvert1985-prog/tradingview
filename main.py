@@ -1,3 +1,15 @@
+# --- à ajouter en haut du fichier avec le reste ---
+from fastapi.responses import JSONResponse
+
+# --- routes de santé/accueil ---
+@app.get("/")
+async def root():
+    return JSONResponse({"ok": True, "service": "tv-webhook", "endpoints": ["/health", "/tv-webhook (POST)"]})
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
+
 import os
 import json
 from typing import Any, Dict, Optional
@@ -402,5 +414,6 @@ async def tv_webhook(payload: TVPayload):
         send_to_telegram(msg)
 
     return {"ok": True}
+
 
 
