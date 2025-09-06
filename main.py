@@ -2,7 +2,6 @@
 import os
 import json
 from typing import Optional, Union, Dict, Any, List
-from collections import defaultdict
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Header
@@ -13,15 +12,22 @@ from pydantic import BaseModel
 LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-try:
-    if LLM_ENABLED and OPENAI_API_KEY:
+
+_openai_client = None
+_llm_reason_down = None
+if LLM_ENABLED and OPENAI_API_KEY:
+    try:
+        # OpenAI SDK v1
         from openai import OpenAI
-        _openai_client = OpenAI()
-    else:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
         _openai_client = None
-except Exception:
-    _openai_client = None
-    LLM_ENABLED = False
+        _llm_reason_down = f"import_error: {e}"
+else:
+    if not LLM_ENABLED:
+        _llm_reason_down = "disabled_by_env"
+    elif not OPENAI_API_KEY:
+        _llm_reason_down = "missing_api_key"
 
 # ============== ENV (Webhook & Telegram) ==============
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
@@ -37,12 +43,6 @@ app = FastAPI(title="AI Trader PRO - Webhook", version="3.2.0")
 TRADES: List[Dict[str, Any]] = []
 MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 
-# Orchestration TP/ENTRY
-SEEN_ENTRY = set()                       # trade_ids déjà vus en ENTRY
-PENDING_EVENTS = defaultdict(list)       # trade_id -> évènements TP en attente
-BEST_TP_RANK: Dict[str, int] = {}        # trade_id -> 1/2/3 (meilleur TP déjà traité)
-TP_RANK = {"TP1_HIT": 1, "TP2_HIT": 2, "TP3_HIT": 3}
-
 # ============== MODELS ==============
 Number = Optional[Union[float, int, str]]
 
@@ -54,8 +54,8 @@ class TVPayload(BaseModel):
     tf: str
     time: int
     side: Optional[str] = None
-    entry: Number = None         # prix touché sur TP/SL | entry sur ENTRY
-    tp: Number = None            # cible atteinte (optionnel)
+    entry: Number = None
+    tp: Number = None
     sl: Number = None
     tp1: Number = None
     tp2: Number = None
@@ -113,8 +113,8 @@ def _build_llm_prompt(p: TVPayload) -> str:
     }
     return (
         "Tu es un moteur de décision de trading.\n"
-        "Retourne UNIQUEMENT un JSON valide:\n"
-        '  {"decision": "BUY|SELL|IGNORE", "confidence": 0..1, "reason": "français"}\n\n'
+        "Retourne UNIQUEMENT un JSON valide avec les clés EXACTES:\n"
+        '  {"decision":"BUY|SELL|IGNORE","confidence":0..1,"reason":"français"}\n\n'
         f"Contexte JSON:\n{json.dumps(body, ensure_ascii=False)}\n\n"
         "Règles:\n"
         "- BUY si direction_raw == LONG et le contexte est favorable.\n"
@@ -127,7 +127,8 @@ def _safe_json_parse(txt: str) -> Dict[str, Any]:
     try:
         return json.loads(txt)
     except Exception:
-        start = txt.find("{"); end = txt.rfind("}")
+        start = txt.find("{")
+        end = txt.rfind("}")
         if 0 <= start < end:
             try:
                 return json.loads(txt[start:end+1])
@@ -137,39 +138,59 @@ def _safe_json_parse(txt: str) -> Dict[str, Any]:
 
 async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     if not (LLM_ENABLED and _openai_client):
-        return {"decision": None, "confidence": None, "reason": None, "llm_used": False}
+        return {
+            "decision": None, "confidence": None, "reason": None,
+            "llm_used": False, "why": _llm_reason_down or "unknown"
+        }
     prompt = _build_llm_prompt(p)
     try:
-        r = _openai_client.responses.create(
+        # Essayez d'abord l'API chat.completions (large compat)
+        comp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
-            input=[
-                {"role": "system", "content": "Tu es un moteur de décision qui NE renvoie que du JSON valide."},
+            messages=[
+                {"role": "system", "content": "Tu es un moteur de décision et tu NE renvoies que du JSON valide."},
                 {"role": "user", "content": prompt},
             ],
-            max_output_tokens=200,
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=250,
         )
-        txt = getattr(r, "output_text", None)
-        if not txt:
-            try:
-                txt = r.output[0].content[0].text  # type: ignore
-            except Exception:
-                txt = str(r)
-        data = _safe_json_parse((txt or "").strip())
-        decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
-        confidence = float(data.get("confidence", 0.0)) if isinstance(data.get("confidence"), (int, float, str)) else None
-        reason = str(data.get("reason")) if data.get("reason") is not None else None
+        txt = comp.choices[0].message.content if comp and comp.choices else ""
+    except Exception as e_chat:
+        # Fallback vers responses API si dispo
+        try:
+            r = _openai_client.responses.create(
+                model=LLM_MODEL,
+                input=[
+                    {"role": "system", "content": "Tu es un moteur de décision et tu NE renvoies que du JSON valide."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_output_tokens=250,
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            txt = getattr(r, "output_text", None) or str(r)
+        except Exception as e_resp:
+            return {
+                "decision": None, "confidence": None, "reason": None,
+                "llm_used": False, "why": f"chat_error={e_chat} | responses_error={e_resp}"
+            }
 
-        if decision not in ("BUY", "SELL", "IGNORE"):
-            decision = "IGNORE"
-        if confidence is not None:
-            try:
-                confidence = max(0.0, min(1.0, float(confidence)))
-            except Exception:
-                confidence = None
+    data = _safe_json_parse((txt or "").strip())
+    decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
+    confidence = None
+    if isinstance(data.get("confidence"), (int, float, str)):
+        try:
+            confidence = float(data["confidence"])
+            confidence = max(0.0, min(1.0, confidence))
+        except Exception:
+            confidence = None
+    reason = str(data.get("reason")) if data.get("reason") is not None else None
 
-        return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True, "raw": txt}
-    except Exception as e:
-        return {"decision": None, "confidence": None, "reason": None, "llm_used": False, "error": str(e)}
+    if decision not in ("BUY", "SELL", "IGNORE"):
+        decision = "IGNORE"
+
+    return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
 # ============== RECORDING (Dashboard) ==============
 def _push_trade(row: Dict[str, Any]) -> None:
@@ -181,8 +202,8 @@ def _basic_stats() -> Dict[str, Any]:
     entries = [t for t in TRADES if t.get("event") == "ENTRY"]
     tp_hits = [t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")]
     sl_hits = [t for t in TRADES if t.get("event") == "SL_HIT"]
-    wins = len(tp_hits)           # simple: tout TP = win
-    losses = len(sl_hits)         # tout SL = loss
+    wins = len(tp_hits)  # simple: tout TP compte win
+    losses = len(sl_hits)
     total = wins + losses
     winrate = (wins / total * 100.0) if total > 0 else 0.0
     return {
@@ -206,7 +227,9 @@ def home():
         ("WEBHOOK_SECRET_set", str(bool(WEBHOOK_SECRET))),
         ("TELEGRAM_BOT_TOKEN_set", str(bool(TELEGRAM_BOT_TOKEN))),
         ("TELEGRAM_CHAT_ID_set", str(bool(TELEGRAM_CHAT_ID))),
-        ("LLM_ENABLED", str(bool(LLM_ENABLED and _openai_client))),
+        ("LLM_ENABLED", str(bool(LLM_ENABLED))),
+        ("LLM_CLIENT_READY", str(bool(_openai_client is not None))),
+        ("LLM_DOWN_REASON", _llm_reason_down or "-"),
         ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and _openai_client) else "-"),
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
         ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
@@ -260,7 +283,9 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
         "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
-        "LLM_ENABLED": bool(LLM_ENABLED and _openai_client),
+        "LLM_ENABLED": bool(LLM_ENABLED),
+        "LLM_CLIENT_READY": bool(_openai_client is not None),
+        "LLM_DOWN_REASON": _llm_reason_down,
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and _openai_client) else None,
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
         "PORT": PORT,
@@ -278,15 +303,15 @@ def openai_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     if not (LLM_ENABLED and _openai_client):
-        return {"ok": False, "enabled": False, "why": "LLM off or API key missing"}
+        return {"ok": False, "enabled": bool(LLM_ENABLED), "client_ready": bool(_openai_client), "why": _llm_reason_down}
     try:
-        r = _openai_client.responses.create(
+        comp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
-            input=[{"role": "user", "content": "ping"}],
-            max_output_tokens=5,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
         )
-        txt = getattr(r, "output_text", None) or str(r)
-        return {"ok": True, "model": LLM_MODEL, "sample": txt[:120]}
+        sample = comp.choices[0].message.content if comp and comp.choices else ""
+        return {"ok": True, "model": LLM_MODEL, "sample": sample[:120]}
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
@@ -374,7 +399,7 @@ th,td{{vertical-align:top}}
           <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Symbol</th>
           <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">TF</th>
           <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Side</th>
-          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Entry/Hit</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Entry</th>
           <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Trade ID</th>
           <th style="text-align:left;padding:6px;border-bottom:1px solid #ddd">Details</th>
         </tr>
@@ -394,9 +419,6 @@ def trades_clear(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     TRADES.clear()
-    SEEN_ENTRY.clear()
-    PENDING_EVENTS.clear()
-    BEST_TP_RANK.clear()
     return {"ok": True, "cleared": True}
 
 # ============== ROUTE — WEBHOOK ==============
@@ -408,12 +430,11 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             raise HTTPException(status_code=401, detail="Invalid secret")
 
     t = (payload.type or payload.tag or "").upper()
-    tid = payload.trade_id or ""
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
-    trade_id_txt = f" • ID: <code>{tid}</code>" if tid else ""
+    trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
     # LLM pour ENTRY si manquant
-    llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason}
+    llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason, "llm_used": False}
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
@@ -423,6 +444,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         conf_val = llm_out.get("confidence")
         conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
         rsn = llm_out.get("reason") or "-"
+        llm_note = ""
+        if not llm_out.get("llm_used", False):
+            why = llm_out.get("why") or _llm_reason_down or "-"
+            llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -434,6 +459,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>\n"
             f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b>\n"
             f"📝 Raison: {rsn}"
+            f"{llm_note}"
         )
         await send_telegram(msg)
 
@@ -446,26 +472,9 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "entry": payload.entry,
             "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
             "r1": payload.r1, "s1": payload.s1,
-            "trade_id": tid,
+            "trade_id": payload.trade_id,
             "decision": dec, "confidence": conf_val, "reason": rsn,
         })
-
-        # Marquer ENTRY et vider le tampon (ne garder que le meilleur TP)
-        SEEN_ENTRY.add(tid)
-        pending = PENDING_EVENTS.pop(tid, [])
-        if pending:
-            best = None; best_rank = 0
-            for e in pending:
-                r = TP_RANK.get(e["event"], 0)
-                if r > best_rank:
-                    best = e; best_rank = r
-            if best:
-                BEST_TP_RANK[tid] = best_rank
-                await send_telegram(
-                    f'{best["nice"]} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n'
-                    f'Prix touché: <b>{_fmt_num(best["hit_price"])}</b> • Cible: <b>{_fmt_num(best["target_price"])}</b>'
-                )
-                _push_trade(best["row"])
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
         nice = {
@@ -478,37 +487,14 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
         target_price = payload.tp
         if target_price is None:
-            if t == "TP1_HIT":   target_price = payload.tp1
-            elif t == "TP2_HIT": target_price = payload.tp2
-            elif t == "TP3_HIT": target_price = payload.tp3
-            elif t == "SL_HIT":  target_price = payload.sl
-
-        rank = TP_RANK.get(t, 0)
-
-        # 1) Si ENTRY pas encore vu -> tampon
-        if tid not in SEEN_ENTRY:
-            PENDING_EVENTS[tid].append({
-                "event": t,
-                "nice": nice,
-                "hit_price": hit_price,
-                "target_price": target_price,
-                "row": {
-                    "event": t, "time": payload.time, "symbol": payload.symbol, "tf": payload.tf,
-                    "side": (payload.side or "").upper() if payload.side else None,
-                    "entry": hit_price, "target_price": target_price, "trade_id": tid,
-                    "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
-                    "r1": payload.r1, "s1": payload.s1,
-                    "decision": None, "confidence": None, "reason": None,
-                }
-            })
-            return JSONResponse({"ok": True, "queued": t, "trade_id": tid})
-
-        # 2) Si un TP plus haut a déjà été traité -> ignorer niveaux inférieurs
-        if t != "SL_HIT" and BEST_TP_RANK.get(tid, 0) >= rank:
-            return JSONResponse({"ok": True, "ignored_lower_tp": t, "trade_id": tid})
-
-        if t != "SL_HIT":
-            BEST_TP_RANK[tid] = rank
+            if t == "TP1_HIT":
+                target_price = payload.tp1
+            elif t == "TP2_HIT":
+                target_price = payload.tp2
+            elif t == "TP3_HIT":
+                target_price = payload.tp3
+            elif t == "SL_HIT":
+                target_price = payload.sl
 
         msg = (
             f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -524,13 +510,11 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "side": (payload.side or "").upper() if payload.side else None,
             "entry": hit_price,
             "target_price": target_price,
-            "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
-            "r1": payload.r1, "s1": payload.s1,
-            "trade_id": tid,
+            "trade_id": payload.trade_id,
             "decision": None, "confidence": None, "reason": None,
         })
 
-    elif t == "CLOSE" or t == "TRADE_TERMINATED":
+    elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
             title = "TRADE TERMINÉ — TP3 ATTEINT"
@@ -554,7 +538,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "tf": payload.tf,
             "side": (payload.side or "").upper() if payload.side else None,
             "entry": payload.entry,
-            "trade_id": tid,
+            "trade_id": payload.trade_id,
             "term_reason": reason,
             "decision": None, "confidence": None, "reason": None,
         })
@@ -567,7 +551,9 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "event": t,
         "received": payload.dict(),
         "llm": {
-            "enabled": bool(LLM_ENABLED and _openai_client),
+            "enabled": bool(LLM_ENABLED),
+            "client_ready": bool(_openai_client is not None),
+            "down_reason": _llm_reason_down,
             "decision": llm_out.get("decision"),
             "confidence": llm_out.get("confidence"),
             "reason": llm_out.get("reason"),
