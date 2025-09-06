@@ -20,20 +20,18 @@ try:
         _openai_client = None
 except Exception:
     _openai_client = None
-    LLM_ENABLED = False
 
 # ============== ENV (Webhook & Telegram) ==============
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
-CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # seuil visuel éventuel, non bloquant
 
 # ============== APP ==============
 app = FastAPI(title="AI Trader PRO - Webhook", version="3.2.0")
 
 # ============== IN-MEMORY STORE ==============
-# (sur Render free tier, ça repart à 0 si l’instance redémarre)
 TRADES: List[Dict[str, Any]] = []
 MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 
@@ -41,15 +39,15 @@ MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 Number = Optional[Union[float, int, str]]
 
 class TVPayload(BaseModel):
-    # On tolère "type" ou "tag" (Pine peut envoyer tag="ENTRY")
+    # On tolère "type" ou "tag"
     type: Optional[str] = None
     tag:  Optional[str] = None
     symbol: str
     tf: str
     time: int
     side: Optional[str] = None
-    entry: Number = None        # prix d'insert (ENTRY) ou dernier prix (events TP/SL)
-    tp: Number = None           # cible touchée (si envoyée par Pine)
+    entry: Number = None
+    tp: Number = None
     sl: Number = None
     tp1: Number = None
     tp2: Number = None
@@ -58,10 +56,10 @@ class TVPayload(BaseModel):
     s1: Number = None
     trade_id: Optional[str] = None
     secret: Optional[str] = None
-    # champs facultatifs (si Pine/LLM les envoie)
+    # Terminaison + LLM facultatifs
     term_reason: Optional[str] = None
     decision: Optional[str] = None
-    confidence: Optional[float] = None
+    confidence: Optional[float] = None  # accepté en décimal 0..1
     reason: Optional[str] = None
 
     class Config:
@@ -93,7 +91,6 @@ async def send_telegram(text: str) -> None:
             r = await http.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPError:
-            # On ne bloque pas le webhook si Telegram échoue
             pass
 
 # ============== LLM ==============
@@ -152,88 +149,36 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
                 txt = str(r)
         data = _safe_json_parse((txt or "").strip())
         decision = str(data.get("decision", "")).upper() if isinstance(data.get("decision"), str) else None
-        confidence = float(data.get("confidence", 0.0)) if isinstance(data.get("confidence"), (int, float, str)) else None
+        confidence = data.get("confidence", None)
+        try:
+            confidence = None if confidence is None else max(0.0, min(1.0, float(confidence)))
+        except Exception:
+            confidence = None
         reason = str(data.get("reason")) if data.get("reason") is not None else None
-
         if decision not in ("BUY", "SELL", "IGNORE"):
             decision = "IGNORE"
-        if confidence is not None:
-            try:
-                confidence = max(0.0, min(1.0, float(confidence)))
-            except Exception:
-                confidence = None
-
         return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True, "raw": txt}
     except Exception as e:
         return {"decision": None, "confidence": None, "reason": None, "llm_used": False, "error": str(e)}
 
-# ============== RECORDING & STATS ==============
+# ============== RECORDING (Dashboard) ==============
 def _push_trade(row: Dict[str, Any]) -> None:
     TRADES.append(row)
     if len(TRADES) > MAX_TRADES:
         del TRADES[: len(TRADES) - MAX_TRADES]
 
 def _basic_stats() -> Dict[str, Any]:
-    """
-    Stats par trade_id (au plus 1 win/1 loss par trade).
-    Règle d’issue par trade: on prend le DERNIER événement significatif:
-      - TP1_HIT/TP2_HIT/TP3_HIT => win
-      - SL_HIT => loss
-      - TRADE_TERMINATED:
-          * term_reason TP3_HIT => win
-          * term_reason SL_HIT/REVERSAL/INVALIDATED => loss
-          * sinon neutre
-    Les trades sans trade_id sont agrégés par (symbol, tf, time) pour ne pas casser.
-    """
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-
-    def _key(ev: Dict[str, Any]) -> str:
-        tid = ev.get("trade_id")
-        if tid:
-            return f"id:{tid}"
-        return f"anon:{ev.get('symbol')}|{ev.get('tf')}|{ev.get('time')}"
-
-    for ev in TRADES:
-        k = _key(ev)
-        groups.setdefault(k, []).append(ev)
-
-    trades_count = 0
-    wins = 0
-    losses = 0
-    entries = 0
-
-    for _, evs in groups.items():
-        evs_sorted = sorted(evs, key=lambda x: x.get("time", 0))
-        has_entry = any(e.get("event") == "ENTRY" for e in evs_sorted)
-        if has_entry:
-            entries += 1
-            trades_count += 1
-        else:
-            trades_count += 1  # compte quand même le groupe
-
-        decisive = [e for e in evs_sorted if e.get("event") in ("TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT","TRADE_TERMINATED")]
-        if decisive:
-            last = decisive[-1]
-            evt = last.get("event")
-            term_reason = (last.get("term_reason") or "").upper()
-
-            if evt in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-                wins += 1
-            elif evt == "SL_HIT":
-                losses += 1
-            elif evt == "TRADE_TERMINATED":
-                if term_reason == "TP3_HIT":
-                    wins += 1
-                elif term_reason in ("SL_HIT","REVERSAL","INVALIDATED"):
-                    losses += 1
-                else:
-                    pass
-
-    total_decided = wins + losses
-    winrate = (wins / total_decided * 100.0) if total_decided > 0 else 0.0
+    entries = [t for t in TRADES if t.get("event") == "ENTRY"]
+    tp_hits = [t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")]
+    sl_hits = [t for t in TRADES if t.get("event") == "SL_HIT"]
+    wins = len(tp_hits)      # simple: chaque TP_hit = 1 win (peut dépasser les entrées)
+    losses = len(sl_hits)
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
     return {
-        "entries": entries,
-        "trades": trades_count,
+        "entries": len(entries),
+        "tp_hits": len(tp_hits),
+        "sl_hits": len(sl_hits),
         "wins": wins,
         "losses": losses,
         "winrate_pct": round(winrate, 2),
@@ -353,10 +298,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
         rsn = t.get("reason") or "-"
         price_line = ""
         if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
-            price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('entry'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
-        term_line = ""
-        if t["event"] == "TRADE_TERMINATED":
-            term_line = f"<div>Raison de terminaison: <b>{t.get('term_reason','-')}</b></div>"
+            price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('hit_price'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
         line = f"""
 <tr>
   <td style="padding:6px;border-bottom:1px solid #eee">{t.get('time')}</td>
@@ -369,7 +311,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
   <td style="padding:6px;border-bottom:1px solid #eee">
     <div>SL: <b>{_fmt_num(t.get('sl'))}</b> | TP1: <b>{_fmt_num(t.get('tp1'))}</b> | TP2: <b>{_fmt_num(t.get('tp2'))}</b> | TP3: <b>{_fmt_num(t.get('tp3'))}</b></div>
     <div>R1: <b>{_fmt_num(t.get('r1'))}</b> • S1: <b>{_fmt_num(t.get('s1'))}</b></div>
-    {price_line}{term_line}
+    {price_line}
     <div>LLM: <b>{t.get('decision','-')}</b> • Confiance: <b>{conf_txt}</b></div>
     <div>Raison: {rsn}</div>
   </td>
@@ -401,8 +343,8 @@ th,td{{vertical-align:top}}
   <h1>Trades — AI Trader PRO</h1>
 
   <div class="card">
-    <b>Stats (par trade)</b>
-    <div>Trades: <b>{stats['trades']}</b> • Entrées: <b>{stats['entries']}</b></div>
+    <b>Stats</b>
+    <div>Entrées: <b>{stats['entries']}</b> • TP hits: <b>{stats['tp_hits']}</b> • SL hits: <b>{stats['sl_hits']}</b></div>
     <div>Wins: <b>{stats['wins']}</b> • Losses: <b>{stats['losses']}</b> • Winrate: <b>{stats['winrate_pct']}%</b></div>
     <div>Événements total: <b>{stats['events_total']}</b></div>
     <div style="margin-top:8px">
@@ -456,17 +398,30 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
     trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
-    # LLM pour ENTRY si rien n’est fourni par Pine
+    # Déterminer si le Pine a fourni des champs LLM (on fait CONFIANCE AU PINE si présent)
+    has_client_dec = bool((payload.decision or "").strip())
+    has_client_conf = payload.confidence is not None
+    has_client_reason = bool((payload.reason or "").strip())
+    client_provided_any = has_client_dec or has_client_conf or has_client_reason
+
+    # LLM uniquement si rien n'est fourni par le Pine
     llm_out: Dict[str, Any] = {"decision": payload.decision, "confidence": payload.confidence, "reason": payload.reason}
-    if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
+    if t == "ENTRY" and not client_provided_any:
         llm_out = await call_llm_for_entry(payload)
 
     # -------- Telegram + enregistrement --------
     if t == "ENTRY":
-        dec = (llm_out.get("decision") or "—")
-        conf_val = llm_out.get("confidence")
-        conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
-        rsn = llm_out.get("reason") or "-"
+        # prioriser ce qui vient du Pine; sinon ce qui vient du LLM; sinon placeholders
+        dec = (payload.decision or llm_out.get("decision") or "—")
+        conf_val = payload.confidence if has_client_conf else llm_out.get("confidence")
+        rsn = (payload.reason or llm_out.get("reason") or "-")
+
+        conf_pct = "—"
+        if conf_val is not None:
+            try:
+                conf_pct = f"{float(conf_val)*100:.0f}%"
+            except Exception:
+                conf_pct = "—"
 
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -492,6 +447,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "r1": payload.r1, "s1": payload.s1,
             "trade_id": payload.trade_id,
             "decision": dec, "confidence": conf_val, "reason": rsn,
+            "conf_source": "pine" if has_client_conf else ("llm" if llm_out.get("confidence") is not None else "none"),
         })
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
@@ -526,10 +482,9 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "symbol": payload.symbol,
             "tf": payload.tf,
             "side": (payload.side or "").upper() if payload.side else None,
-            "entry": hit_price,
-            "target_price": target_price,
-            "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
-            "r1": payload.r1, "s1": payload.s1,
+            "entry": hit_price,                 # compat
+            "hit_price": hit_price,             # pour dashboard
+            "target_price": target_price,       # pour dashboard
             "trade_id": payload.trade_id,
             "decision": None, "confidence": None, "reason": None,
         })
@@ -572,9 +527,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "received": payload.dict(),
         "llm": {
             "enabled": bool(LLM_ENABLED and _openai_client),
-            "decision": llm_out.get("decision"),
-            "confidence": llm_out.get("confidence"),
-            "reason": llm_out.get("reason"),
+            "used": bool(t == "ENTRY" and not client_provided_any and _openai_client is not None),
         },
         "sent_to_telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "stats": _basic_stats(),
