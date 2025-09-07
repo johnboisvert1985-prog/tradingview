@@ -17,7 +17,6 @@ _openai_client = None
 _llm_reason_down = None
 if LLM_ENABLED and OPENAI_API_KEY:
     try:
-        # OpenAI SDK v1
         from openai import OpenAI
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
@@ -34,10 +33,10 @@ WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
-CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))
+CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.2.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.3.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -144,7 +143,6 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
         }
     prompt = _build_llm_prompt(p)
     try:
-        # Essayez d'abord l'API chat.completions (large compat)
         comp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
@@ -157,7 +155,6 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
         )
         txt = comp.choices[0].message.content if comp and comp.choices else ""
     except Exception as e_chat:
-        # Fallback vers responses API si dispo
         try:
             r = _openai_client.responses.create(
                 model=LLM_MODEL,
@@ -368,7 +365,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 <style>
 body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.5;margin:20px;color:#111}}
 .card{{border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:14px 0}}
-.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111;margin-right:8px}}
+.btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #e5e7eb;text-decoration:none;color:#111}}
 table{{border-collapse:collapse;width:100%;font-size:14px}}
 code{{background:#f9fafb;padding:2px 4px;border-radius:6px}}
 th,td{{vertical-align:top}}
@@ -438,6 +435,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
+    # ========== FILTRE CONFIDENCE SUR LES ENTRÉES ==========
+    def _conf_ok(cv: Optional[float]) -> bool:
+        return (cv is not None) and (cv >= CONFIDENCE_MIN)
+
     # -------- Telegram + enregistrement --------
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
@@ -449,6 +450,30 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             why = llm_out.get("why") or _llm_reason_down or "-"
             llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
+        # applique le seuil : si < CONFIDENCE_MIN -> on ignore (pas d'envoi, pas de dashboard)
+        if not _conf_ok(conf_val):
+            reason_filter = (
+                f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} "
+                f"< seuil {CONFIDENCE_MIN*100:.0f}% — entrée ignorée"
+            )
+            return JSONResponse({
+                "ok": True,
+                "event": "ENTRY_FILTERED",
+                "filter": {"reason": reason_filter, "threshold": CONFIDENCE_MIN},
+                "received": payload.dict(),
+                "llm": {
+                    "enabled": bool(LLM_ENABLED),
+                    "client_ready": bool(_openai_client is not None),
+                    "down_reason": _llm_reason_down,
+                    "decision": llm_out.get("decision"),
+                    "confidence": llm_out.get("confidence"),
+                    "reason": llm_out.get("reason"),
+                },
+                "sent_to_telegram": False,
+                "stats": _basic_stats(),
+            })
+
+        # Sinon => on envoie & on enregistre
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
@@ -457,7 +482,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
             f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
             f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>\n"
-            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b>\n"
+            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
             f"📝 Raison: {rsn}"
             f"{llm_note}"
         )
