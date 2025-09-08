@@ -35,6 +35,12 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
 
+# >>> PATCH (minime) — Bouton Telegram vers le dashboard
+TG_BUTTONS       = os.getenv("TG_BUTTONS", "0") not in ("0", "false", "False", "")
+TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "")
+TG_BUTTON_TEXT   = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
+# <<< PATCH
+
 # ============== APP ==============
 app = FastAPI(title="AI Trader PRO - Webhook", version="3.5.0")
 
@@ -95,11 +101,19 @@ def _fmt_pct(x: Optional[float]) -> str:
     except Exception:
         return "-"
 
-async def send_telegram(text: str) -> None:
+# >>> PATCH — ajoute inline buttons sans casser l'existant
+async def send_telegram(text: str, inline_url: Optional[str] = None, inline_text: Optional[str] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload: Dict[str, Any] = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+
+    # Ajoute un bouton seulement si activé ET URL fournie
+    if TG_BUTTONS and (inline_url or TG_DASHBOARD_URL):
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": inline_text or TG_BUTTON_TEXT, "url": inline_url or TG_DASHBOARD_URL}]]
+        }
+
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
@@ -107,6 +121,7 @@ async def send_telegram(text: str) -> None:
             r.raise_for_status()
         except httpx.HTTPError:
             pass
+# <<< PATCH
 
 # ============== LLM ==============
 def _build_llm_prompt(p: TVPayload) -> str:
@@ -636,7 +651,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 "stats": _basic_stats(),
             })
 
-        # Sinon => envoi & enregistrement
+        # Sinon => envoi & enregistrement (bouton ajouté)
         msg = (
             f"{header_emoji} <b>ALERTE!!!</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
@@ -649,7 +664,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"📝 Raison: {rsn}"
             f"{llm_note}"
         )
-        await send_telegram(msg)
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": "ENTRY",
@@ -688,7 +703,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
         )
-        await send_telegram(msg)
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": t,
@@ -717,7 +732,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"⏹ <b>{title}</b>\n"
             f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
         )
-        await send_telegram(msg)
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": "TRADE_TERMINATED",
@@ -752,6 +767,3 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
-
-
-
