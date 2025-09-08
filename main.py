@@ -640,10 +640,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
             f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
             f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
             f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
+            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
             f"Première Résistance: <b>{_fmt_num(payload.r1)}</b>  •  Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
             f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
             f"📝 Raison: {rsn}"
@@ -752,3 +752,4 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
+
