@@ -14,7 +14,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 # Nouveau: auto-approve des ENTRY si LLM indispo ou manquant (1=on, 0=off)
-AUTO_APPROVE = os.getenv("AUTO_APPROVE", "1") not in ("0", "false", "False", "")
+AUTO_APPROVE = os.getenv("AUTO_APPROVE", "0") not in ("0", "false", "False", "")
 
 _openai_client = None
 _llm_reason_down = None
@@ -748,3 +748,4 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
+
