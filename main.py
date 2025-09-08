@@ -13,9 +13,6 @@ LLM_ENABLED = os.getenv("LLM_ENABLED", "1") not in ("0", "false", "False", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
-# Nouveau: auto-approve des ENTRY si LLM indispo ou manquant (1=on, 0=off)
-AUTO_APPROVE = os.getenv("AUTO_APPROVE", "0") not in ("0", "false", "False", "")
-
 _openai_client = None
 _llm_reason_down = None
 if LLM_ENABLED and OPENAI_API_KEY:
@@ -39,7 +36,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.5.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -228,11 +225,18 @@ def _basic_stats() -> Dict[str, Any]:
 _TERMINAL = {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}
 
 def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Regroupe par trade_id et détermine le résultat du trade:
+    - WIN si le premier évènement terminal est un TPx
+    - LOSS si le premier évènement terminal est SL_HIT
+    - OPEN sinon
+    """
     groups: Dict[str, Dict[str, Any]] = {}
 
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
+            # on saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -256,14 +260,16 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["tp3"] = ev.get("tp3")
             g["entry_time"] = ev.get("time")
 
+        # mémorise chaque event avec infos utiles
         if ev.get("event") in _TERMINAL:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),
-                ev.get("target_price"),
+                ev.get("entry"),        # hit price (payload.entry écrit ici comme prix touché côté /tv-webhook)
+                ev.get("target_price"), # target (tp/sl) réel
             ))
 
+    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
 
@@ -309,7 +315,7 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "open": open_trades,
         "wins": wins,
         "losses": losses,
-        "true_winrate": true_wr,
+        "true_winrate": true_wr,  # 0..1
         "true_winrate_pct": round((true_wr * 100.0), 2) if true_wr is not None else None,
     }
     return summary_rows, agg_stats
@@ -331,7 +337,6 @@ def home():
         ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and _openai_client) else "-"),
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
         ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
-        ("AUTO_APPROVE", str(bool(AUTO_APPROVE))),
         ("PORT", str(PORT)),
     ]
     rows_html = "".join(
@@ -387,7 +392,6 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "LLM_DOWN_REASON": _llm_reason_down,
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and _openai_client) else None,
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
-        "AUTO_APPROVE": bool(AUTO_APPROVE),
         "PORT": PORT,
     }
 
@@ -429,6 +433,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     stats = _basic_stats()
     groups, gstats = _group_trades_by_id()
 
+    # ---- tableau des événements (identique à avant)
     rows = []
     for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
         conf = t.get("confidence")
@@ -457,6 +462,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 """
         rows.append(line)
 
+    # ---- tableau groupé par trade_id
     grows = []
     for g in sorted(groups, key=lambda x: (x.get("entry_time") or 0), reverse=True)[:300]:
         grows.append(f"""
@@ -583,12 +589,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # ===== Fallback AUTO_APPROVE =====
-    if t == "ENTRY" and AUTO_APPROVE and (llm_out.get("decision") is None or llm_out.get("confidence") is None):
-        side_upper = (payload.side or "").upper()
-        mapped = "BUY" if side_upper == "LONG" else ("SELL" if side_upper == "SHORT" else "IGNORE")
-        llm_out = {"decision": mapped, "confidence": 1.0 if mapped != "IGNORE" else 0.0, "reason": "auto_approved_no_llm", "llm_used": False}
-
     # ========== GATE: direction + confiance ==========
     def _conf_ok(cv: Optional[float]) -> bool:
         return (cv is not None) and (cv >= CONFIDENCE_MIN)
@@ -606,8 +606,8 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         rsn = llm_out.get("reason") or "-"
         llm_note = ""
         if not llm_out.get("llm_used", False):
-            why = llm_out.get("why") or _llm_reason_down or "fallback_or_decision_from_pine"
-            llm_note = f"\n⚠️ <i>LLM non utilisé</i> (<code>{why}</code>)"
+            why = llm_out.get("why") or _llm_reason_down or "-"
+            llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
         # Applique les deux filtres
         if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
@@ -642,7 +642,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
             f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
             f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>\n"
-            f"🤖 Decision: <b>{dec}</b>  | <b>Confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
+            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
             f"📝 Raison: {rsn}"
             f"{llm_note}"
         )
@@ -731,6 +731,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
+    # réponse API
     groups, gstats = _group_trades_by_id()
     return JSONResponse({
         "ok": True,
@@ -748,4 +749,3 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
-
