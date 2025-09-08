@@ -36,7 +36,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.3.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.4.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -435,9 +435,14 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # ========== FILTRE CONFIDENCE SUR LES ENTRÉES ==========
+    # ========== GATE: direction + confiance ==========
     def _conf_ok(cv: Optional[float]) -> bool:
         return (cv is not None) and (cv >= CONFIDENCE_MIN)
+
+    def _dir_ok(side: Optional[str], decision: Optional[str]) -> bool:
+        s = (side or "").upper()
+        d = (decision or "").upper()
+        return (s == "LONG" and d == "BUY") or (s == "SHORT" and d == "SELL")
 
     # -------- Telegram + enregistrement --------
     if t == "ENTRY":
@@ -450,16 +455,17 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             why = llm_out.get("why") or _llm_reason_down or "-"
             llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
-        # applique le seuil : si < CONFIDENCE_MIN -> on ignore (pas d'envoi, pas de dashboard)
-        if not _conf_ok(conf_val):
-            reason_filter = (
-                f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} "
-                f"< seuil {CONFIDENCE_MIN*100:.0f}% — entrée ignorée"
-            )
+        # Applique les deux filtres
+        if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
+            reason_filter = []
+            if not _conf_ok(conf_val):
+                reason_filter.append(f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} < seuil {CONFIDENCE_MIN*100:.0f}%")
+            if not _dir_ok(payload.side, dec):
+                reason_filter.append(f"Incohérence directionnelle (side={ (payload.side or '—').upper() } / decision={ (dec or '—').upper() })")
             return JSONResponse({
                 "ok": True,
                 "event": "ENTRY_FILTERED",
-                "filter": {"reason": reason_filter, "threshold": CONFIDENCE_MIN},
+                "filter": {"reasons": reason_filter, "threshold": CONFIDENCE_MIN},
                 "received": payload.dict(),
                 "llm": {
                     "enabled": bool(LLM_ENABLED),
@@ -473,7 +479,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 "stats": _basic_stats(),
             })
 
-        # Sinon => on envoie & on enregistre
+        # Sinon => envoi & enregistrement
         msg = (
             f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
