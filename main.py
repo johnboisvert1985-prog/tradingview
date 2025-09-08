@@ -1,6 +1,7 @@
 # main.py
 import os
 import json
+import urllib.parse
 from typing import Optional, Union, Dict, Any, List, Tuple
 
 import httpx
@@ -34,6 +35,27 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
+
+# --- Telegram rendering options (NEW) ---
+TG_PARSE       = os.getenv("TG_PARSE", "HTML").upper()           # HTML | MARKDOWN
+TG_SILENT      = os.getenv("TG_SILENT", "0") in ("1", "true", "True")
+TG_DASHBOARD   = os.getenv("TG_DASHBOARD_URL", "").strip()
+TG_SHOW_LLM    = os.getenv("TG_SHOW_LLM", "1") in ("1", "true", "True")
+TG_COMPACT     = os.getenv("TG_COMPACT", "0") in ("1", "true", "True")
+TG_BUTTONS     = os.getenv("TG_BUTTONS", "1") in ("1", "true", "True")
+
+TG_TPL_ENTRY       = os.getenv("TG_TEMPLATE_ENTRY", "").strip()
+TG_TPL_HIT         = os.getenv("TG_TEMPLATE_HIT", "").strip()
+TG_TPL_TERMINATED  = os.getenv("TG_TEMPLATE_TERMINATED", "").strip()
+
+def _tv_url(symbol: str, tf: str) -> str:
+    tf_map = {"5": "5", "15": "15", "60": "60", "240": "240", "1D": "D", "D": "D", "4H": "240"}
+    itv = tf_map.get((tf or "").upper(), tf)
+    return f"https://www.tradingview.com/chart/?symbol={urllib.parse.quote(symbol)}&interval={itv}"
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return ""
 
 # ============== APP ==============
 app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
@@ -95,7 +117,12 @@ def _fmt_pct(x: Optional[float]) -> str:
     except Exception:
         return "-"
 
+def _inline_keyboard(buttons: List[Tuple[str, str]]) -> dict:
+    kb = [[{"text": t, "url": u}] for (t, u) in buttons if u]
+    return {"inline_keyboard": kb} if kb else {}
+
 async def send_telegram(text: str) -> None:
+    """Legacy simple sender (kept for /tg-health)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -107,6 +134,74 @@ async def send_telegram(text: str) -> None:
             r.raise_for_status()
         except httpx.HTTPError:
             pass
+
+async def send_telegram_ex(
+    text: str,
+    buttons: Optional[List[Tuple[str, str]]] = None,
+    silent: Optional[bool] = None,
+    parse: Optional[str] = None,
+) -> None:
+    """Enhanced sender with templates/buttons/parse mode."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": (parse or TG_PARSE),
+        "disable_web_page_preview": True,
+        "disable_notification": (TG_SILENT if silent is None else silent),
+    }
+    if buttons and TG_BUTTONS:
+        payload["reply_markup"] = _inline_keyboard(buttons)
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        try:
+            r = await http.post(url, json=payload)
+            r.raise_for_status()
+        except httpx.HTTPError:
+            pass
+
+# -------- Default templates if ENV is empty --------
+def _default_entry_template() -> str:
+    if TG_PARSE == "MARKDOWN":
+        base = (
+            "**ALERTE** • **{symbol}** • **{tf}**\n"
+            "→ {side} | Entry: `{entry}`\n"
+            "SL `{sl}` | TP1 `{tp1}` | TP2 `{tp2}` | TP3 `{tp3}`\n"
+        )
+        if TG_SHOW_LLM:
+            base += "LLM: **{decision}** | Confiance: **{confidence_pct}**\n"
+        if not TG_COMPACT:
+            base += "R1 `{r1}` • S1 `{s1}`\n"
+        base += "{llm_line}"
+        return base
+    # HTML
+    base = (
+        "📣 <b>ALERTE</b> • <b>{symbol}</b> • <b>{tf}</b>\n"
+        "Direction: <b>{side}</b> | Entry: <b>{entry}</b>\n"
+        "🎯 SL: <b>{sl}</b> | TP1: <b>{tp1}</b> | TP2: <b>{tp2}</b> | TP3: <b>{tp3}</b>\n"
+    )
+    if TG_SHOW_LLM:
+        base += "🤖 LLM: <b>{decision}</b> | <b>Confiance: {confidence_pct}</b>\n"
+    if not TG_COMPACT:
+        base += "R1: <b>{r1}</b>  •  S1: <b>{s1}</b>\n"
+    base += "{llm_line}"
+    return base
+
+def _default_hit_template() -> str:
+    if TG_PARSE == "MARKDOWN":
+        return "{title} • **{symbol}** • **{tf}**\nHit: `{hit_price}` • Target: `{target_price}`"
+    return "{title} • <b>{symbol}</b> • <b>{tf}</b>\nPrix touché: <b>{hit_price}</b> • Cible: <b>{target_price}</b>"
+
+def _default_term_template() -> str:
+    if TG_PARSE == "MARKDOWN":
+        return "⏹ **{title}**\nInstrument: **{symbol}** • TF: **{tf}** • ID: `{trade_id}`"
+    return "⏹ <b>{title}</b>\nInstrument: <b>{symbol}</b> • TF: <b>{tf}</b> • ID: <code>{trade_id}</code>"
+
+def _render_template(tpl: str, ctx: dict, fallback: str) -> str:
+    template = tpl if tpl else fallback
+    return template.format_map(_SafeDict(ctx))
 
 # ============== LLM ==============
 def _build_llm_prompt(p: TVPayload) -> str:
@@ -197,7 +292,7 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
 
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
-# ============== RECORDING (Dashboard par événements) ==============
+# ============== RECORDING (Dashboard basique + groupé) ==============
 def _push_trade(row: Dict[str, Any]) -> None:
     TRADES.append(row)
     if len(TRADES) > MAX_TRADES:
@@ -207,7 +302,7 @@ def _basic_stats() -> Dict[str, Any]:
     entries = [t for t in TRADES if t.get("event") == "ENTRY"]
     tp_hits = [t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")]
     sl_hits = [t for t in TRADES if t.get("event") == "SL_HIT"]
-    wins = len(tp_hits)  # ATTENTION: compte les events TP, pas les trades
+    wins = len(tp_hits)  # ATTENTION: compte les TP events, pas les trades
     losses = len(sl_hits)
     total = wins + losses
     winrate = (wins / total * 100.0) if total > 0 else 0.0
@@ -221,10 +316,11 @@ def _basic_stats() -> Dict[str, Any]:
         "events_total": len(TRADES),
     }
 
-# ============== NEW: Agrégation par trade_id (vrai winrate) ==============
+# ---- NEW: Agrégation par trade_id (vrai winrate) ----
 _TERMINAL = {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}
 
-def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+from typing import Tuple as _Tuple
+def _group_trades_by_id() -> _Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Regroupe par trade_id et détermine le résultat du trade:
     - WIN si le premier évènement terminal est un TPx
@@ -236,7 +332,6 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
-            # saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -248,7 +343,7 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "entry": None,
                 "sl": None, "tp1": None, "tp2": None, "tp3": None,
                 "entry_time": None,
-                "events": [],  # (time, event, hit_price, target_price)
+                "events": [],  # (time, event, price, target_price)
             }
             groups[tid] = g
 
@@ -264,11 +359,10 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),        # prix touché
-                ev.get("target_price"), # cible (tp/sl)
+                ev.get("entry"),        # hit price
+                ev.get("target_price"), # target (tp/sl)
             ))
 
-    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
 
@@ -336,6 +430,11 @@ def home():
         ("LLM_MODEL", LLM_MODEL if (LLM_ENABLED and _openai_client) else "-"),
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
         ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
+        ("TG_PARSE", TG_PARSE),
+        ("TG_SILENT", str(TG_SILENT)),
+        ("TG_SHOW_LLM", str(TG_SHOW_LLM)),
+        ("TG_COMPACT", str(TG_COMPACT)),
+        ("TG_BUTTONS", str(TG_BUTTONS)),
         ("PORT", str(PORT)),
     ]
     rows_html = "".join(
@@ -391,6 +490,11 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "LLM_DOWN_REASON": _llm_reason_down,
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and _openai_client) else None,
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
+        "TG_PARSE": TG_PARSE,
+        "TG_SILENT": TG_SILENT,
+        "TG_SHOW_LLM": TG_SHOW_LLM,
+        "TG_COMPACT": TG_COMPACT,
+        "TG_BUTTONS": TG_BUTTONS,
         "PORT": PORT,
     }
 
@@ -425,10 +529,12 @@ def favicon():
 # ============== ROUTE — TRADES DASHBOARD ==============
 @app.get("/trades")
 def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        # pour /trades publics non sensibles on autorise sans secret,
+        # mais si secret fourni et faux -> 401
+        if secret is not None:
+            raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # JSON enrichi
     if format == "json":
         groups, gstats = _group_trades_by_id()
         return {"stats_events": _basic_stats(), "stats_trades": gstats, "trades_raw": TRADES, "groups": groups}
@@ -443,7 +549,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
         conf_txt = "-" if conf is None else f"{float(conf)*100:.0f}%"
         rsn = t.get("reason") or "-"
         price_line = ""
-        if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
+        if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
             price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('entry'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
         line = f"""
 <tr>
@@ -484,9 +590,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 
     clear_btn = ""
     if WEBHOOK_SECRET:
-        # si secret fourni en query on réutilise dans le bouton pour rester sur la même session
-        q = f"?secret={WEBHOOK_SECRET}" if not secret else f"?secret={secret}"
-        clear_btn = f'<a class="btn" href="/trades/clear{q}">Vider l’historique</a>'
+        clear_btn = f'<a class="btn" href="/trades/clear?secret={WEBHOOK_SECRET}">Vider l’historique</a>'
 
     html = f"""
 <!doctype html>
@@ -512,17 +616,17 @@ th,td{{vertical-align:top}}
     <div>Entrées: <b>{stats['entries']}</b> • TP hits: <b>{stats['tp_hits']}</b> • SL hits: <b>{stats['sl_hits']}</b></div>
     <div>Wins (par évènement TP): <b>{stats['wins']}</b> • Losses (SL): <b>{stats['losses']}</b> • Winrate: <b>{stats['winrate_pct']}%</b></div>
     <div>Événements total: <b>{stats['events_total']}</b></div>
+    <div style="margin-top:8px">
+      <a class="btn" href="/trades?format=json">JSON</a>
+      <a class="btn" href="/">Status</a>
+      {clear_btn}
+    </div>
   </div>
 
   <div class="card">
     <b>Résultats par trade (groupés par <code>trade_id</code>)</b>
     <div>Trades total: <b>{gstats['trades_total']}</b> • Fermés: <b>{gstats['closed']}</b> • Ouverts: <b>{gstats['open']}</b></div>
     <div>Gagnants: <b>{gstats['wins']}</b> • Perdants: <b>{gstats['losses']}</b> • <u>True Winrate</u>: <b>{_fmt_pct(gstats['true_winrate'])}</b></div>
-    <div style="margin-top:8px">
-      <a class="btn" href="/trades?format=json{'' if not secret else f'&secret={secret}'}">JSON</a>
-      <a class="btn" href="/">{'Status'}</a>
-      {clear_btn}
-    </div>
     <div style="margin-top:10px;max-height:60vh;overflow:auto;border:1px solid #eee;border-radius:12px">
       <table>
         <thead>
@@ -586,7 +690,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             raise HTTPException(status_code=401, detail="Invalid secret")
 
     t = (payload.type or payload.tag or "").upper()
-    header_emoji = "🟩" if (payload.side or "").upper() == "LONG" else ("🟥" if (payload.side or "").upper() == "SHORT" else "▫️")
     trade_id_txt = f" • ID: <code>{payload.trade_id}</code>" if payload.trade_id else ""
 
     # LLM pour ENTRY si manquant
@@ -594,38 +697,34 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # ========== GATE: direction + confiance ==========
+    # ========== FILTRE CONFIDENCE SUR LES ENTRÉES ==========
     def _conf_ok(cv: Optional[float]) -> bool:
         return (cv is not None) and (cv >= CONFIDENCE_MIN)
-
-    def _dir_ok(side: Optional[str], decision: Optional[str]) -> bool:
-        s = (side or "").upper()
-        d = (decision or "").upper()
-        return (s == "LONG" and d == "BUY") or (s == "SHORT" and d == "SELL")
 
     # -------- Telegram + enregistrement --------
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
         conf_val = llm_out.get("confidence")
-        conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
+        conf_pct = _fmt_pct(conf_val)
         rsn = llm_out.get("reason") or "-"
         llm_note = ""
         if not llm_out.get("llm_used", False):
             why = llm_out.get("why") or _llm_reason_down or "-"
-            llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
+            if TG_PARSE == "HTML":
+                llm_note = f"\n⚠️ LLM indisponible (<code>{why}</code>)"
+            else:
+                llm_note = f"\n⚠️ LLM indisponible (`{why}`)"
 
-        # Applique les deux filtres
-        if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
-            reason_filter = []
-            if not _conf_ok(conf_val):
-                reason_filter.append(f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} < seuil {CONFIDENCE_MIN*100:.0f}%")
-            if not _dir_ok(payload.side, dec):
-                reason_filter.append(f"Incohérence directionnelle (side={ (payload.side or '—').upper() } / decision={ (dec or '—').upper() })")
-            groups, gstats = _group_trades_by_id()
+        # applique le seuil : si < CONFIDENCE_MIN -> on ignore (pas d'envoi, pas de dashboard)
+        if not _conf_ok(conf_val):
+            reason_filter = (
+                f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} "
+                f"< seuil {CONFIDENCE_MIN*100:.0f}% — entrée ignorée"
+            )
             return JSONResponse({
                 "ok": True,
                 "event": "ENTRY_FILTERED",
-                "filter": {"reasons": reason_filter, "threshold": CONFIDENCE_MIN},
+                "filter": {"reason": reason_filter, "threshold": CONFIDENCE_MIN},
                 "received": payload.dict(),
                 "llm": {
                     "enabled": bool(LLM_ENABLED),
@@ -636,24 +735,37 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                     "reason": llm_out.get("reason"),
                 },
                 "sent_to_telegram": False,
-                "stats_events": _basic_stats(),
-                "stats_trades": gstats,
+                "stats": _basic_stats(),
             })
 
-        # Sinon => envoi & enregistrement
-        msg = (
-            f"{header_emoji} <b>ALERTE</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
-            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
-            f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
-            f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"R1: <b>{_fmt_num(payload.r1)}</b>  •  S1: <b>{_fmt_num(payload.s1)}</b>\n"
-            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
-            f"📝 Raison: {rsn}"
-            f"{llm_note}"
-        )
-        await send_telegram(msg)
+        # Sinon => on envoie & on enregistre (TEMPLATES)
+        ctx = {
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "—").upper(),
+            "entry": _fmt_num(payload.entry),
+            "sl": _fmt_num(payload.sl),
+            "tp1": _fmt_num(payload.tp1),
+            "tp2": _fmt_num(payload.tp2),
+            "tp3": _fmt_num(payload.tp3),
+            "r1": _fmt_num(payload.r1),
+            "s1": _fmt_num(payload.s1),
+            "decision": dec,
+            "confidence_pct": conf_pct,
+            "reason": rsn,
+            "trade_id": payload.trade_id or "-",
+            "dashboard_url": TG_DASHBOARD,
+            "tradingview_url": _tv_url(payload.symbol, payload.tf),
+            "llm_line": ("" if (not TG_SHOW_LLM or TG_COMPACT) else (("📝 "+rsn) if TG_PARSE=="HTML" else ("Note: "+rsn))),
+        }
+        msg = _render_template(TG_TPL_ENTRY, ctx, _default_entry_template())
+
+        buttons: List[Tuple[str, str]] = []
+        if TG_DASHBOARD:
+            buttons.append(("📊 Dashboard", TG_DASHBOARD))
+        buttons.append(("📈 TradingView", _tv_url(payload.symbol, payload.tf)))
+
+        await send_telegram_ex(msg, buttons=buttons)
 
         _push_trade({
             "event": "ENTRY",
@@ -688,11 +800,22 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             elif t == "SL_HIT":
                 target_price = payload.sl
 
-        msg = (
-            f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
-        )
-        await send_telegram(msg)
+        ctx_hit = {
+            "title": nice,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "hit_price": _fmt_num(hit_price),
+            "target_price": _fmt_num(target_price),
+            "trade_id": payload.trade_id or "-",
+        }
+        msg = _render_template(TG_TPL_HIT, ctx_hit, _default_hit_template())
+
+        buttons: List[Tuple[str, str]] = []
+        if TG_DASHBOARD:
+            buttons.append(("📊 Dashboard", TG_DASHBOARD))
+        buttons.append(("📈 TradingView", _tv_url(payload.symbol, payload.tf)))
+
+        await send_telegram_ex(msg, buttons=buttons)
 
         _push_trade({
             "event": t,
@@ -717,11 +840,16 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         else:
             title = "TRADE TERMINÉ — VEUILLEZ FERMER"
 
-        msg = (
-            f"⏹ <b>{title}</b>\n"
-            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
-        )
-        await send_telegram(msg)
+        ctx_term = {
+            "title": title,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "trade_id": payload.trade_id or "-",
+        }
+        msg = _render_template(TG_TPL_TERMINATED, ctx_term, _default_term_template())
+
+        buttons: Optional[List[Tuple[str, str]]] = [("📊 Dashboard", TG_DASHBOARD)] if TG_DASHBOARD else None
+        await send_telegram_ex(msg, buttons=buttons)
 
         _push_trade({
             "event": "TRADE_TERMINATED",
@@ -738,7 +866,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
-    # réponse API enrichie
+    # réponse API
     groups, gstats = _group_trades_by_id()
     return JSONResponse({
         "ok": True,
