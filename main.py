@@ -705,11 +705,11 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
-            title = "TRADE TERMINÉ — TP3 ATTEINT"
+            title = "TRADE TERMINÉ — TP3 ATTEINT FELICITATION"
         elif reason in ("REVERSAL", "INVALIDATED"):
-            title = "TRADE INVALIDÉ — VEUILLEZ FERMER!"
+            title = "TRADE INVALIDÉ — VEUILLEZ FERMER! MERCI"
         elif reason == "SL_HIT":
-            title = "TRADE TERMINÉ — SL ATTEINT"
+            title = "TRADE TERMINÉ — SL ATTEINT DESOLE"
         else:
             title = "TRADE TERMINÉ — VEUILLEZ FERMER"
 
@@ -752,4 +752,5 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
+
 
