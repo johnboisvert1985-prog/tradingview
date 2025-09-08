@@ -748,7 +748,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "tp1": _fmt_num(payload.tp1),
             "tp2": _fmt_num(payload.tp2),
             "tp3": _fmt_num(payload.tp3),
-            "Première Résistance": _fmt_num(payload.r1),
+            "Premiere Resistance": _fmt_num(payload.r1),
             "Premier Support": _fmt_num(payload.s1),
             "decision": dec,
             "confidence_pct": conf_pct,
@@ -884,4 +884,5 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
+
 
