@@ -251,6 +251,7 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
+            # on saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -274,14 +275,16 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["tp3"] = ev.get("tp3")
             g["entry_time"] = ev.get("time")
 
+        # mémorise chaque event avec infos utiles
         if ev.get("event") in _TERMINAL:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),
-                ev.get("target_price"),
+                ev.get("entry"),        # hit price (payload.entry écrit ici comme prix touché côté /tv-webhook)
+                ev.get("target_price"), # target (tp/sl) réel
             ))
 
+    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
 
@@ -448,7 +451,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     stats = _basic_stats()
     groups, gstats = _group_trades_by_id()
 
-    # ---- tableau des événements
+    # ---- tableau des événements (identique à avant)
     rows = []
     for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
         conf = t.get("confidence")
@@ -624,6 +627,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             why = llm_out.get("why") or _llm_reason_down or "-"
             llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
+        # Applique les deux filtres
         if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
             reason_filter = []
             if not _conf_ok(conf_val):
@@ -647,7 +651,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 "stats": _basic_stats(),
             })
 
-        # Sinon => envoi & enregistrement (bouton + infos levier/qty)
+        # Sinon => envoi & enregistrement (bouton ajouté)
         msg = (
             f"{header_emoji} <b>ALERTE!!!</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
@@ -660,20 +664,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             f"📝 Raison: {rsn}"
             f"{llm_note}"
         )
-
-        # ==== PATCH START: show size/leverage in Telegram ====
-        extra_size = ""
-        _pd = payload.dict()
-        if _pd.get("lev_reco") is not None:
-            extra_size = (
-                f"\n📏 Qty≈ <b>{_fmt_num(_pd.get('qty_reco'))}</b> • "
-                f"Notional≈ <b>{_fmt_num(_pd.get('notional'))}$</b> • "
-                f"Lev used≈ <b>{_fmt_num(_pd.get('lev_used'))}x</b> • "
-                f"Lev conseillé≈ <b>{_fmt_num(_pd.get('lev_reco'))}x</b>"
-            )
-        msg += extra_size
-        # ==== PATCH END ====
-
         await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
