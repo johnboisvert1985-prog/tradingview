@@ -1,7 +1,6 @@
 # main.py
 import os
 import json
-import asyncio
 from typing import Optional, Union, Dict, Any, List, Tuple
 
 import httpx
@@ -43,11 +42,15 @@ TG_BUTTON_TEXT   = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
 # <<< PATCH
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.5.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
 MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
+
+# Anti-doublons (idempotence simple)
+SEEN_KEYS: set = set()
+MAX_SEEN = 5000
 
 # ============== MODELS ==============
 Number = Optional[Union[float, int, str]]
@@ -75,6 +78,10 @@ class TVPayload(BaseModel):
     decision: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
+    # >>> NEW: sizing côté Pine
+    lev_reco: Number = None
+    qty_reco: Number = None
+    notional: Number = None
 
     class Config:
         extra = "allow"
@@ -102,7 +109,7 @@ def _fmt_pct(x: Optional[float]) -> str:
     except Exception:
         return "-"
 
-# >>> PATCH — ajoute inline buttons + timeout plus court et non bloquant possible
+# >>> PATCH — ajoute inline buttons sans casser l'existant
 async def send_telegram(text: str, inline_url: Optional[str] = None, inline_text: Optional[str] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -115,7 +122,7 @@ async def send_telegram(text: str, inline_url: Optional[str] = None, inline_text
             "inline_keyboard": [[{"text": inline_text or TG_BUTTON_TEXT, "url": inline_url or TG_DASHBOARD_URL}]]
         }
 
-    timeout = httpx.Timeout(5.0, connect=3.0, read=5.0, write=5.0)
+    timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
             r = await http.post(url, json=payload)
@@ -214,7 +221,23 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
 # ============== RECORDING (Dashboard basique) ==============
+def _dedup_key(row: Dict[str, Any]) -> str:
+    # Unifie par (event, trade_id); si pas de trade_id, prend (event,symbol,time)
+    tid = row.get("trade_id") or f"{row.get('symbol','?')}|{row.get('time','?')}"
+    return f"{row.get('event')}|{tid}"
+
 def _push_trade(row: Dict[str, Any]) -> None:
+    key = _dedup_key(row)
+    if key in SEEN_KEYS:
+        return
+    SEEN_KEYS.add(key)
+    if len(SEEN_KEYS) > MAX_SEEN:
+        # purge simple
+        for _ in range(len(SEEN_KEYS) - MAX_SEEN):
+            try:
+                SEEN_KEYS.pop()
+            except KeyError:
+                break
     TRADES.append(row)
     if len(TRADES) > MAX_TRADES:
         del TRADES[: len(TRADES) - MAX_TRADES]
@@ -241,10 +264,18 @@ def _basic_stats() -> Dict[str, Any]:
 _TERMINAL = {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}
 
 def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Regroupe par trade_id et détermine le résultat du trade:
+    - WIN si le premier évènement terminal est un TPx
+    - LOSS si le premier évènement terminal est SL_HIT
+    - OPEN sinon
+    """
     groups: Dict[str, Dict[str, Any]] = {}
+
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
+            # on saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -268,14 +299,16 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["tp3"] = ev.get("tp3")
             g["entry_time"] = ev.get("time")
 
+        # mémorise chaque event avec infos utiles
         if ev.get("event") in _TERMINAL:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),
-                ev.get("target_price"),
+                ev.get("entry"),        # hit price (payload.entry écrit ici comme prix touché côté /tv-webhook)
+                ev.get("target_price"), # target (tp/sl) réel
             ))
 
+    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
 
@@ -287,9 +320,11 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             first_hit = evs[0]
             e = first_hit[1]
             if e.startswith("TP"):
-                status = "WIN"; wins += 1
+                status = "WIN"
+                wins += 1
             elif e == "SL_HIT":
-                status = "LOSS"; losses += 1
+                status = "LOSS"
+                losses += 1
         else:
             open_trades += 1
 
@@ -319,7 +354,7 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "open": open_trades,
         "wins": wins,
         "losses": losses,
-        "true_winrate": true_wr,
+        "true_winrate": true_wr,  # 0..1
         "true_winrate_pct": round((true_wr * 100.0), 2) if true_wr is not None else None,
     }
     return summary_rows, agg_stats
@@ -403,8 +438,7 @@ def env_sanity(secret: Optional[str] = Query(None)):
 async def tg_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    # Non bloquant
-    asyncio.create_task(send_telegram("✅ Test Telegram: ça fonctionne."))
+    await send_telegram("✅ Test Telegram: ça fonctionne.")
     return {"ok": True, "info": "Message Telegram envoyé (si BOT + CHAT_ID configurés)."}
 
 @app.get("/openai-health")
@@ -441,6 +475,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     stats = _basic_stats()
     groups, gstats = _group_trades_by_id()
 
+    # ---- tableau des événements
     rows = []
     for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
         conf = t.get("confidence")
@@ -449,6 +484,13 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
         price_line = ""
         if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
             price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('entry'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
+        sizing_line = ""
+        if t["event"] == "ENTRY":
+            sizing_line = (
+                f"<div>Lev: <b>{_fmt_num(t.get('lev_reco'))}</b> • "
+                f"Qty: <b>{_fmt_num(t.get('qty_reco'))}</b> • "
+                f"Notional: <b>{_fmt_num(t.get('notional'))}</b></div>"
+            )
         line = f"""
 <tr>
   <td style="padding:6px;border-bottom:1px solid #eee">{t.get('time')}</td>
@@ -462,6 +504,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     <div>SL: <b>{_fmt_num(t.get('sl'))}</b> | TP1: <b>{_fmt_num(t.get('tp1'))}</b> | TP2: <b>{_fmt_num(t.get('tp2'))}</b> | TP3: <b>{_fmt_num(t.get('tp3'))}</b></div>
     <div>R1: <b>{_fmt_num(t.get('r1'))}</b> • S1: <b>{_fmt_num(t.get('s1'))}</b></div>
     {price_line}
+    {sizing_line}
     <div>LLM: <b>{t.get('decision','-')}</b> • Confiance: <b>{conf_txt}</b></div>
     <div>Raison: {rsn}</div>
   </td>
@@ -469,6 +512,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 """
         rows.append(line)
 
+    # ---- tableau groupé par trade_id
     grows = []
     for g in sorted(groups, key=lambda x: (x.get("entry_time") or 0), reverse=True)[:300]:
         grows.append(f"""
@@ -576,6 +620,7 @@ def trades_clear(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     TRADES.clear()
+    SEEN_KEYS.clear()
     return {"ok": True, "cleared": True}
 
 # ============== ROUTE — WEBHOOK ==============
@@ -595,6 +640,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
+    # ========== GATE: direction + confiance ==========
     def _conf_ok(cv: Optional[float]) -> bool:
         return (cv is not None) and (cv >= CONFIDENCE_MIN)
 
@@ -603,6 +649,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         d = (decision or "").upper()
         return (s == "LONG" and d == "BUY") or (s == "SHORT" and d == "SELL")
 
+    # -------- Telegram + enregistrement --------
     if t == "ENTRY":
         dec = (llm_out.get("decision") or "—")
         conf_val = llm_out.get("confidence")
@@ -613,6 +660,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             why = llm_out.get("why") or _llm_reason_down or "-"
             llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
+        # Applique les deux filtres
         if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
             reason_filter = []
             if not _conf_ok(conf_val):
@@ -636,16 +684,21 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 "stats": _basic_stats(),
             })
 
+        # Sinon => envoi & enregistrement (bouton ajouté)
         msg = (
             f"{header_emoji} <b>ALERTE!!!</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
-            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | TP2: <b>{_fmt_num(payload.tp2)}</b> | TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | Première Résistance: <b>{_fmt_num(payload.r1)}</b>  •  Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
+            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
+            f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
+            f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
+            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
+            f"Première Résistance: <b>{_fmt_num(payload.r1)}</b>  •  Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
+            f"💼 Lev: <b>{_fmt_num(payload.lev_reco)}</b> • Qty: <b>{_fmt_num(payload.qty_reco)}</b> • Notional: <b>{_fmt_num(payload.notional)}</b>\n"
             f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
-            f"📝 Raison: {rsn}{llm_note}"
+            f"📝 Raison: {rsn}"
+            f"{llm_note}"
         )
-        # >>> PATCH: non-bloquant
-        asyncio.create_task(send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT))
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": "ENTRY",
@@ -658,6 +711,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "r1": payload.r1, "s1": payload.s1,
             "trade_id": payload.trade_id,
             "decision": dec, "confidence": conf_val, "reason": rsn,
+            # sizing
+            "lev_reco": payload.lev_reco,
+            "qty_reco": payload.qty_reco,
+            "notional": payload.notional,
         })
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
@@ -671,15 +728,20 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
         target_price = payload.tp
         if target_price is None:
-            if t == "TP1_HIT":   target_price = payload.tp1
-            elif t == "TP2_HIT": target_price = payload.tp2
-            elif t == "TP3_HIT": target_price = payload.tp3
-            elif t == "SL_HIT":  target_price = payload.sl
+            if t == "TP1_HIT":
+                target_price = payload.tp1
+            elif t == "TP2_HIT":
+                target_price = payload.tp2
+            elif t == "TP3_HIT":
+                target_price = payload.tp3
+            elif t == "SL_HIT":
+                target_price = payload.sl
 
-        msg = f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{(' • ID: <code>'+payload.trade_id+'</code>') if payload.trade_id else ''}\n" \
-              f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
-        # >>> PATCH: non-bloquant
-        asyncio.create_task(send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT))
+        msg = (
+            f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
+            f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
+        )
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": t,
@@ -695,15 +757,20 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
 
     elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
-        if reason == "TP3_HIT":            title = "TRADE TERMINÉ — TP3 ATTEINT FELICITATION"
-        elif reason in ("REVERSAL","INVALIDATED"): title = "TRADE INVALIDÉ — VEUILLEZ FERMER! MERCI"
-        elif reason == "SL_HIT":           title = "TRADE TERMINÉ — SL ATTEINT DESOLE"
-        else:                              title = "TRADE TERMINÉ — VEUILLEZ FERMER"
+        if reason == "TP3_HIT":
+            title = "TRADE TERMINÉ — TP3 ATTEINT FELICITATION"
+        elif reason in ("REVERSAL", "INVALIDATED"):
+            title = "TRADE INVALIDÉ — VEUILLEZ FERMER! MERCI"
+        elif reason == "SL_HIT":
+            title = "TRADE TERMINÉ — SL ATTEINT DESOLE"
+        else:
+            title = "TRADE TERMINÉ — VEUILLEZ FERMER"
 
-        msg = f"⏹ <b>{title}</b>\n" \
-              f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{(' • ID: <code>'+payload.trade_id+'</code>') if payload.trade_id else ''}"
-        # >>> PATCH: non-bloquant
-        asyncio.create_task(send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT))
+        msg = (
+            f"⏹ <b>{title}</b>\n"
+            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
+        )
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
             "event": "TRADE_TERMINATED",
@@ -720,6 +787,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
+    # réponse API
     groups, gstats = _group_trades_by_id()
     return JSONResponse({
         "ok": True,
