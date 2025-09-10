@@ -48,10 +48,6 @@ app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
 TRADES: List[Dict[str, Any]] = []
 MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 
-# Anti-doublons (idempotence simple)
-SEEN_KEYS: set = set()
-MAX_SEEN = 5000
-
 # ============== MODELS ==============
 Number = Optional[Union[float, int, str]]
 
@@ -78,7 +74,7 @@ class TVPayload(BaseModel):
     decision: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
-    # >>> NEW: sizing côté Pine
+    # --- Nouveaux champs depuis Pine ---
     lev_reco: Number = None
     qty_reco: Number = None
     notional: Number = None
@@ -97,7 +93,8 @@ def _fmt_num(x: Number) -> str:
         return "-"
     try:
         xf = float(x)
-        return f"{xf:.8f}" if xf < 1 else f"{xf:.4f}"
+        # affiche simple pour levier/percentages
+        return f"{xf:.4f}" if xf >= 1 else f"{xf:.8f}"
     except Exception:
         return str(x)
 
@@ -140,6 +137,7 @@ def _build_llm_prompt(p: TVPayload) -> str:
         "entry": p.entry,
         "levels": {"sl": p.sl, "tp1": p.tp1, "tp2": p.tp2, "tp3": p.tp3},
         "sr": {"R1": p.r1, "S1": p.s1},
+        "sizing": {"lev_reco": p.lev_reco, "qty_reco": p.qty_reco, "notional": p.notional},
     }
     return (
         "Tu es un moteur de décision de trading.\n"
@@ -221,23 +219,7 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
 # ============== RECORDING (Dashboard basique) ==============
-def _dedup_key(row: Dict[str, Any]) -> str:
-    # Unifie par (event, trade_id); si pas de trade_id, prend (event,symbol,time)
-    tid = row.get("trade_id") or f"{row.get('symbol','?')}|{row.get('time','?')}"
-    return f"{row.get('event')}|{tid}"
-
 def _push_trade(row: Dict[str, Any]) -> None:
-    key = _dedup_key(row)
-    if key in SEEN_KEYS:
-        return
-    SEEN_KEYS.add(key)
-    if len(SEEN_KEYS) > MAX_SEEN:
-        # purge simple
-        for _ in range(len(SEEN_KEYS) - MAX_SEEN):
-            try:
-                SEEN_KEYS.pop()
-            except KeyError:
-                break
     TRADES.append(row)
     if len(TRADES) > MAX_TRADES:
         del TRADES[: len(TRADES) - MAX_TRADES]
@@ -264,18 +246,11 @@ def _basic_stats() -> Dict[str, Any]:
 _TERMINAL = {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}
 
 def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Regroupe par trade_id et détermine le résultat du trade:
-    - WIN si le premier évènement terminal est un TPx
-    - LOSS si le premier évènement terminal est SL_HIT
-    - OPEN sinon
-    """
     groups: Dict[str, Dict[str, Any]] = {}
 
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
-            # on saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -299,16 +274,14 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["tp3"] = ev.get("tp3")
             g["entry_time"] = ev.get("time")
 
-        # mémorise chaque event avec infos utiles
         if ev.get("event") in _TERMINAL:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),        # hit price (payload.entry écrit ici comme prix touché côté /tv-webhook)
-                ev.get("target_price"), # target (tp/sl) réel
+                ev.get("entry"),
+                ev.get("target_price"),
             ))
 
-    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
 
@@ -320,11 +293,9 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             first_hit = evs[0]
             e = first_hit[1]
             if e.startswith("TP"):
-                status = "WIN"
-                wins += 1
+                status = "WIN"; wins += 1
             elif e == "SL_HIT":
-                status = "LOSS"
-                losses += 1
+                status = "LOSS"; losses += 1
         else:
             open_trades += 1
 
@@ -354,7 +325,7 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "open": open_trades,
         "wins": wins,
         "losses": losses,
-        "true_winrate": true_wr,  # 0..1
+        "true_winrate": true_wr,
         "true_winrate_pct": round((true_wr * 100.0), 2) if true_wr is not None else None,
     }
     return summary_rows, agg_stats
@@ -475,7 +446,6 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     stats = _basic_stats()
     groups, gstats = _group_trades_by_id()
 
-    # ---- tableau des événements
     rows = []
     for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
         conf = t.get("confidence")
@@ -485,10 +455,10 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
         if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
             price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('entry'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
         sizing_line = ""
-        if t["event"] == "ENTRY":
+        if t["event"] in ("ENTRY", "ENTRY_FILTERED"):
             sizing_line = (
-                f"<div>Lev: <b>{_fmt_num(t.get('lev_reco'))}</b> • "
-                f"Qty: <b>{_fmt_num(t.get('qty_reco'))}</b> • "
+                f"<div>Lev.Reco: <b>{_fmt_num(t.get('lev_reco'))}×</b> • "
+                f"Qty.Reco: <b>{_fmt_num(t.get('qty_reco'))}</b> • "
                 f"Notional: <b>{_fmt_num(t.get('notional'))}</b></div>"
             )
         line = f"""
@@ -503,8 +473,8 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
   <td style="padding:6px;border-bottom:1px solid #eee">
     <div>SL: <b>{_fmt_num(t.get('sl'))}</b> | TP1: <b>{_fmt_num(t.get('tp1'))}</b> | TP2: <b>{_fmt_num(t.get('tp2'))}</b> | TP3: <b>{_fmt_num(t.get('tp3'))}</b></div>
     <div>R1: <b>{_fmt_num(t.get('r1'))}</b> • S1: <b>{_fmt_num(t.get('s1'))}</b></div>
-    {price_line}
     {sizing_line}
+    {price_line}
     <div>LLM: <b>{t.get('decision','-')}</b> • Confiance: <b>{conf_txt}</b></div>
     <div>Raison: {rsn}</div>
   </td>
@@ -512,7 +482,6 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 """
         rows.append(line)
 
-    # ---- tableau groupé par trade_id
     grows = []
     for g in sorted(groups, key=lambda x: (x.get("entry_time") or 0), reverse=True)[:300]:
         grows.append(f"""
@@ -592,6 +561,7 @@ th,td{{vertical-align:top}}
 
   <div class="card">
     <b>Derniers événements (log brut)</b>
+    <small>Les lignes ENTRY/ENTRY_FILTERED affichent aussi levier/qty/notional (recommandés par le Pine).</small>
     <table>
       <thead>
         <tr>
@@ -620,7 +590,6 @@ def trades_clear(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     TRADES.clear()
-    SEEN_KEYS.clear()
     return {"ok": True, "cleared": True}
 
 # ============== ROUTE — WEBHOOK ==============
@@ -667,6 +636,22 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 reason_filter.append(f"Confiance {'n/a' if conf_val is None else f'{conf_val*100:.0f}%'} < seuil {CONFIDENCE_MIN*100:.0f}%")
             if not _dir_ok(payload.side, dec):
                 reason_filter.append(f"Incohérence directionnelle (side={ (payload.side or '—').upper() } / decision={ (dec or '—').upper() })")
+
+            # --- Log visuel dans /trades pour debug
+            _push_trade({
+                "event": "ENTRY_FILTERED",
+                "time": payload.time,
+                "symbol": payload.symbol,
+                "tf": payload.tf,
+                "side": (payload.side or "").upper(),
+                "entry": payload.entry,
+                "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
+                "r1": payload.r1, "s1": payload.s1,
+                "lev_reco": payload.lev_reco, "qty_reco": payload.qty_reco, "notional": payload.notional,
+                "trade_id": payload.trade_id,
+                "decision": dec, "confidence": conf_val, "reason": " | ".join(reason_filter),
+            })
+
             return JSONResponse({
                 "ok": True,
                 "event": "ENTRY_FILTERED",
@@ -688,13 +673,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         msg = (
             f"{header_emoji} <b>ALERTE!!!</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
-            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | "
-            f"TP2: <b>{_fmt_num(payload.tp2)}</b> | "
-            f"TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | "
-            f"Première Résistance: <b>{_fmt_num(payload.r1)}</b>  •  Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
-            f"💼 Lev: <b>{_fmt_num(payload.lev_reco)}</b> • Qty: <b>{_fmt_num(payload.qty_reco)}</b> • Notional: <b>{_fmt_num(payload.notional)}</b>\n"
-            f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
+            f"TP1: <b>{_fmt_num(payload.tp1)}</b> | TP2: <b>{_fmt_num(payload.tp2)}</b> | TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
+            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | R1: <b>{_fmt_num(payload.r1)}</b> • S1: <b>{_fmt_num(payload.s1)}</b>\n"
+            f"📐 Lev.Reco: <b>{_fmt_num(payload.lev_reco)}×</b> • Qty.Reco: <b>{_fmt_num(payload.qty_reco)}</b> • Notional: <b>{_fmt_num(payload.notional)}</b>\n"
+            f"🤖 LLM: <b>{dec}</b> | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
             f"📝 Raison: {rsn}"
             f"{llm_note}"
         )
@@ -709,12 +691,9 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "entry": payload.entry,
             "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
             "r1": payload.r1, "s1": payload.s1,
+            "lev_reco": payload.lev_reco, "qty_reco": payload.qty_reco, "notional": payload.notional,
             "trade_id": payload.trade_id,
             "decision": dec, "confidence": conf_val, "reason": rsn,
-            # sizing
-            "lev_reco": payload.lev_reco,
-            "qty_reco": payload.qty_reco,
-            "notional": payload.notional,
         })
 
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
@@ -728,14 +707,10 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
         target_price = payload.tp
         if target_price is None:
-            if t == "TP1_HIT":
-                target_price = payload.tp1
-            elif t == "TP2_HIT":
-                target_price = payload.tp2
-            elif t == "TP3_HIT":
-                target_price = payload.tp3
-            elif t == "SL_HIT":
-                target_price = payload.sl
+            if t == "TP1_HIT":   target_price = payload.tp1
+            elif t == "TP2_HIT": target_price = payload.tp2
+            elif t == "TP3_HIT": target_price = payload.tp3
+            elif t == "SL_HIT":  target_price = payload.sl
 
         msg = (
             f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
@@ -787,7 +762,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
-    # réponse API
     groups, gstats = _group_trades_by_id()
     return JSONResponse({
         "ok": True,
