@@ -35,11 +35,14 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 PORT               = int(os.getenv("PORT", "8000"))
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0"))  # ex: 0.85
 
-# >>> PATCH (minime) — Bouton Telegram vers le dashboard
+# >>> Bouton Telegram vers le dashboard
 TG_BUTTONS       = os.getenv("TG_BUTTONS", "0") not in ("0", "false", "False", "")
 TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "")
 TG_BUTTON_TEXT   = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
-# <<< PATCH
+
+# ============== RISK FALLBACK (si Pine ne l'envoie pas) ==============
+RISK_ACCOUNT_BAL = float(os.getenv("RISK_ACCOUNT_BAL", "1000"))  # en devise de cotation (quote)
+RISK_PCT         = float(os.getenv("RISK_PCT", "0.01"))          # 0.01 => 1%
 
 # ============== APP ==============
 app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
@@ -69,15 +72,15 @@ class TVPayload(BaseModel):
     s1: Number = None
     trade_id: Optional[str] = None
     secret: Optional[str] = None
-    # sizing / levier ajoutés
-    lev_reco: Number = None
-    qty_reco: Number = None
-    notional: Number = None
     # Terminaison + LLM facultatifs
     term_reason: Optional[str] = None
     decision: Optional[str] = None
     confidence: Optional[float] = None
     reason: Optional[str] = None
+    # >>> Risk fields envoyés par Pine
+    lev_reco: Number = None
+    qty_reco: Number = None
+    notional: Number = None
 
     class Config:
         extra = "allow"
@@ -87,6 +90,14 @@ def _mask(val: Optional[str]) -> str:
     if not val:
         return "missing"
     return (val[:6] + "..." + val[-4:]) if len(val) > 12 else "***"
+
+def _to_float(x: Number) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 def _fmt_num(x: Number) -> str:
     if x is None:
@@ -105,19 +116,15 @@ def _fmt_pct(x: Optional[float]) -> str:
     except Exception:
         return "-"
 
-# >>> PATCH — ajoute inline buttons sans casser l'existant
 async def send_telegram(text: str, inline_url: Optional[str] = None, inline_text: Optional[str] = None) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload: Dict[str, Any] = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-
-    # Ajoute un bouton seulement si activé ET URL fournie
     if TG_BUTTONS and (inline_url or TG_DASHBOARD_URL):
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": inline_text or TG_BUTTON_TEXT, "url": inline_url or TG_DASHBOARD_URL}]]
         }
-
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
@@ -125,7 +132,6 @@ async def send_telegram(text: str, inline_url: Optional[str] = None, inline_text
             r.raise_for_status()
         except httpx.HTTPError:
             pass
-# <<< PATCH
 
 # ============== LLM ==============
 def _build_llm_prompt(p: TVPayload) -> str:
@@ -216,7 +222,7 @@ async def call_llm_for_entry(p: TVPayload) -> Dict[str, Any]:
 
     return {"decision": decision, "confidence": confidence, "reason": reason, "llm_used": True}
 
-# ============== RECORDING (Dashboard basique) ==============
+# ============== RECORDING ==============
 def _push_trade(row: Dict[str, Any]) -> None:
     TRADES.append(row)
     if len(TRADES) > MAX_TRADES:
@@ -226,7 +232,7 @@ def _basic_stats() -> Dict[str, Any]:
     entries = [t for t in TRADES if t.get("event") == "ENTRY"]
     tp_hits = [t for t in TRADES if t.get("event") in ("TP1_HIT", "TP2_HIT", "TP3_HIT")]
     sl_hits = [t for t in TRADES if t.get("event") == "SL_HIT"]
-    wins = len(tp_hits)  # ATTENTION: compte les TP events, pas les trades
+    wins = len(tp_hits)
     losses = len(sl_hits)
     total = wins + losses
     winrate = (wins / total * 100.0) if total > 0 else 0.0
@@ -240,22 +246,13 @@ def _basic_stats() -> Dict[str, Any]:
         "events_total": len(TRADES),
     }
 
-# ============== NEW: Agrégation par trade_id (vrai winrate) ==============
 _TERMINAL = {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}
 
 def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Regroupe par trade_id et détermine le résultat du trade:
-    - WIN si le premier évènement terminal est un TPx
-    - LOSS si le premier évènement terminal est SL_HIT
-    - OPEN sinon
-    """
     groups: Dict[str, Dict[str, Any]] = {}
-
     for ev in TRADES:
         tid = ev.get("trade_id") or ""
         if not tid:
-            # on saute les événements sans trade_id pour l'agrégat
             continue
         g = groups.get(tid)
         if g is None:
@@ -266,9 +263,12 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "side": ev.get("side"),
                 "entry": None,
                 "sl": None, "tp1": None, "tp2": None, "tp3": None,
-                "lev_reco": None, "qty_reco": None, "notional": None,
                 "entry_time": None,
-                "events": [],  # (time, event, price, target_price)
+                "events": [],
+                # >>> Risk fields (pour /trades groupés)
+                "lev_reco": None,
+                "qty_reco": None,
+                "notional": None,
             }
             groups[tid] = g
 
@@ -278,24 +278,21 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             g["tp1"] = ev.get("tp1")
             g["tp2"] = ev.get("tp2")
             g["tp3"] = ev.get("tp3")
+            g["entry_time"] = ev.get("time")
             g["lev_reco"] = ev.get("lev_reco")
             g["qty_reco"] = ev.get("qty_reco")
             g["notional"] = ev.get("notional")
-            g["entry_time"] = ev.get("time")
 
-        # mémorise chaque event avec infos utiles
         if ev.get("event") in _TERMINAL:
             g["events"].append((
                 ev.get("time"),
                 ev.get("event"),
-                ev.get("entry"),        # hit price
-                ev.get("target_price"), # target (tp/sl)
+                ev.get("entry"),
+                ev.get("target_price"),
             ))
 
-    # calcule le résultat
     summary_rows: List[Dict[str, Any]] = []
     wins = losses = open_trades = 0
-
     for tid, g in groups.items():
         evs = sorted(g["events"], key=lambda x: (x[0] or 0))
         status = "OPEN"
@@ -304,11 +301,9 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             first_hit = evs[0]
             e = first_hit[1]
             if e.startswith("TP"):
-                status = "WIN"
-                wins += 1
+                status = "WIN"; wins += 1
             elif e == "SL_HIT":
-                status = "LOSS"
-                losses += 1
+                status = "LOSS"; losses += 1
         else:
             open_trades += 1
 
@@ -318,30 +313,26 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             "tf": g["tf"],
             "side": g["side"],
             "entry": g["entry"],
-            "sl": g["sl"],
-            "tp1": g["tp1"],
-            "tp2": g["tp2"],
-            "tp3": g["tp3"],
-            "lev_reco": g["lev_reco"],
-            "qty_reco": g["qty_reco"],
-            "notional": g["notional"],
+            "sl": g["sl"], "tp1": g["tp1"], "tp2": g["tp2"], "tp3": g["tp3"],
             "entry_time": g["entry_time"],
             "status": status,
             "first_hit_event": first_hit[1] if first_hit else None,
             "first_hit_price": first_hit[2] if first_hit else None,
             "first_hit_target": first_hit[3] if first_hit else None,
+            "lev_reco": g["lev_reco"],
+            "qty_reco": g["qty_reco"],
+            "notional": g["notional"],
         })
 
     closed = wins + losses
     true_wr = (wins / closed) if closed > 0 else None
-
     agg_stats = {
         "trades_total": len(summary_rows),
         "closed": closed,
         "open": open_trades,
         "wins": wins,
         "losses": losses,
-        "true_winrate": true_wr,  # 0..1
+        "true_winrate": true_wr,
         "true_winrate_pct": round((true_wr * 100.0), 2) if true_wr is not None else None,
     }
     return summary_rows, agg_stats
@@ -364,6 +355,8 @@ def home():
         ("OPENAI_API_KEY", _mask(OPENAI_API_KEY)),
         ("CONFIDENCE_MIN", str(CONFIDENCE_MIN)),
         ("PORT", str(PORT)),
+        ("RISK_ACCOUNT_BAL", str(RISK_ACCOUNT_BAL)),
+        ("RISK_PCT", str(RISK_PCT)),
     ]
     rows_html = "".join(
         f"<tr><td style='padding:6px 10px;border-bottom:1px solid #eee'>{k}</td>"
@@ -419,87 +412,9 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "LLM_MODEL": LLM_MODEL if (LLM_ENABLED and _openai_client) else None,
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
         "PORT": PORT,
+        "RISK_ACCOUNT_BAL": RISK_ACCOUNT_BAL,
+        "RISK_PCT": RISK_PCT,
     }
-# ===== R / Winrate analytics (par trade_id) =====
-def _calc_r_stats(groups):
-    """
-    Calcule le R réalisé par trade:
-      - SL_HIT  -> -1R
-      - TPx_HIT -> (profit / risk) selon le sens
-    Retourne R moyen, distribution TP/SL et winrate break-even.
-    """
-    r_values = []
-    dist = {"TP1_HIT": 0, "TP2_HIT": 0, "TP3_HIT": 0, "SL_HIT": 0, "OPEN": 0}
-    for g in groups:
-        side = (g.get("side") or "").upper()
-        entry = g.get("entry")
-        sl    = g.get("sl")
-        tgt   = g.get("first_hit_target")
-        ev    = g.get("first_hit_event")
-
-        if ev is None:
-            dist["OPEN"] += 1
-            continue
-
-        if ev in dist:
-            dist[ev] += 1
-
-        # Défaut prudence si info manquante
-        if entry is None or sl is None:
-            continue
-
-        try:
-            if ev == "SL_HIT":
-                r = -1.0
-            elif ev.startswith("TP"):
-                if side == "LONG":
-                    risk  = float(entry) - float(sl)
-                    prof  = float(tgt)   - float(entry)
-                elif side == "SHORT":
-                    risk  = float(sl)    - float(entry)
-                    prof  = float(entry) - float(tgt)
-                else:
-                    continue
-                if risk <= 0:
-                    continue
-                r = prof / risk
-            else:
-                # évènement inconnu -> ignore
-                continue
-            r_values.append(r)
-        except Exception:
-            pass
-
-    # agrégats
-    closed = dist["SL_HIT"] + dist["TP1_HIT"] + dist["TP2_HIT"] + dist["TP3_HIT"]
-    wins   = dist["TP1_HIT"] + dist["TP2_HIT"] + dist["TP3_HIT"]
-    true_wr = (wins / closed) if closed > 0 else None
-    r_avg   = (sum(r_values) / len(r_values)) if r_values else None
-
-    # WR de break-even = 1 / (1 + R_avg), si R_avg>0
-    be_wr = (1.0 / (1.0 + r_avg)) if (r_avg is not None and r_avg > 0) else None
-
-    return {
-        "closed": closed,
-        "wins": wins,
-        "losses": dist["SL_HIT"],
-        "open": dist["OPEN"],
-        "tp_dist": {k: v for k, v in dist.items() if k != "OPEN"},
-        "r_count": len(r_values),
-        "r_avg": r_avg,
-        "true_winrate": true_wr,
-        "true_winrate_pct": (round(true_wr * 100.0, 2) if true_wr is not None else None),
-        "breakeven_wr": be_wr,
-        "breakeven_wr_pct": (round(be_wr * 100.0, 2) if be_wr is not None else None),
-    }
-
-@app.get("/winrate")
-def winrate(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    groups, gstats = _group_trades_by_id()
-    rstats = _calc_r_stats(groups)
-    return {"stats_trades": gstats, "r_stats": rstats}
 
 @app.get("/tg-health")
 async def tg_health(secret: Optional[str] = Query(None)):
@@ -529,7 +444,7 @@ def openai_health(secret: Optional[str] = Query(None)):
 def favicon():
     return PlainTextResponse("", status_code=204)
 
-# ============== ROUTE — TRADES DASHBOARD ==============
+# ============== /trades (Dashboard) ==============
 @app.get("/trades")
 def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -542,20 +457,17 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
     stats = _basic_stats()
     groups, gstats = _group_trades_by_id()
 
-    # ---- tableau des événements (identique à avant + sizing affiché)
     rows = []
     for t in sorted(TRADES, key=lambda x: x.get("time", 0), reverse=True)[:500]:
         conf = t.get("confidence")
         conf_txt = "-" if conf is None else f"{float(conf)*100:.0f}%"
         rsn = t.get("reason") or "-"
+        risk_line = ""
+        if t.get("lev_reco") is not None or t.get("qty_reco") is not None or t.get("notional") is not None:
+            risk_line = f"<div>Lev.Reco: <b>{_fmt_num(t.get('lev_reco'))}×</b> • Qty.Reco: <b>{_fmt_num(t.get('qty_reco'))}</b> • Notional: <b>{_fmt_num(t.get('notional'))}</b></div>"
         price_line = ""
         if t["event"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
             price_line = f"<div>Prix touché: <b>{_fmt_num(t.get('entry'))}</b> • Cible: <b>{_fmt_num(t.get('target_price'))}</b></div>"
-
-        sizing_line = ""
-        if t["event"] == "ENTRY":
-            sizing_line = f"<div>⚖️ Lev: <b>{_fmt_num(t.get('lev_reco'))}</b> • Qty: <b>{_fmt_num(t.get('qty_reco'))}</b> • Notional: <b>{_fmt_num(t.get('notional'))}</b></div>"
-
         line = f"""
 <tr>
   <td style="padding:6px;border-bottom:1px solid #eee">{t.get('time')}</td>
@@ -568,8 +480,8 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
   <td style="padding:6px;border-bottom:1px solid #eee">
     <div>SL: <b>{_fmt_num(t.get('sl'))}</b> | TP1: <b>{_fmt_num(t.get('tp1'))}</b> | TP2: <b>{_fmt_num(t.get('tp2'))}</b> | TP3: <b>{_fmt_num(t.get('tp3'))}</b></div>
     <div>R1: <b>{_fmt_num(t.get('r1'))}</b> • S1: <b>{_fmt_num(t.get('s1'))}</b></div>
+    {risk_line}
     {price_line}
-    {sizing_line}
     <div>LLM: <b>{t.get('decision','-')}</b> • Confiance: <b>{conf_txt}</b></div>
     <div>Raison: {rsn}</div>
   </td>
@@ -577,9 +489,11 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
 """
         rows.append(line)
 
-    # ---- tableau groupé par trade_id
     grows = []
     for g in sorted(groups, key=lambda x: (x.get("entry_time") or 0), reverse=True)[:300]:
+        g_risk = ""
+        if g.get("lev_reco") is not None or g.get("qty_reco") is not None or g.get("notional") is not None:
+            g_risk = f"<div>Lev.Reco: <b>{_fmt_num(g.get('lev_reco'))}×</b> • Qty.Reco: <b>{_fmt_num(g.get('qty_reco'))}</b> • Notional: <b>{_fmt_num(g.get('notional'))}</b></div>"
         grows.append(f"""
 <tr>
   <td style="padding:6px;border-bottom:1px solid #eee">{g.get('entry_time')}</td>
@@ -592,6 +506,7 @@ def trades(format: Optional[str] = Query(None), secret: Optional[str] = Query(No
   <td style="padding:6px;border-bottom:1px solid #eee">{_fmt_num(g.get('entry'))}</td>
   <td style="padding:6px;border-bottom:1px solid #eee">{_fmt_num(g.get('first_hit_price'))}</td>
 </tr>
+<tr><td colspan="9" style="padding:0 6px 10px 6px;border-bottom:1px solid #eee">{g_risk}</td></tr>
 """)
 
     clear_btn = ""
@@ -687,10 +602,23 @@ def trades_clear(secret: Optional[str] = Query(None)):
     TRADES.clear()
     return {"ok": True, "cleared": True}
 
+# ============== Risk fallback calc ==============
+def _fallback_risk_calc(entry: Number, sl: Number) -> Dict[str, Optional[float]]:
+    e = _to_float(entry); s = _to_float(sl)
+    if e is None or s is None:
+        return {"lev_reco": None, "qty_reco": None, "notional": None}
+    dist = abs(e - s)
+    if dist <= 0:
+        return {"lev_reco": None, "qty_reco": None, "notional": None}
+    risk_amount = RISK_ACCOUNT_BAL * RISK_PCT
+    qty = risk_amount / dist
+    notional = qty * e
+    lev = (RISK_PCT) / (dist / e) if e > 0 else None   # = (risk%) / (%SL distance)
+    return {"lev_reco": lev, "qty_reco": qty, "notional": notional}
+
 # ============== ROUTE — WEBHOOK ==============
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Header(None)):
-    # Secret check
     if WEBHOOK_SECRET:
         if not payload.secret or payload.secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
@@ -704,7 +632,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     if t == "ENTRY" and (payload.decision is None or payload.confidence is None or payload.reason is None):
         llm_out = await call_llm_for_entry(payload)
 
-    # ========== GATE: direction + confiance ==========
     def _conf_ok(cv: Optional[float]) -> bool:
         return (cv is not None) and (cv >= CONFIDENCE_MIN)
 
@@ -713,8 +640,16 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         d = (decision or "").upper()
         return (s == "LONG" and d == "BUY") or (s == "SHORT" and d == "SELL")
 
-    # -------- Telegram + enregistrement --------
+    # ======= ENTRY =======
     if t == "ENTRY":
+        # Risk fields: utiliser payload si présent, sinon fallback serveur
+        lev = _to_float(payload.lev_reco)
+        qty = _to_float(payload.qty_reco)
+        notional = _to_float(payload.notional)
+        if lev is None or qty is None or notional is None:
+            fb = _fallback_risk_calc(payload.entry, payload.sl)
+            lev = fb["lev_reco"]; qty = fb["qty_reco"]; notional = fb["notional"]
+
         dec = (llm_out.get("decision") or "—")
         conf_val = llm_out.get("confidence")
         conf_pct = "—" if conf_val is None else f"{float(conf_val)*100:.0f}%"
@@ -724,7 +659,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             why = llm_out.get("why") or _llm_reason_down or "-"
             llm_note = f"\n⚠️ <i>LLM indisponible</i> (<code>{why}</code>)"
 
-        # Applique les deux filtres
         if (not _conf_ok(conf_val)) or (not _dir_ok(payload.side, dec)):
             reason_filter = []
             if not _conf_ok(conf_val):
@@ -748,15 +682,19 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
                 "stats": _basic_stats(),
             })
 
-        # Sinon => envoi & enregistrement (bouton ajouté)
+        # Telegram (avec Risk)
+        risk_line = ""
+        if lev is not None or qty is not None or notional is not None:
+            risk_line = f"\n💡 Lev.Reco: <b>{_fmt_num(lev)}×</b> • Qty.Reco: <b>{_fmt_num(qty)}</b> • Notional: <b>{_fmt_num(notional)}</b>"
+
         msg = (
             f"{header_emoji} <b>ALERTE!!!</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
             f"Direction: <b>{(payload.side or '—').upper()}</b> | Entry: <b>{_fmt_num(payload.entry)}</b>\n"
             f"TP1: <b>{_fmt_num(payload.tp1)}</b> | TP2: <b>{_fmt_num(payload.tp2)}</b> | TP3: <b>{_fmt_num(payload.tp3)}</b>\n"
-            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | Première Résistance: <b>{_fmt_num(payload.r1)}</b>  •  Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
-            f"⚖️ Levier rec.: <b>{_fmt_num(payload.lev_reco)}</b> • Qty rec.: <b>{_fmt_num(payload.qty_reco)}</b> • Notional: <b>{_fmt_num(payload.notional)}</b>\n"
+            f"🎯 SL: <b>{_fmt_num(payload.sl)}</b> | Première Résistance: <b>{_fmt_num(payload.r1)}</b> • Premier Support: <b>{_fmt_num(payload.s1)}</b>\n"
             f"🤖 LLM: <b>{dec}</b>  | <b>Niveau de confiance: {conf_pct}</b> (seuil {int(CONFIDENCE_MIN*100)}%)\n"
             f"📝 Raison: {rsn}"
+            f"{risk_line}"
             f"{llm_note}"
         )
         await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
@@ -770,35 +708,29 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "entry": payload.entry,
             "sl": payload.sl, "tp1": payload.tp1, "tp2": payload.tp2, "tp3": payload.tp3,
             "r1": payload.r1, "s1": payload.s1,
-            "lev_reco": payload.lev_reco, "qty_reco": payload.qty_reco, "notional": payload.notional,
             "trade_id": payload.trade_id,
             "decision": dec, "confidence": conf_val, "reason": rsn,
+            "lev_reco": lev, "qty_reco": qty, "notional": notional,
         })
 
+    # ======= EVENTS =======
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
         nice = {
             "TP1_HIT": "🎯 TP1 touché",
             "TP2_HIT": "🎯 TP2 touché",
-            "TP3_HIT": "🎯 TP3 touché FELICITATION",
+            "TP3_HIT": "🎯 TP3 touché",
             "SL_HIT":  "✖️ SL touché",
         }.get(t, t)
 
         hit_price = payload.entry if payload.entry is not None else payload.dict().get("close")
         target_price = payload.tp
         if target_price is None:
-            if t == "TP1_HIT":
-                target_price = payload.tp1
-            elif t == "TP2_HIT":
-                target_price = payload.tp2
-            elif t == "TP3_HIT":
-                target_price = payload.tp3
-            elif t == "SL_HIT":
-                target_price = payload.sl
+            if t == "TP1_HIT": target_price = payload.tp1
+            elif t == "TP2_HIT": target_price = payload.tp2
+            elif t == "TP3_HIT": target_price = payload.tp3
+            elif t == "SL_HIT":  target_price = payload.sl
 
-        msg = (
-            f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Prix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
-        )
+        msg = f"{nice} • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\nPrix touché: <b>{_fmt_num(hit_price)}</b> • Cible: <b>{_fmt_num(target_price)}</b>"
         await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
@@ -816,18 +748,15 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
-            title = "TRADE TERMINÉ — TP3 ATTEINT FELICITATION"
+            title = "TRADE TERMINÉ — TP3 ATTEINT"
         elif reason in ("REVERSAL", "INVALIDATED"):
-            title = "TRADE INVALIDÉ — VEUILLEZ FERMER! MERCI"
+            title = "TRADE INVALIDÉ — VEUILLEZ FERMER"
         elif reason == "SL_HIT":
-            title = "TRADE TERMINÉ — SL ATTEINT DESOLE"
+            title = "TRADE TERMINÉ — SL ATTEINT"
         else:
             title = "TRADE TERMINÉ — VEUILLEZ FERMER"
 
-        msg = (
-            f"⏹ <b>{title}</b>\n"
-            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
-        )
+        msg = f"⏹ <b>{title}</b>\nInstrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}"
         await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
 
         _push_trade({
@@ -845,7 +774,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
     else:
         print("[tv-webhook] type non géré:", t)
 
-    # réponse API
     groups, gstats = _group_trades_by_id()
     return JSONResponse({
         "ok": True,
@@ -863,4 +791,3 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
-
