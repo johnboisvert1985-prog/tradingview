@@ -420,6 +420,86 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "CONFIDENCE_MIN": CONFIDENCE_MIN,
         "PORT": PORT,
     }
+# ===== R / Winrate analytics (par trade_id) =====
+def _calc_r_stats(groups):
+    """
+    Calcule le R réalisé par trade:
+      - SL_HIT  -> -1R
+      - TPx_HIT -> (profit / risk) selon le sens
+    Retourne R moyen, distribution TP/SL et winrate break-even.
+    """
+    r_values = []
+    dist = {"TP1_HIT": 0, "TP2_HIT": 0, "TP3_HIT": 0, "SL_HIT": 0, "OPEN": 0}
+    for g in groups:
+        side = (g.get("side") or "").upper()
+        entry = g.get("entry")
+        sl    = g.get("sl")
+        tgt   = g.get("first_hit_target")
+        ev    = g.get("first_hit_event")
+
+        if ev is None:
+            dist["OPEN"] += 1
+            continue
+
+        if ev in dist:
+            dist[ev] += 1
+
+        # Défaut prudence si info manquante
+        if entry is None or sl is None:
+            continue
+
+        try:
+            if ev == "SL_HIT":
+                r = -1.0
+            elif ev.startswith("TP"):
+                if side == "LONG":
+                    risk  = float(entry) - float(sl)
+                    prof  = float(tgt)   - float(entry)
+                elif side == "SHORT":
+                    risk  = float(sl)    - float(entry)
+                    prof  = float(entry) - float(tgt)
+                else:
+                    continue
+                if risk <= 0:
+                    continue
+                r = prof / risk
+            else:
+                # évènement inconnu -> ignore
+                continue
+            r_values.append(r)
+        except Exception:
+            pass
+
+    # agrégats
+    closed = dist["SL_HIT"] + dist["TP1_HIT"] + dist["TP2_HIT"] + dist["TP3_HIT"]
+    wins   = dist["TP1_HIT"] + dist["TP2_HIT"] + dist["TP3_HIT"]
+    true_wr = (wins / closed) if closed > 0 else None
+    r_avg   = (sum(r_values) / len(r_values)) if r_values else None
+
+    # WR de break-even = 1 / (1 + R_avg), si R_avg>0
+    be_wr = (1.0 / (1.0 + r_avg)) if (r_avg is not None and r_avg > 0) else None
+
+    return {
+        "closed": closed,
+        "wins": wins,
+        "losses": dist["SL_HIT"],
+        "open": dist["OPEN"],
+        "tp_dist": {k: v for k, v in dist.items() if k != "OPEN"},
+        "r_count": len(r_values),
+        "r_avg": r_avg,
+        "true_winrate": true_wr,
+        "true_winrate_pct": (round(true_wr * 100.0, 2) if true_wr is not None else None),
+        "breakeven_wr": be_wr,
+        "breakeven_wr_pct": (round(be_wr * 100.0, 2) if be_wr is not None else None),
+    }
+
+@app.get("/winrate")
+def winrate(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    groups, gstats = _group_trades_by_id()
+    rstats = _calc_r_stats(groups)
+    return {"stats_trades": gstats, "r_stats": rstats}
 
 @app.get("/tg-health")
 async def tg_health(secret: Optional[str] = Query(None)):
@@ -783,3 +863,4 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
         "stats_events": _basic_stats(),
         "stats_trades": gstats,
     })
+
