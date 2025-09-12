@@ -45,7 +45,7 @@ RISK_ACCOUNT_BAL = float(os.getenv("RISK_ACCOUNT_BAL", "1000"))  # en devise de 
 RISK_PCT         = float(os.getenv("RISK_PCT", "0.01"))          # 0.01 => 1%
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.0")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.1")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -769,6 +769,29 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "trade_id": payload.trade_id,
             "term_reason": reason,
             "decision": None, "confidence": None, "reason": None,
+        })
+
+    # ======= CLOSE (flip depuis Pine) =======
+    elif t == "CLOSE":
+        close_reason = (payload.reason or "CLOSE").upper()
+        title = "TRADE CLOSÉ — FLIP détecté" if payload.reason else "TRADE CLOSÉ"
+        msg = (
+            f"⏹ <b>{title}</b>\n"
+            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}\n"
+            f"Motif: {payload.reason or '-'}"
+        )
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
+
+        _push_trade({
+            "event": "TRADE_TERMINATED",
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "").upper() if payload.side else None,
+            "entry": payload.entry,           # si fourni par Pine
+            "trade_id": payload.trade_id,
+            "term_reason": close_reason,      # CLOSE / FLIP
+            "decision": None, "confidence": None, "reason": payload.reason or None,
         })
 
     else:
