@@ -45,7 +45,7 @@ RISK_ACCOUNT_BAL = float(os.getenv("RISK_ACCOUNT_BAL", "1000"))  # en devise de 
 RISK_PCT         = float(os.getenv("RISK_PCT", "0.01"))          # 0.01 => 1%
 
 # ============== APP ==============
-app = FastAPI(title="AI Trader PRO - Webhook", version="3.6.1")
+app = FastAPI(title="AI Trader PRO - Webhook", version="3.7.0")
 
 # ============== IN-MEMORY STORE ==============
 TRADES: List[Dict[str, Any]] = []
@@ -55,7 +55,6 @@ MAX_TRADES = int(os.getenv("MAX_TRADES", "2000"))
 Number = Optional[Union[float, int, str]]
 
 class TVPayload(BaseModel):
-    # On tolère "type" ou "tag"
     type: Optional[str] = None
     tag:  Optional[str] = None
     symbol: str
@@ -265,7 +264,6 @@ def _group_trades_by_id() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "sl": None, "tp1": None, "tp2": None, "tp3": None,
                 "entry_time": None,
                 "events": [],
-                # >>> Risk fields (pour /trades groupés)
                 "lev_reco": None,
                 "qty_reco": None,
                 "notional": None,
@@ -613,7 +611,7 @@ def _fallback_risk_calc(entry: Number, sl: Number) -> Dict[str, Optional[float]]
     risk_amount = RISK_ACCOUNT_BAL * RISK_PCT
     qty = risk_amount / dist
     notional = qty * e
-    lev = (RISK_PCT) / (dist / e) if e > 0 else None   # = (risk%) / (%SL distance)
+    lev = (RISK_PCT) / (dist / e) if e > 0 else None
     return {"lev_reco": lev, "qty_reco": qty, "notional": notional}
 
 # ============== ROUTE — WEBHOOK ==============
@@ -642,7 +640,7 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
 
     # ======= ENTRY =======
     if t == "ENTRY":
-        # Risk fields: utiliser payload si présent, sinon fallback serveur
+        # Risk fields
         lev = _to_float(payload.lev_reco)
         qty = _to_float(payload.qty_reco)
         notional = _to_float(payload.notional)
@@ -713,7 +711,23 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "lev_reco": lev, "qty_reco": qty, "notional": notional,
         })
 
-    # ======= EVENTS =======
+    # ======= CLOSE (flip) =======
+    elif t == "CLOSE":
+        msg = (f"⛔️ <b>FERMER POSITION</b> • <b>{payload.symbol}</b> • <b>{payload.tf}</b>{trade_id_txt}\n"
+               f"Raison: <b>{payload.reason or 'Flip'}</b> • Côté initial: <b>{(payload.side or '-').upper()}</b>")
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
+        _push_trade({
+            "event": "CLOSE",
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": (payload.side or "").upper() if payload.side else None,
+            "entry": payload.entry,
+            "trade_id": payload.trade_id,
+            "decision": None, "confidence": None, "reason": payload.reason or "Flip",
+        })
+
+    # ======= EVENTS (TP/SL) =======
     elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
         nice = {
             "TP1_HIT": "🎯 TP1 touché",
@@ -745,6 +759,23 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "decision": None, "confidence": None, "reason": None,
         })
 
+    # ======= PDZ touches (Premium/Discount) =======
+    elif t in ("PDZ_PREMIUM_TOUCH", "PDZ_DISCOUNT_TOUCH"):
+        zone = "Premium" if t == "PDZ_PREMIUM_TOUCH" else "Discount"
+        msg = f"📐 Zone {zone} touchée • <b>{payload.symbol}</b> • <b>{payload.tf}</b>\nPrix: <b>{_fmt_num(payload.entry)}</b> • Niveau zone: <b>{_fmt_num(payload.tp)}</b>"
+        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
+        _push_trade({
+            "event": t,
+            "time": payload.time,
+            "symbol": payload.symbol,
+            "tf": payload.tf,
+            "side": None,
+            "entry": payload.entry,
+            "target_price": payload.tp,
+            "trade_id": payload.trade_id,
+            "decision": None, "confidence": None, "reason": None,
+        })
+
     elif t == "TRADE_TERMINATED":
         reason = (payload.term_reason or "").upper()
         if reason == "TP3_HIT":
@@ -769,29 +800,6 @@ async def tv_webhook(payload: TVPayload, x_render_signature: Optional[str] = Hea
             "trade_id": payload.trade_id,
             "term_reason": reason,
             "decision": None, "confidence": None, "reason": None,
-        })
-
-    # ======= CLOSE (flip depuis Pine) =======
-    elif t == "CLOSE":
-        close_reason = (payload.reason or "CLOSE").upper()
-        title = "TRADE CLOSÉ — FLIP détecté" if payload.reason else "TRADE CLOSÉ"
-        msg = (
-            f"⏹ <b>{title}</b>\n"
-            f"Instrument: <b>{payload.symbol}</b> • TF: <b>{payload.tf}</b>{trade_id_txt}\n"
-            f"Motif: {payload.reason or '-'}"
-        )
-        await send_telegram(msg, inline_url=TG_DASHBOARD_URL, inline_text=TG_BUTTON_TEXT)
-
-        _push_trade({
-            "event": "TRADE_TERMINATED",
-            "time": payload.time,
-            "symbol": payload.symbol,
-            "tf": payload.tf,
-            "side": (payload.side or "").upper() if payload.side else None,
-            "entry": payload.entry,           # si fourni par Pine
-            "trade_id": payload.trade_id,
-            "term_reason": close_reason,      # CLOSE / FLIP
-            "decision": None, "confidence": None, "reason": payload.reason or None,
         })
 
     else:
