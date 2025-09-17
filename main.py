@@ -8,7 +8,7 @@ from string import Template
 from collections import defaultdict
 
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse, Response
 
 # =========================
 # Config / ENV
@@ -24,6 +24,7 @@ CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
+DB_PATH            = os.getenv("DB_PATH", "data.db")
 
 # =========================
 # OpenAI client (optionnel)
@@ -32,7 +33,6 @@ _openai_client = None
 _llm_reason_down = None
 if LLM_ENABLED and OPENAI_API_KEY:
     try:
-        # openai>=1.x style
         from openai import OpenAI  # type: ignore
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
@@ -41,10 +41,8 @@ else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
 # =========================
-# SQLite setup (persistant)
+# SQLite (persistant)
 # =========================
-DB_PATH = os.getenv("DB_PATH", "data.db")
-
 def db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -74,12 +72,19 @@ def db_init() -> None:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_trade ON events(trade_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(received_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_tf ON events(tf)")
         conn.commit()
 
 db_init()
 
+def _to_float(v):
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
 def save_event(payload: Dict[str, Any]) -> None:
-    # Normalize fields
     row = {
         "received_at": int(time.time()),
         "type": payload.get("type"),
@@ -105,14 +110,59 @@ def save_event(payload: Dict[str, Any]) -> None:
         )
         conn.commit()
 
-def _to_float(v):
+# =========================
+# Helpers: dates, filters, SQL
+# =========================
+def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
+    # Expect "YYYY-MM-DD"
+    if not date_str:
+        return None
     try:
-        return float(v) if v is not None else None
+        import datetime as dt
+        y, m, d = map(int, date_str.split("-"))
+        dtobj = dt.datetime(y, m, d, 0, 0, 0)
+        return int(dtobj.timestamp())
     except Exception:
         return None
 
+def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
+    # End is exclusive: + 1 day
+    if not date_str:
+        return None
+    try:
+        import datetime as dt
+        y, m, d = map(int, date_str.split("-"))
+        dtobj = dt.datetime(y, m, d, 23, 59, 59)
+        return int(dtobj.timestamp())
+    except Exception:
+        return None
+
+def fetch_events_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Optional[int], end_ep: Optional[int], limit: int = 10000) -> List[sqlite3.Row]:
+    sql = "SELECT * FROM events WHERE 1=1"
+    args: List[Any] = []
+    if symbol:
+        sql += " AND symbol = ?"
+        args.append(symbol)
+    if tf:
+        sql += " AND tf = ?"
+        args.append(tf)
+    if start_ep is not None:
+        sql += " AND received_at >= ?"
+        args.append(start_ep)
+    if end_ep is not None:
+        sql += " AND received_at <= ?"
+        args.append(end_ep)
+    sql += " ORDER BY received_at ASC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, tuple(args))
+        return cur.fetchall()
+
 # =========================
-# Business logic: trades & stats
+# Build trades & stats
 # =========================
 class TradeOutcome:
     NONE = "NONE"
@@ -121,55 +171,37 @@ class TradeOutcome:
     TP3 = "TP3_HIT"
     SL  = "SL_HIT"
 
-def load_events(limit: int = 500) -> List[sqlite3.Row]:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM events ORDER BY received_at DESC LIMIT ?",
-            (limit,),
-        )
-        return cur.fetchall()
-
-def load_all_events_for_analysis(max_rows: int = 10000) -> List[sqlite3.Row]:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM events ORDER BY received_at ASC LIMIT ?",
-            (max_rows,),
-        )
-        return cur.fetchall()
-
-def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def build_trades_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Optional[int], end_ep: Optional[int], max_rows: int = 20000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Regroupe par trade_id. Le premier ENTRY démarre le trade.
-    Resultat = premier évènement parmi {TP3, TP2, TP1, SL} observé après l'ENTRY.
+    On prend les events filtres (symbol/tf/date/limit). On groupe par trade_id.
+    Un trade commence au premier ENTRY. Le premier event parmi {TP3, TP2, TP1, SL}
+    rencontre apres l'ENTRY devient l'issue.
     """
-    rows = load_all_events_for_analysis()
+    rows = fetch_events_filtered(symbol, tf, start_ep, end_ep, max_rows)
     by_tid: Dict[str, List[sqlite3.Row]] = defaultdict(list)
     for r in rows:
-        tid = r["trade_id"]
-        if not tid:
-            # Pas de trade_id => ignore (ou groupe par symbol+time si tu veux)
-            # On peut aussi créer un trade_id synthétique:
-            tid = f"noid:{r['symbol']}:{r['received_at']}"
+        tid = r["trade_id"] or f"noid:{r['symbol']}:{r['received_at']}"
         by_tid[tid].append(r)
 
     trades: List[Dict[str, Any]] = []
-    # Counters
-    total = 0
-    wins = 0
-    losses = 0
+    total = wins = losses = 0
     hit_tp1 = hit_tp2 = hit_tp3 = 0
     times_to_outcome: List[int] = []
 
+    # Optional streaks
+    win_streak = 0
+    loss_streak = 0
+    best_win_streak = 0
+    worst_loss_streak = 0
+
+    # Walk in chronological order by grouped trades (already ASC by fetch)
     for tid, items in by_tid.items():
-        # Ordre chronologique déjà asc
         entry = None
         outcome_type = TradeOutcome.NONE
         outcome_time = None
         side = None
-        symbol = None
-        tf = None
+        vsymbol = None
+        vtf = None
         e_entry = e_sl = e_tp1 = e_tp2 = e_tp3 = None
         entry_time = None
 
@@ -177,8 +209,8 @@ def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             etype = ev["type"]
             if etype == "ENTRY" and entry is None:
                 entry = ev
-                symbol = ev["symbol"]
-                tf = ev["tf"]
+                vsymbol = ev["symbol"]
+                vtf = ev["tf"]
                 side = ev["side"]
                 e_entry = ev["entry"]
                 e_sl = ev["sl"]
@@ -186,21 +218,19 @@ def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 e_tp2 = ev["tp2"]
                 e_tp3 = ev["tp3"]
                 entry_time = ev["received_at"]
-                # continue scanning for outcome
             elif entry is not None:
-                # Determine outcome order: TP3 > TP2 > TP1 > SL, but we pick the FIRST event time we encounter
                 if etype in ("TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT") and outcome_type == TradeOutcome.NONE:
                     outcome_type = etype
                     outcome_time = ev["received_at"]
 
-        # register only trades that had an ENTRY
         if entry is not None:
             total += 1
             if outcome_time and entry_time:
                 times_to_outcome.append(int(outcome_time - entry_time))
-            # win/lose
-            if outcome_type in ("TP3_HIT", "TP2_HIT", "TP1_HIT"):
+            is_win = False
+            if outcome_type in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
                 wins += 1
+                is_win = True
                 if outcome_type == "TP1_HIT":
                     hit_tp1 += 1
                 elif outcome_type == "TP2_HIT":
@@ -210,11 +240,24 @@ def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             elif outcome_type == "SL_HIT":
                 losses += 1
 
+            # streaks
+            if is_win:
+                win_streak += 1
+                best_win_streak = max(best_win_streak, win_streak)
+                loss_streak = 0
+            elif outcome_type == "SL_HIT":
+                loss_streak += 1
+                worst_loss_streak = max(worst_loss_streak, loss_streak)
+                win_streak = 0
+            else:
+                # no outcome yet: do not change streaks
+                pass
+
             trades.append(
                 {
                     "trade_id": tid,
-                    "symbol": symbol,
-                    "tf": tf,
+                    "symbol": vsymbol,
+                    "tf": vtf,
                     "side": side,
                     "entry": e_entry,
                     "sl": e_sl,
@@ -230,7 +273,6 @@ def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     winrate = (wins / total * 100.0) if total else 0.0
     avg_sec = int(sum(times_to_outcome) / len(times_to_outcome)) if times_to_outcome else 0
-
     summary = {
         "total_trades": total,
         "wins": wins,
@@ -240,6 +282,8 @@ def build_trades() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "tp2_hits": hit_tp2,
         "tp3_hits": hit_tp3,
         "avg_time_to_outcome_sec": avg_sec,
+        "best_win_streak": best_win_streak,
+        "worst_loss_streak": worst_loss_streak,
     }
     return trades, summary
 
@@ -264,7 +308,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # =========================
-# HTML templates (Template)
+# HTML templates
 # =========================
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en">
@@ -286,32 +330,17 @@ INDEX_HTML_TPL = Template(r"""<!doctype html>
     --chip-bg: #0b1220;
   }
   * { box-sizing: border-box; }
-  body {
-    margin:0; padding:24px; background:var(--bg); color:var(--text);
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-  }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
   h1 { margin: 0 0 16px 0; font-size: 28px; font-weight: 700; letter-spacing: .2px; }
   .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   @media (min-width: 960px) { .grid { grid-template-columns: 1fr 1fr; } }
-
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px 16px 8px 16px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
-  }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 16px 8px 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
   .title { font-size: 16px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  table {
-    width: 100%; border-collapse: collapse; font-size: 14px;
-  }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
   th { text-align: left; color: var(--muted); font-weight: 600; }
   tr:last-child td { border-bottom: none; }
-  .btn {
-    display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
-    background: #0b1220; color: var(--text); text-decoration: none; font-weight: 600; margin-right: 8px;
-  }
+  .btn { display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0b1220; color: var(--text); text-decoration: none; font-weight: 600; margin-right: 8px; }
   .btn:hover { background: #0f1525; }
   .chip { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; margin-right:8px; background:var(--chip-bg); }
   .muted { color: var(--muted); }
@@ -321,16 +350,10 @@ INDEX_HTML_TPL = Template(r"""<!doctype html>
 </head>
 <body>
 <h1>AI Trader PRO - Status</h1>
-
 <div class="grid">
   <div class="card">
     <div class="title">Environment</div>
-    <table>
-      <thead><tr><th>Key</th><th>Value</th></tr></thead>
-      <tbody>
-        $rows_html
-      </tbody>
-    </table>
+    <table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>$rows_html</tbody></table>
     <div class="cta-row">
       <a class="btn" href="/env-sanity">/env-sanity</a>
       <a class="btn" href="/tg-health">/tg-health</a>
@@ -338,7 +361,6 @@ INDEX_HTML_TPL = Template(r"""<!doctype html>
       <a class="btn" href="/trades">/trades</a>
     </div>
   </div>
-
   <div class="card">
     <div class="title">Webhook</div>
     <div>POST <code>/tv-webhook</code> with JSON (TradingView).</div>
@@ -354,7 +376,6 @@ INDEX_HTML_TPL = Template(r"""<!doctype html>
     </div>
   </div>
 </div>
-
 </body>
 </html>
 """)
@@ -384,9 +405,7 @@ TRADES_HTML_TPL = Template(r"""<!doctype html>
   @media (min-width: 1100px) { .grid { grid-template-columns: 360px 1fr; } }
   .card { background: var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
   .title { font-size: 16px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  .kpi {
-    display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:6px;
-  }
+  .kpi { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:6px; }
   .kpi .item { background:#0b1220; border:1px solid var(--border); border-radius:10px; padding:10px; }
   .kpi .label { color: var(--muted); font-size:12px; }
   .kpi .value { font-size:22px; font-weight:700; }
@@ -399,65 +418,69 @@ TRADES_HTML_TPL = Template(r"""<!doctype html>
   .badge-win { color:#10b981; border-color:#0f5132; }
   .badge-loss { color:#ef4444; border-color:#5c1e1e; }
   .muted { color: var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .filter { display:grid; gap:8px; }
+  .filter input, .filter select { width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); }
+  .btn { display:inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0b1220; color: var(--text); text-decoration: none; font-weight: 600; margin-right: 8px; }
+  .btn:hover { background: #0f1525; }
+  .spark { width:100%; height:60px; }
 </style>
 </head>
 <body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
   <div class="card">
-    <div class="title">Summary</div>
-    <div class="kpi">
-      <div class="item">
-        <div class="label">Total</div>
-        <div class="value">$total_trades</div>
+    <div class="title">Filters</div>
+    <form method="get" class="filter">
+      <input type="hidden" name="secret" value="$secret">
+      <label>Symbol
+        <input type="text" name="symbol" placeholder="ex: BTCUSDT" value="$symbol">
+      </label>
+      <label>TF
+        <input type="text" name="tf" placeholder="ex: 15, 60, 1D" value="$tf">
+      </label>
+      <label>Start (YYYY-MM-DD)
+        <input type="text" name="start" placeholder="YYYY-MM-DD" value="$start">
+      </label>
+      <label>End (YYYY-MM-DD)
+        <input type="text" name="end" placeholder="YYYY-MM-DD" value="$end">
+      </label>
+      <label>Limit rows
+        <input type="number" min="1" max="50000" step="1" name="limit" value="$limit">
+      </label>
+      <div class="row">
+        <button class="btn" type="submit">Apply</button>
+        <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
+        <a class="btn" href="/events?secret=$secret">Raw events</a>
       </div>
-      <div class="item">
-        <div class="label">Winrate</div>
-        <div class="value green">$winrate_pct%</div>
-      </div>
-      <div class="item">
-        <div class="label">Wins</div>
-        <div class="value green">$wins</div>
-      </div>
-      <div class="item">
-        <div class="label">Losses</div>
-        <div class="value red">$losses</div>
-      </div>
-      <div class="item">
-        <div class="label">TP1 hits</div>
-        <div class="value blue">$tp1_hits</div>
-      </div>
-      <div class="item">
-        <div class="label">TP2 hits</div>
-        <div class="value blue">$tp2_hits</div>
-      </div>
-      <div class="item">
-        <div class="label">TP3 hits</div>
-        <div class="value yellow">$tp3_hits</div>
-      </div>
-      <div class="item">
-        <div class="label">Avg time to outcome</div>
-        <div class="value">$avg_time_to_outcome_sec s</div>
-      </div>
-    </div>
+    </form>
   </div>
 
   <div class="card">
+    <div class="title">Summary</div>
+    <div class="kpi">
+      <div class="item"><div class="label">Total</div><div class="value">$total_trades</div></div>
+      <div class="item"><div class="label">Winrate</div><div class="value green">$winrate_pct%</div></div>
+      <div class="item"><div class="label">Wins</div><div class="value green">$wins</div></div>
+      <div class="item"><div class="label">Losses</div><div class="value red">$losses</div></div>
+      <div class="item"><div class="label">TP1 hits</div><div class="value blue">$tp1_hits</div></div>
+      <div class="item"><div class="label">TP2 hits</div><div class="value blue">$tp2_hits</div></div>
+      <div class="item"><div class="label">TP3 hits</div><div class="value yellow">$tp3_hits</div></div>
+      <div class="item"><div class="label">Avg time to outcome</div><div class="value">$avg_time_to_outcome_sec s</div></div>
+      <div class="item"><div class="label">Best win streak</div><div class="value green">$best_win_streak</div></div>
+      <div class="item"><div class="label">Worst loss streak</div><div class="value red">$worst_loss_streak</div></div>
+    </div>
+    <canvas class="spark" id="spark"></canvas>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
     <div class="title">Recent trades</div>
     <table>
       <thead>
         <tr>
-          <th>Trade ID</th>
-          <th>Symbol</th>
-          <th>TF</th>
-          <th>Side</th>
-          <th>Entry</th>
-          <th>SL</th>
-          <th>TP1</th>
-          <th>TP2</th>
-          <th>TP3</th>
-          <th>Outcome</th>
-          <th>Duration (s)</th>
+          <th>Trade ID</th><th>Symbol</th><th>TF</th><th>Side</th>
+          <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
+          <th>Outcome</th><th>Duration (s)</th>
         </tr>
       </thead>
       <tbody>
@@ -466,6 +489,79 @@ TRADES_HTML_TPL = Template(r"""<!doctype html>
     </table>
     <div class="muted">Showing up to $limit trades (grouped by trade_id).</div>
   </div>
+</div>
+
+<script>
+// Simple sparkline of outcomes (1 for win, 0 for loss, 0.5 for none)
+const data = $spark_data;
+const canvas = document.getElementById('spark');
+if (canvas && data && data.length > 0) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  canvas.width = W;
+  canvas.height = H;
+  const n = data.length;
+  const maxV = 1, minV = 0;
+  const pad = 6;
+  function x(i){ return pad + i*(W-2*pad)/Math.max(1,(n-1)); }
+  function y(v){ return H - pad - (v-minV)*(H-2*pad)/(maxV-minV); }
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#3b82f6';
+  ctx.beginPath();
+  for (let i=0;i<n;i++){
+    const xp = x(i), yp = y(data[i]);
+    if (i===0) ctx.moveTo(xp, yp); else ctx.lineTo(xp, yp);
+  }
+  ctx.stroke();
+  // baseline
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+}
+</script>
+</body>
+</html>
+""")
+
+EVENTS_HTML_TPL = Template(r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Trader PRO - Events</title>
+<style>
+  :root { --bg:#0f172a; --card:#111827; --text:#e5e7eb; --muted:#94a3b8; --border:#1f2937; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+  h1 { margin:0 0 16px 0; font-size:28px; font-weight:700; }
+  .card { background: var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .muted { color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .btn { display:inline-block; padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); text-decoration:none; font-weight:600; }
+  input { padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); }
+</style>
+</head>
+<body>
+<h1>AI Trader PRO - Raw Events</h1>
+<div class="card">
+  <form method="get" class="row">
+    <input type="hidden" name="secret" value="$secret" />
+    <label>Limit <input type="number" name="limit" value="$limit" min="1" max="50000" /></label>
+    <button class="btn" type="submit">Apply</button>
+    <a class="btn" href="/trades?secret=$secret">Back to Trades</a>
+  </form>
+  <table>
+    <thead>
+      <tr><th>Time (server)</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr>
+    </thead>
+    <tbody>
+      $rows_html
+    </tbody>
+  </table>
 </div>
 </body>
 </html>
@@ -476,7 +572,26 @@ TRADES_HTML_TPL = Template(r"""<!doctype html>
 # =========================
 app = FastAPI(title="AI Trader PRO")
 
-# ------------- Index -------------
+# --------- Helpers (HTML) ---------
+def escape_html(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
+    )
+
+def fmt_num(v) -> str:
+    try:
+        if v is None:
+            return ""
+        s = f"{float(v):,.6f}".rstrip("0").rstrip(".")
+        return s
+    except Exception:
+        return str(v or "")
+
+# --------- Index ----------
 @app.get("/", response_class=HTMLResponse)
 def index(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -496,11 +611,11 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
     ]
-    trs = "".join([f"<tr><td>{k}</td><td>{v}</td></tr>" for (k, v) in rows])
+    trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.substitute(rows_html=trs)
     return HTMLResponse(html)
 
-# ------------- Env sanity -------------
+# --------- Env sanity ----------
 @app.get("/env-sanity")
 def env_sanity(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -518,9 +633,10 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "PORT": PORT,
         "RISK_ACCOUNT_BAL": RISK_ACCOUNT_BAL,
         "RISK_PCT": RISK_PCT,
+        "DB_PATH": DB_PATH,
     }
 
-# ------------- Telegram health -------------
+# --------- Telegram health ----------
 @app.get("/tg-health")
 def tg_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -528,7 +644,7 @@ def tg_health(secret: Optional[str] = Query(None)):
     ok = send_telegram("Test Telegram: OK")
     return {"ok": ok}
 
-# ------------- OpenAI health -------------
+# --------- OpenAI health ----------
 @app.get("/openai-health")
 def openai_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -536,7 +652,6 @@ def openai_health(secret: Optional[str] = Query(None)):
     if not (LLM_ENABLED and _openai_client):
         return {"ok": False, "enabled": bool(LLM_ENABLED), "client_ready": bool(_openai_client), "why": _llm_reason_down}
     try:
-        # minimal ping
         comp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": "ping"}],
@@ -547,13 +662,13 @@ def openai_health(secret: Optional[str] = Query(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ------------- Webhook TradingView -------------
+# --------- Webhook TradingView ----------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     """
-    Reçoit les alertes JSON TradingView.
-    Secret accepté en query (?secret=...) ou dans le JSON ("secret": "...").
-    Stocke l'évènement en base.
+    Recoit les alertes JSON TradingView.
+    Secret accepte en query (?secret=...) ou dans le JSON ("secret": "...").
+    Enregistre l'evenement en base.
     """
     try:
         payload = await request.json()
@@ -567,10 +682,9 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         if secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # enregistrer
     save_event(payload)
 
-    # (optionnel) Telegram résumé succinct
+    # Option: Telegram
     try:
         t = payload.get("type", "EVENT")
         sym = payload.get("symbol", "?")
@@ -582,34 +696,83 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
 
     return {"ok": True}
 
-# ------------- Trades JSON brut -------------
+# --------- Trades JSON ----------
 @app.get("/trades.json")
-def trades_json(secret: Optional[str] = Query(None), limit: int = 100):
+def trades_json(
+    secret: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100)
+):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    trades, summary = build_trades()
-    # renvoyer jusqu'au "limit" derniers selon l'ordre inverse d'insertion
-    resp = {
-        "summary": summary,
-        "trades": trades[-limit:] if limit else trades
-    }
-    return JSONResponse(resp)
 
-# ------------- Trades (HTML) -------------
-@app.get("/trades", response_class=HTMLResponse)
-def trades(secret: Optional[str] = Query(None), limit: int = 100):
+    start_ep = parse_date_to_epoch(start)
+    end_ep   = parse_date_end_to_epoch(end)
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit*10))
+    return JSONResponse({"summary": summary, "trades": trades[-limit:] if limit else trades})
+
+# --------- Trades CSV export ----------
+@app.get("/trades.csv")
+def trades_csv(
+    secret: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(1000)
+):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    trades, summary = build_trades()
-    # Construire lignes
+    start_ep = parse_date_to_epoch(start)
+    end_ep   = parse_date_end_to_epoch(end)
+    trades, _ = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
+    data = trades[-limit:] if limit else trades
+    # CSV headers
+    headers = ["trade_id","symbol","tf","side","entry","sl","tp1","tp2","tp3","entry_time","outcome","outcome_time","duration_sec"]
+    lines = [",".join(headers)]
+    for tr in data:
+        row = [str(tr.get(h,"")) for h in headers]
+        # Escape commas by wrapping in quotes if needed
+        row = [f"\"{x}\"" if ("," in x) else x for x in row]
+        lines.append(",".join(row))
+    csv_content = "\n".join(lines)
+    return Response(content=csv_content, media_type="text/csv")
+
+# --------- Trades HTML ----------
+@app.get("/trades", response_class=HTMLResponse)
+def trades(
+    secret: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100)
+):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    start_ep = parse_date_to_epoch(start)
+    end_ep   = parse_date_end_to_epoch(end)
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
+
     rows_html = ""
-    # afficher les plus récents en bas du tableau? on garde l'ordre d'assemblage
-    for tr in trades[-limit:]:
-        badge_class = "badge-win" if tr["outcome"] in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else ("badge-loss" if tr["outcome"] == "SL_HIT" else "")
-        outcome_html = f'<span class="chip {badge_class}">{tr["outcome"] or "NONE"}</span>'
+    spark_values = []  # 1 for win, 0 for loss, 0.5 for NONE
+    data = trades[-limit:] if limit else trades
+    for tr in data:
+        outcome = tr["outcome"] or "NONE"
+        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
+        if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT"):
+            spark_values.append(1.0)
+        elif outcome == "SL_HIT":
+            spark_values.append(0.0)
+        else:
+            spark_values.append(0.5)
+        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
         rows_html += (
             "<tr>"
-            f"<td>{escape_html(tr['trade_id'])}</td>"
+            f"<td>{escape_html(str(tr['trade_id']))}</td>"
             f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
             f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
             f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
@@ -624,46 +787,86 @@ def trades(secret: Optional[str] = Query(None), limit: int = 100):
         )
 
     html = TRADES_HTML_TPL.substitute(
-        total_trades=summary["total_trades"],
-        winrate_pct=summary["winrate_pct"],
-        wins=summary["wins"],
-        losses=summary["losses"],
-        tp1_hits=summary["tp1_hits"],
-        tp2_hits=summary["tp2_hits"],
-        tp3_hits=summary["tp3_hits"],
-        avg_time_to_outcome_sec=summary["avg_time_to_outcome_sec"],
+        secret=escape_html(secret or ""),
+        symbol=escape_html(symbol or ""),
+        tf=escape_html(tf or ""),
+        start=escape_html(start or ""),
+        end=escape_html(end or ""),
+        limit=str(limit),
+        total_trades=str(summary["total_trades"]),
+        winrate_pct=str(summary["winrate_pct"]),
+        wins=str(summary["wins"]),
+        losses=str(summary["losses"]),
+        tp1_hits=str(summary["tp1_hits"]),
+        tp2_hits=str(summary["tp2_hits"]),
+        tp3_hits=str(summary["tp3_hits"]),
+        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
+        best_win_streak=str(summary["best_win_streak"]),
+        worst_loss_streak=str(summary["worst_loss_streak"]),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        limit=limit
+        spark_data=json.dumps(spark_values)
     )
     return HTMLResponse(html)
 
-# ------------- Alias: /trades/secret=... -> redirect -------------
+# --------- Events raw HTML ----------
+@app.get("/events", response_class=HTMLResponse)
+def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM events ORDER BY received_at DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+
+    def fmt_time(ts: int) -> str:
+        try:
+            import datetime as dt
+            return dt.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            return str(ts)
+
+    rows_html = ""
+    for r in rows:
+        rows_html += (
+            "<tr>"
+            f"<td>{escape_html(fmt_time(r['received_at']))}</td>"
+            f"<td>{escape_html(r['type'] or '')}</td>"
+            f"<td>{escape_html(r['symbol'] or '')}</td>"
+            f"<td>{escape_html(r['tf'] or '')}</td>"
+            f"<td>{escape_html(r['side'] or '')}</td>"
+            f"<td>{escape_html(r['trade_id'] or '')}</td>"
+            f"<td><pre style='white-space:pre-wrap;margin:0'>{escape_html(r['raw_json'] or '')}</pre></td>"
+            "</tr>"
+        )
+    html = EVENTS_HTML_TPL.substitute(
+        secret=escape_html(secret or ""),
+        limit=str(limit),
+        rows_html=rows_html or '<tr><td colspan="7" class="muted">No events.</td></tr>'
+    )
+    return HTMLResponse(html)
+
+# --------- Events JSON ----------
+@app.get("/events.json")
+def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM events ORDER BY received_at DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+    return JSONResponse({"events": rows})
+
+# --------- Alias: /trades/secret=... ----------
 @app.get("/trades/secret={secret}")
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
-# ============ Helpers ============
-def escape_html(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&#39;")
-    )
-
-def fmt_num(v) -> str:
-    try:
-        if v is None:
-            return ""
-        # compact formatting
-        s = f"{float(v):,.6f}".rstrip("0").rstrip(".")
-        return s
-    except Exception:
-        return str(v or "")
+# --------- Root CSV quick test ----------
+@app.get("/ping")
+def ping():
+    return {"ok": True}
 
 # ============ Run (local) ============
-# For Render, use: gunicorn -k uvicorn.workers.UvicornWorker -w 1 main:app
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
