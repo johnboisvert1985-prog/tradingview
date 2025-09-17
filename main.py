@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 import html
+from string import Template
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 # =========================
 # Config / Environment
@@ -41,7 +42,12 @@ async def send_telegram(text: str) -> None:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
 
     if httpx:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -50,21 +56,19 @@ async def send_telegram(text: str) -> None:
             except Exception:
                 pass
     else:
-        # Fallback sync via stdlib
-        import json, urllib.request
+        # Fallback sync via stdlib, exécuté en thread pour ne pas bloquer l’event loop
+        import json, urllib.request, asyncio
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         try:
-            # Exécuter en thread pour ne pas bloquer l’event loop
-            import asyncio
             await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
         except Exception:
             pass
 
 # =========================
-# HTML Template
+# HTML Template (string.Template)
 # =========================
-INDEX_HTML = """<!doctype html>
+INDEX_HTML = Template("""<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8" />
@@ -87,7 +91,7 @@ INDEX_HTML = """<!doctype html>
 
   <div class="card">
     <b>Environnement</b>
-    <table>{rows_html}</table>
+    <table>$rows_html</table>
     <div style="margin-top:10px">
       <a class="btn" href="/env-sanity">/env-sanity</a>
       <a class="btn" href="/tg-health">/tg-health</a>
@@ -102,7 +106,7 @@ INDEX_HTML = """<!doctype html>
   </div>
 </body>
 </html>
-"""
+""")
 
 # =========================
 # App
@@ -131,7 +135,7 @@ def index() -> HTMLResponse:
         f"<tr><td class='key'>{html.escape(k)}</td><td><code>{html.escape(v)}</code></td></tr>"
         for k, v in _rows()
     )
-    return HTMLResponse(INDEX_HTML.format(rows_html=rows_html))
+    return HTMLResponse(INDEX_HTML.substitute(rows_html=rows_html))
 
 @app.get("/env-sanity")
 def env_sanity(secret: Optional[str] = Query(None)):
@@ -186,9 +190,8 @@ def trades(secret: Optional[str] = Query(None)):
 # =========================
 #  Webhook TradingView
 # =========================
-
 class TVPayload(BaseModel):
-    # Exemple minimal compatible avec ton Pine (type, symbol, tf, time, side, entry/ sl / tp...)
+    # Exemple minimal compatible avec ton Pine (type, symbol, tf, time, side, entry/sl/tp…)
     type: str = Field(..., description="ENTRY, CLOSE, TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, AOE_PREMIUM, AOE_DISCOUNT, etc.")
     symbol: Optional[str] = None
     tf: Optional[str] = None
@@ -208,9 +211,10 @@ class TVPayload(BaseModel):
     trade_id: Optional[str] = None
     secret: Optional[str] = None  # support secret dans le body
 
-    @validator("type")
-    def _type_upper(cls, v: str) -> str:
-        return v.upper()
+    @field_validator("type", mode="before")
+    @classmethod
+    def _type_upper(cls, v: str):
+        return v.upper() if isinstance(v, str) else v
 
 def _check_secret(header_secret: Optional[str], body_secret: Optional[str]):
     """Vérifie X-Webhook-Secret ou champ body.secret."""
@@ -296,7 +300,7 @@ async def tv_webhook(
     await send_telegram(msg)
 
     # Réponse
-    return {"ok": True, "received": payload.dict()}
+    return {"ok": True, "received": payload.model_dump()}
 
 # =========================
 # Run local
