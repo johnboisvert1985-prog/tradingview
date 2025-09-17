@@ -5,8 +5,9 @@ import os
 import html
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, validator
 
 # =========================
 # Config / Environment
@@ -22,19 +23,43 @@ PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "1000"))
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0"))
 
-# If you have an OpenAI client, initialize it here; otherwise leave None.
+# (Optionnel) Client LLM si disponible
 _openai_client = None
 _llm_reason_down = "LLM disabled or client not initialized"
 
 # =========================
-# Utilities (stubs)
+# HTTP client (Telegram)
 # =========================
+# On tente httpx (async). Si indisponible, fallback standard lib.
+try:
+    import httpx
+except Exception:  # pragma: no cover
+    httpx = None
+
 async def send_telegram(text: str) -> None:
-    """Minimal stub. Wire your real Telegram sender here if needed."""
+    """Envoie un message Telegram si BOT et CHAT_ID sont configurés."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
-    # Implement requests.post to Telegram if desired.
-    return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+
+    if httpx:
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                await client.post(url, json=payload)
+            except Exception:
+                pass
+    else:
+        # Fallback sync via stdlib
+        import json, urllib.request
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            # Exécuter en thread pour ne pas bloquer l’event loop
+            import asyncio
+            await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
+        except Exception:
+            pass
 
 # =========================
 # HTML Template
@@ -141,7 +166,6 @@ def openai_health(secret: Optional[str] = Query(None)):
     if not (LLM_ENABLED and _openai_client):
         return {"ok": False, "enabled": bool(LLM_ENABLED), "client_ready": bool(_openai_client), "why": _llm_reason_down}
     try:
-        # Example ping; adjust to your SDK
         comp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": "ping"}],
@@ -156,18 +180,127 @@ def openai_health(secret: Optional[str] = Query(None)):
 def trades(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    # Return whatever you store as trades; placeholder here:
+    # TODO: renvoyer vos trades persistés
     return JSONResponse({"trades": []})
 
-# If you have a POST /tv-webhook, define it here
-# from fastapi import Request
-# @app.post("/tv-webhook")
-# async def tv_webhook(request: Request):
-#     payload = await request.json()
-#     # handle payload...
-#     return {"ok": True}
+# =========================
+#  Webhook TradingView
+# =========================
 
-# For local run: uvicorn main:app --reload --port 8000
+class TVPayload(BaseModel):
+    # Exemple minimal compatible avec ton Pine (type, symbol, tf, time, side, entry/ sl / tp...)
+    type: str = Field(..., description="ENTRY, CLOSE, TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, AOE_PREMIUM, AOE_DISCOUNT, etc.")
+    symbol: Optional[str] = None
+    tf: Optional[str] = None
+    time: Optional[int] = None
+    side: Optional[str] = None
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    r1: Optional[float] = None
+    s1: Optional[float] = None
+    lev_reco: Optional[float] = None
+    qty_reco: Optional[float] = None
+    notional: Optional[float] = None
+    trade_id: Optional[str] = None
+    secret: Optional[str] = None  # support secret dans le body
+
+    @validator("type")
+    def _type_upper(cls, v: str) -> str:
+        return v.upper()
+
+def _check_secret(header_secret: Optional[str], body_secret: Optional[str]):
+    """Vérifie X-Webhook-Secret ou champ body.secret."""
+    if not WEBHOOK_SECRET:
+        return  # pas de protection
+    sent = header_secret or body_secret
+    if sent != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+def _emoji(evt_type: str) -> str:
+    return {
+        "ENTRY": "🚀",
+        "CLOSE": "🔚",
+        "TP1_HIT": "✅",
+        "TP2_HIT": "✅✅",
+        "TP3_HIT": "🏁",
+        "SL_HIT": "⛔",
+        "AOE_PREMIUM": "🟥",
+        "AOE_DISCOUNT": "🟩",
+    }.get(evt_type.upper(), "ℹ️")
+
+def _fmt_float(v: Optional[float]) -> str:
+    return "-" if v is None else f"{v:.6f}".rstrip("0").rstrip(".")
+
+def _format_tv_message(p: TVPayload) -> str:
+    em = _emoji(p.type)
+    lines = [
+        f"{em} <b>{html.escape(p.type)}</b>",
+        f"• Symbol: <code>{html.escape(p.symbol or '-')}</code>",
+    ]
+    if p.side:
+        lines.append(f"• Side: <b>{html.escape(p.side)}</b>")
+    if p.tf:
+        lines.append(f"• TF: <code>{html.escape(p.tf)}</code>")
+    if p.entry is not None:
+        lines.append(f"• Entry: <code>{_fmt_float(p.entry)}</code>")
+    if p.sl is not None:
+        lines.append(f"• SL: <code>{_fmt_float(p.sl)}</code>")
+    if p.tp is not None:
+        lines.append(f"• TP: <code>{_fmt_float(p.tp)}</code>")
+    if p.tp1 is not None or p.tp2 is not None or p.tp3 is not None:
+        lines.append(f"• TP1/2/3: <code>{_fmt_float(p.tp1)} / {_fmt_float(p.tp2)} / {_fmt_float(p.tp3)}</code>")
+    if p.r1 is not None or p.s1 is not None:
+        lines.append(f"• R1/S1: <code>{_fmt_float(p.r1)} / {_fmt_float(p.s1)}</code>")
+    if p.lev_reco is not None or p.qty_reco is not None or p.notional is not None:
+        lines.append(f"• Lev/Qty/Notional: <code>{_fmt_float(p.lev_reco)} / {_fmt_float(p.qty_reco)} / {_fmt_float(p.notional)}</code>")
+    if p.trade_id:
+        lines.append(f"• Trade ID: <code>{html.escape(p.trade_id)}</code>")
+    return "\n".join(lines)
+
+@app.post("/tv-webhook")
+async def tv_webhook(
+    request: Request,
+    x_webhook_secret: Optional[str] = Header(None, convert_underscores=False),
+):
+    """
+    Reçoit les webhooks TradingView.
+    - Secret accepté via header `X-Webhook-Secret` OU champ JSON `secret`.
+    - Payload validé via Pydantic, champs facultatifs tolérés.
+    - Relais Telegram formaté.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Valide secret (header ou body)
+    body_secret = data.get("secret") if isinstance(data, dict) else None
+    _check_secret(x_webhook_secret, body_secret)
+
+    # Valide schéma
+    try:
+        payload = TVPayload(**data)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Bad payload: {e}")
+
+    # (Optionnel) Filtrage côté serveur (ex: seuil de confiance)
+    # if payload.type == "ENTRY" and CONFIDENCE_MIN > 0:
+    #     ...
+
+    # Compose & envoie le message Telegram
+    msg = _format_tv_message(payload)
+    await send_telegram(msg)
+
+    # Réponse
+    return {"ok": True, "received": payload.dict()}
+
+# =========================
+# Run local
+# =========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
