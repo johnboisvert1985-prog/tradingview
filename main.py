@@ -31,12 +31,13 @@ CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
-DB_PATH            = os.getenv("DB_PATH", "data/data.db")  # met dans un dossier dédié
 
-DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1","true","True")
+# DB path default = data/data.db; fallback auto to /tmp if read-only
+DB_PATH            = os.getenv("DB_PATH", "data/data.db")
+DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
 # -------------------------
-# OpenAI client (optionnel)
+# OpenAI client (optional)
 # -------------------------
 _openai_client = None
 _llm_reason_down = None
@@ -50,21 +51,30 @@ else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
 # -------------------------
-# SQLite (persistant)
+# SQLite (persistent)
 # -------------------------
-def ensure_db_dir():
-    d = os.path.dirname(DB_PATH)
-    if d and not os.path.exists(d):
+def resolve_db_path() -> None:
+    """Try to create directory for DB_PATH; if permission denied, fallback to /tmp/ai_trader/data.db."""
+    global DB_PATH
+    d = os.path.dirname(DB_PATH) or "."
+    try:
         os.makedirs(d, exist_ok=True)
-        log.info("Created DB directory: %s", d)
+        probe = os.path.join(d, ".write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        log.info("DB dir OK: %s (using %s)", d, DB_PATH)
+    except Exception as e:
+        fallback_dir = "/tmp/ai_trader"
+        os.makedirs(fallback_dir, exist_ok=True)
+        DB_PATH = os.path.join(fallback_dir, "data.db")
+        log.warning("DB dir '%s' not writable (%s). Falling back to %s", d, e, DB_PATH)
 
-ensure_db_dir()
+resolve_db_path()
 
 def db_conn() -> sqlite3.Connection:
-    # check_same_thread=False pour éviter soucis multi-threads
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # un petit set pragmas
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -298,7 +308,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (optionnel)
+# Telegram (optional)
 # -------------------------
 def send_telegram(text: str) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -317,7 +327,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # -------------------------
-# HTML templates
+# HTML templates (ASCII only)
 # -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
@@ -575,13 +585,9 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         log.warning("Invalid secret on tv-webhook")
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # Log minimal
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
-
-    # Sauvegarde
     save_event(payload)
 
-    # (Option) Telegram
     try:
         t = payload.get("type", "EVENT")
         sym = payload.get("symbol", "?")
@@ -747,7 +753,7 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
-# -------- Self test: insert un trade factice --------
+# -------- Self test: insert a sample trade --------
 @app.get("/selftest")
 def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
