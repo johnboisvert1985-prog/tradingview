@@ -3,16 +3,23 @@ import os
 import json
 import time
 import sqlite3
+import logging
 from typing import Optional, Dict, Any, List, Tuple
 from string import Template
 from collections import defaultdict
 
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-# =========================
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("aitrader")
+
+# -------------------------
 # Config / ENV
-# =========================
+# -------------------------
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -24,11 +31,13 @@ CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
-DB_PATH            = os.getenv("DB_PATH", "data.db")
+DB_PATH            = os.getenv("DB_PATH", "data/data.db")  # met dans un dossier dédié
 
-# =========================
+DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1","true","True")
+
+# -------------------------
 # OpenAI client (optionnel)
-# =========================
+# -------------------------
 _openai_client = None
 _llm_reason_down = None
 if LLM_ENABLED and OPENAI_API_KEY:
@@ -40,12 +49,28 @@ if LLM_ENABLED and OPENAI_API_KEY:
 else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
-# =========================
+# -------------------------
 # SQLite (persistant)
-# =========================
+# -------------------------
+def ensure_db_dir():
+    d = os.path.dirname(DB_PATH)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+        log.info("Created DB directory: %s", d)
+
+ensure_db_dir()
+
 def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # check_same_thread=False pour éviter soucis multi-threads
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # un petit set pragmas
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
     return conn
 
 def db_init() -> None:
@@ -75,6 +100,7 @@ def db_init() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_events_tf ON events(tf)")
         conn.commit()
+    log.info("DB initialized at %s", DB_PATH)
 
 db_init()
 
@@ -109,12 +135,13 @@ def save_event(payload: Dict[str, Any]) -> None:
             row,
         )
         conn.commit()
+    log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s",
+             row["type"], row["symbol"], row["tf"], row["trade_id"])
 
-# =========================
-# Helpers: dates, filters, SQL
-# =========================
+# -------------------------
+# Helpers: dates, filters
+# -------------------------
 def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    # Expect "YYYY-MM-DD"
     if not date_str:
         return None
     try:
@@ -126,7 +153,6 @@ def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
         return None
 
 def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    # End is exclusive: + 1 day
     if not date_str:
         return None
     try:
@@ -137,7 +163,9 @@ def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
-def fetch_events_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Optional[int], end_ep: Optional[int], limit: int = 10000) -> List[sqlite3.Row]:
+def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
+                          start_ep: Optional[int], end_ep: Optional[int],
+                          limit: int = 10000) -> List[sqlite3.Row]:
     sql = "SELECT * FROM events WHERE 1=1"
     args: List[Any] = []
     if symbol:
@@ -161,9 +189,9 @@ def fetch_events_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Op
         cur.execute(sql, tuple(args))
         return cur.fetchall()
 
-# =========================
+# -------------------------
 # Build trades & stats
-# =========================
+# -------------------------
 class TradeOutcome:
     NONE = "NONE"
     TP1 = "TP1_HIT"
@@ -171,12 +199,9 @@ class TradeOutcome:
     TP3 = "TP3_HIT"
     SL  = "SL_HIT"
 
-def build_trades_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Optional[int], end_ep: Optional[int], max_rows: int = 20000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    On prend les events filtres (symbol/tf/date/limit). On groupe par trade_id.
-    Un trade commence au premier ENTRY. Le premier event parmi {TP3, TP2, TP1, SL}
-    rencontre apres l'ENTRY devient l'issue.
-    """
+def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
+                          start_ep: Optional[int], end_ep: Optional[int],
+                          max_rows: int = 20000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rows = fetch_events_filtered(symbol, tf, start_ep, end_ep, max_rows)
     by_tid: Dict[str, List[sqlite3.Row]] = defaultdict(list)
     for r in rows:
@@ -187,14 +212,10 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Op
     total = wins = losses = 0
     hit_tp1 = hit_tp2 = hit_tp3 = 0
     times_to_outcome: List[int] = []
-
-    # Optional streaks
-    win_streak = 0
-    loss_streak = 0
+    win_streak = loss_streak = 0
     best_win_streak = 0
     worst_loss_streak = 0
 
-    # Walk in chronological order by grouped trades (already ASC by fetch)
     for tid, items in by_tid.items():
         entry = None
         outcome_type = TradeOutcome.NONE
@@ -227,31 +248,20 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Op
             total += 1
             if outcome_time and entry_time:
                 times_to_outcome.append(int(outcome_time - entry_time))
-            is_win = False
-            if outcome_type in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
-                wins += 1
-                is_win = True
-                if outcome_type == "TP1_HIT":
-                    hit_tp1 += 1
-                elif outcome_type == "TP2_HIT":
-                    hit_tp2 += 1
-                elif outcome_type == "TP3_HIT":
-                    hit_tp3 += 1
-            elif outcome_type == "SL_HIT":
-                losses += 1
-
-            # streaks
+            is_win = outcome_type in ("TP1_HIT", "TP2_HIT", "TP3_HIT")
             if is_win:
+                wins += 1
                 win_streak += 1
                 best_win_streak = max(best_win_streak, win_streak)
                 loss_streak = 0
+                if outcome_type == "TP1_HIT": hit_tp1 += 1
+                elif outcome_type == "TP2_HIT": hit_tp2 += 1
+                elif outcome_type == "TP3_HIT": hit_tp3 += 1
             elif outcome_type == "SL_HIT":
+                losses += 1
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
-            else:
-                # no outcome yet: do not change streaks
-                pass
 
             trades.append(
                 {
@@ -287,9 +297,9 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str], start_ep: Op
     }
     return trades, summary
 
-# =========================
+# -------------------------
 # Telegram (optionnel)
-# =========================
+# -------------------------
 def send_telegram(text: str) -> bool:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
@@ -297,161 +307,87 @@ def send_telegram(text: str) -> bool:
         import urllib.request
         import urllib.parse
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode(
-            {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        ).encode()
+        data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
         req = urllib.request.Request(api_url, data=data)
         with urllib.request.urlopen(req, timeout=10) as resp:
             _ = resp.read()
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("Telegram send failed: %s", e)
         return False
 
-# =========================
+# -------------------------
 # HTML templates
-# =========================
+# -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Trader PRO - Status</title>
 <style>
-  :root {
-    --bg: #0f172a;
-    --card: #111827;
-    --text: #e5e7eb;
-    --muted: #94a3b8;
-    --green: #10b981;
-    --red: #ef4444;
-    --blue: #3b82f6;
-    --yellow: #f59e0b;
-    --border: #1f2937;
-    --chip-bg: #0b1220;
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-  h1 { margin: 0 0 16px 0; font-size: 28px; font-weight: 700; letter-spacing: .2px; }
-  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
-  @media (min-width: 960px) { .grid { grid-template-columns: 1fr 1fr; } }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 16px 8px 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
-  .title { font-size: 16px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  th { text-align: left; color: var(--muted); font-weight: 600; }
-  tr:last-child td { border-bottom: none; }
-  .btn { display: inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0b1220; color: var(--text); text-decoration: none; font-weight: 600; margin-right: 8px; }
-  .btn:hover { background: #0f1525; }
-  .chip { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; margin-right:8px; background:var(--chip-bg); }
-  .muted { color: var(--muted); }
-  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .cta-row { margin-top: 10px; }
-</style>
-</head>
-<body>
+:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--yellow:#f59e0b;--border:#1f2937;--chip-bg:#0b1220}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+h1{margin:0 0 16px 0;font-size:28px;font-weight:700;letter-spacing:.2px}.grid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:960px){.grid{grid-template-columns:1fr 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 16px 8px 16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
+.btn:hover{background:#0f1525}.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;margin-right:8px;background:var(--chip-bg)}.muted{color:var(--muted)}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cta-row{margin-top:10px}
+</style></head><body>
 <h1>AI Trader PRO - Status</h1>
 <div class="grid">
-  <div class="card">
-    <div class="title">Environment</div>
-    <table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>$rows_html</tbody></table>
-    <div class="cta-row">
-      <a class="btn" href="/env-sanity">/env-sanity</a>
-      <a class="btn" href="/tg-health">/tg-health</a>
-      <a class="btn" href="/openai-health">/openai-health</a>
-      <a class="btn" href="/trades">/trades</a>
-    </div>
-  </div>
-  <div class="card">
-    <div class="title">Webhook</div>
-    <div>POST <code>/tv-webhook</code> with JSON (TradingView).</div>
-    <div class="muted">Secret can be passed as ?secret=... or in JSON body "secret".</div>
-    <div style="margin-top:8px" class="row">
-      <span class="chip">ENTRY</span>
-      <span class="chip">TP1_HIT</span>
-      <span class="chip">TP2_HIT</span>
-      <span class="chip">TP3_HIT</span>
-      <span class="chip">SL_HIT</span>
-      <span class="chip">AOE_PREMIUM</span>
-      <span class="chip">AOE_DISCOUNT</span>
-    </div>
-  </div>
-</div>
-</body>
-</html>
+<div class="card"><div class="title">Environment</div>
+<table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>$rows_html</tbody></table>
+<div class="cta-row">
+  <a class="btn" href="/env-sanity">/env-sanity</a>
+  <a class="btn" href="/tg-health">/tg-health</a>
+  <a class="btn" href="/openai-health">/openai-health</a>
+  <a class="btn" href="/trades">/trades</a>
+</div></div>
+<div class="card"><div class="title">Webhook</div>
+<div>POST <code>/tv-webhook</code> with JSON (TradingView).</div>
+<div class="muted">Secret can be passed as ?secret=... or in JSON body "secret".</div>
+<div style="margin-top:8px" class="row">
+  <span class="chip">ENTRY</span><span class="chip">TP1_HIT</span><span class="chip">TP2_HIT</span>
+  <span class="chip">TP3_HIT</span><span class="chip">SL_HIT</span><span class="chip">AOE_PREMIUM</span><span class="chip">AOE_DISCOUNT</span>
+</div></div></div></body></html>
 """)
 
 TRADES_HTML_TPL = Template(r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Trader PRO - Trades</title>
 <style>
-  :root {
-    --bg: #0f172a;
-    --card: #111827;
-    --text: #e5e7eb;
-    --muted: #94a3b8;
-    --green: #10b981;
-    --red: #ef4444;
-    --blue: #3b82f6;
-    --yellow: #f59e0b;
-    --border: #1f2937;
-    --chip-bg: #0b1220;
-  }
-  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-  h1 { margin: 0 0 16px 0; font-size: 28px; font-weight: 700; }
-  .grid { display:grid; grid-template-columns: 1fr; gap: 16px; }
-  @media (min-width: 1100px) { .grid { grid-template-columns: 360px 1fr; } }
-  .card { background: var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
-  .title { font-size: 16px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-  .kpi { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; margin-top:6px; }
-  .kpi .item { background:#0b1220; border:1px solid var(--border); border-radius:10px; padding:10px; }
-  .kpi .label { color: var(--muted); font-size:12px; }
-  .kpi .value { font-size:22px; font-weight:700; }
-  .kpi .green { color: var(--green); } .kpi .red { color: var(--red); } .kpi .blue { color: var(--blue); } .kpi .yellow { color: var(--yellow); }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  th { text-align:left; color: var(--muted); font-weight:600; }
-  tr:last-child td { border-bottom:none; }
-  .chip { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; background:var(--chip-bg); }
-  .badge-win { color:#10b981; border-color:#0f5132; }
-  .badge-loss { color:#ef4444; border-color:#5c1e1e; }
-  .muted { color: var(--muted); }
-  .row { display:flex; gap:8px; flex-wrap:wrap; }
-  .filter { display:grid; gap:8px; }
-  .filter input, .filter select { width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); }
-  .btn { display:inline-block; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); background: #0b1220; color: var(--text); text-decoration: none; font-weight: 600; margin-right: 8px; }
-  .btn:hover { background: #0f1525; }
-  .spark { width:100%; height:60px; }
-</style>
-</head>
-<body>
+:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--yellow:#f59e0b;--border:#1f2937;--chip-bg:#0b1220}
+body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
+.kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
+.kpi .green{color:var(--green)}.kpi .red{color:var(--red)}.kpi .blue{color:var(--blue)}.kpi .yellow{color:var(--yellow)}table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
+.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
+.badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
+.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
+.btn:hover{background:#0f1525}.spark{width:100%;height:60px}
+</style></head><body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
   <div class="card">
     <div class="title">Filters</div>
     <form method="get" class="filter">
       <input type="hidden" name="secret" value="$secret">
-      <label>Symbol
-        <input type="text" name="symbol" placeholder="ex: BTCUSDT" value="$symbol">
-      </label>
-      <label>TF
-        <input type="text" name="tf" placeholder="ex: 15, 60, 1D" value="$tf">
-      </label>
-      <label>Start (YYYY-MM-DD)
-        <input type="text" name="start" placeholder="YYYY-MM-DD" value="$start">
-      </label>
-      <label>End (YYYY-MM-DD)
-        <input type="text" name="end" placeholder="YYYY-MM-DD" value="$end">
-      </label>
-      <label>Limit rows
-        <input type="number" min="1" max="50000" step="1" name="limit" value="$limit">
-      </label>
+      <label>Symbol <input type="text" name="symbol" value="$symbol" placeholder="ex: BTCUSDT"></label>
+      <label>TF <input type="text" name="tf" value="$tf" placeholder="ex: 15, 60, 1D"></label>
+      <label>Start (YYYY-MM-DD) <input type="text" name="start" value="$start" placeholder="YYYY-MM-DD"></label>
+      <label>End (YYYY-MM-DD) <input type="text" name="end" value="$end" placeholder="YYYY-MM-DD"></label>
+      <label>Limit rows <input type="number" min="1" max="50000" step="1" name="limit" value="$limit"></label>
       <div class="row">
         <button class="btn" type="submit">Apply</button>
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
+        <a class="btn" href="/selftest?secret=$secret">Self test</a>
       </div>
     </form>
   </div>
@@ -473,125 +409,86 @@ TRADES_HTML_TPL = Template(r"""<!doctype html>
     <canvas class="spark" id="spark"></canvas>
   </div>
 
-  <div class="card" style="grid-column: 1 / -1;">
+  <div class="card" style="grid-column:1/-1">
     <div class="title">Recent trades</div>
     <table>
-      <thead>
-        <tr>
-          <th>Trade ID</th><th>Symbol</th><th>TF</th><th>Side</th>
-          <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
-          <th>Outcome</th><th>Duration (s)</th>
-        </tr>
-      </thead>
-      <tbody>
-        $rows_html
-      </tbody>
+      <thead><tr>
+        <th>Trade ID</th><th>Symbol</th><th>TF</th><th>Side</th>
+        <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
+        <th>Outcome</th><th>Duration (s)</th>
+      </tr></thead>
+      <tbody>$rows_html</tbody>
     </table>
     <div class="muted">Showing up to $limit trades (grouped by trade_id).</div>
   </div>
 </div>
 
 <script>
-// Simple sparkline of outcomes (1 for win, 0 for loss, 0.5 for none)
 const data = $spark_data;
 const canvas = document.getElementById('spark');
 if (canvas && data && data.length > 0) {
   const ctx = canvas.getContext('2d');
-  const W = canvas.clientWidth;
-  const H = canvas.clientHeight;
-  canvas.width = W;
-  canvas.height = H;
-  const n = data.length;
-  const maxV = 1, minV = 0;
-  const pad = 6;
-  function x(i){ return pad + i*(W-2*pad)/Math.max(1,(n-1)); }
-  function y(v){ return H - pad - (v-minV)*(H-2*pad)/(maxV-minV); }
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = '#3b82f6';
-  ctx.beginPath();
-  for (let i=0;i<n;i++){
-    const xp = x(i), yp = y(data[i]);
-    if (i===0) ctx.moveTo(xp, yp); else ctx.lineTo(xp, yp);
-  }
-  ctx.stroke();
-  // baseline
-  ctx.strokeStyle = '#1f2937';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+  const W = canvas.clientWidth, H = canvas.clientHeight; canvas.width=W; canvas.height=H;
+  const n = data.length, pad=6; function x(i){return pad + i*(W-2*pad)/Math.max(1,(n-1));}
+  function y(v){ return H - pad - (v-0)*(H-2*pad)/(1-0); }
+  ctx.lineWidth=2; ctx.strokeStyle='#3b82f6'; ctx.beginPath();
+  for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); } ctx.stroke();
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 </script>
-</body>
-</html>
+</body></html>
 """)
 
 EVENTS_HTML_TPL = Template(r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Trader PRO - Events</title>
 <style>
-  :root { --bg:#0f172a; --card:#111827; --text:#e5e7eb; --muted:#94a3b8; --border:#1f2937; }
-  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-  h1 { margin:0 0 16px 0; font-size:28px; font-weight:700; }
-  .card { background: var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th,td { padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
-  th { color:var(--muted); font-weight:600; }
-  .muted { color:var(--muted); }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
-  .btn { display:inline-block; padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); text-decoration:none; font-weight:600; }
-  input { padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1220; color:var(--text); }
-</style>
-</head>
-<body>
+:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--border:#1f2937}
+body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600}
+input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+</style></head><body>
 <h1>AI Trader PRO - Raw Events</h1>
 <div class="card">
-  <form method="get" class="row">
-    <input type="hidden" name="secret" value="$secret" />
-    <label>Limit <input type="number" name="limit" value="$limit" min="1" max="50000" /></label>
-    <button class="btn" type="submit">Apply</button>
-    <a class="btn" href="/trades?secret=$secret">Back to Trades</a>
-  </form>
-  <table>
-    <thead>
-      <tr><th>Time (server)</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr>
-    </thead>
-    <tbody>
-      $rows_html
-    </tbody>
-  </table>
-</div>
-</body>
-</html>
+<form method="get" class="row">
+  <input type="hidden" name="secret" value="$secret" />
+  <label>Limit <input type="number" name="limit" value="$limit" min="1" max="50000" /></label>
+  <button class="btn" type="submit">Apply</button>
+  <a class="btn" href="/trades?secret=$secret">Back to Trades</a>
+</form>
+<table>
+  <thead><tr><th>Time (server)</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr></thead>
+  <tbody>$rows_html</tbody>
+</table></div></body></html>
 """)
 
-# =========================
+# -------------------------
 # FastAPI app
-# =========================
+# -------------------------
 app = FastAPI(title="AI Trader PRO")
 
-# --------- Helpers (HTML) ---------
 def escape_html(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&#39;")
-    )
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+             .replace('"',"&quot;").replace("'","&#39;"))
 
 def fmt_num(v) -> str:
     try:
-        if v is None:
-            return ""
+        if v is None: return ""
         s = f"{float(v):,.6f}".rstrip("0").rstrip(".")
         return s
     except Exception:
         return str(v or "")
 
-# --------- Index ----------
+# -------- Health / Ping --------
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+# -------- Index --------
 @app.get("/", response_class=HTMLResponse)
 def index(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -610,12 +507,13 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_ACCOUNT_BAL", str(RISK_ACCOUNT_BAL)),
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
+        ("DEBUG", str(bool(DEBUG_MODE))),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.substitute(rows_html=trs)
     return HTMLResponse(html)
 
-# --------- Env sanity ----------
+# -------- Env sanity --------
 @app.get("/env-sanity")
 def env_sanity(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -634,9 +532,10 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "RISK_ACCOUNT_BAL": RISK_ACCOUNT_BAL,
         "RISK_PCT": RISK_PCT,
         "DB_PATH": DB_PATH,
+        "DEBUG": DEBUG_MODE,
     }
 
-# --------- Telegram health ----------
+# -------- Telegram health --------
 @app.get("/tg-health")
 def tg_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -644,7 +543,7 @@ def tg_health(secret: Optional[str] = Query(None)):
     ok = send_telegram("Test Telegram: OK")
     return {"ok": ok}
 
-# --------- OpenAI health ----------
+# -------- OpenAI health --------
 @app.get("/openai-health")
 def openai_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -653,50 +552,47 @@ def openai_health(secret: Optional[str] = Query(None)):
         return {"ok": False, "enabled": bool(LLM_ENABLED), "client_ready": bool(_openai_client), "why": _llm_reason_down}
     try:
         comp = _openai_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=2,
+            model=LLM_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=2,
         )
         sample = comp.choices[0].message.content if comp and comp.choices else ""
         return {"ok": True, "model": LLM_MODEL, "sample": sample}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# --------- Webhook TradingView ----------
+# -------- Webhook TradingView --------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
-    """
-    Recoit les alertes JSON TradingView.
-    Secret accepte en query (?secret=...) ou dans le JSON ("secret": "...").
-    Enregistre l'evenement en base.
-    """
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
             raise ValueError("JSON must be an object")
-    except Exception:
+    except Exception as e:
+        log.error("Invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     body_secret = payload.get("secret")
-    if WEBHOOK_SECRET:
-        if secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid secret")
+    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
+        log.warning("Invalid secret on tv-webhook")
+        raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # Log minimal
+    log.info("Webhook payload: %s", json.dumps(payload)[:300])
+
+    # Sauvegarde
     save_event(payload)
 
-    # Option: Telegram
+    # (Option) Telegram
     try:
         t = payload.get("type", "EVENT")
         sym = payload.get("symbol", "?")
         tf = payload.get("tf", "?")
-        msg = f"[TV] {t} | {sym} | TF {tf}"
-        send_telegram(msg)
+        send_telegram(f"[TV] {t} | {sym} | TF {tf}")
     except Exception:
         pass
 
     return {"ok": True}
 
-# --------- Trades JSON ----------
+# -------- Trades JSON --------
 @app.get("/trades.json")
 def trades_json(
     secret: Optional[str] = Query(None),
@@ -708,13 +604,12 @@ def trades_json(
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-
     start_ep = parse_date_to_epoch(start)
     end_ep   = parse_date_end_to_epoch(end)
     trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit*10))
     return JSONResponse({"summary": summary, "trades": trades[-limit:] if limit else trades})
 
-# --------- Trades CSV export ----------
+# -------- Trades CSV --------
 @app.get("/trades.csv")
 def trades_csv(
     secret: Optional[str] = Query(None),
@@ -730,18 +625,15 @@ def trades_csv(
     end_ep   = parse_date_end_to_epoch(end)
     trades, _ = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
     data = trades[-limit:] if limit else trades
-    # CSV headers
     headers = ["trade_id","symbol","tf","side","entry","sl","tp1","tp2","tp3","entry_time","outcome","outcome_time","duration_sec"]
     lines = [",".join(headers)]
     for tr in data:
         row = [str(tr.get(h,"")) for h in headers]
-        # Escape commas by wrapping in quotes if needed
-        row = [f"\"{x}\"" if ("," in x) else x for x in row]
+        row = [("\"%s\"" % x) if ("," in x) else x for x in row]
         lines.append(",".join(row))
-    csv_content = "\n".join(lines)
-    return Response(content=csv_content, media_type="text/csv")
+    return Response(content="\n".join(lines), media_type="text/csv")
 
-# --------- Trades HTML ----------
+# -------- Trades HTML --------
 @app.get("/trades", response_class=HTMLResponse)
 def trades(
     secret: Optional[str] = Query(None),
@@ -758,17 +650,12 @@ def trades(
     trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
 
     rows_html = ""
-    spark_values = []  # 1 for win, 0 for loss, 0.5 for NONE
+    spark_values = []
     data = trades[-limit:] if limit else trades
     for tr in data:
         outcome = tr["outcome"] or "NONE"
         badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-            spark_values.append(1.0)
-        elif outcome == "SL_HIT":
-            spark_values.append(0.0)
-        else:
-            spark_values.append(0.5)
+        spark_values.append(1.0 if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
         outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
         rows_html += (
             "<tr>"
@@ -808,7 +695,7 @@ def trades(
     )
     return HTMLResponse(html)
 
-# --------- Events raw HTML ----------
+# -------- Events raw HTML --------
 @app.get("/events", response_class=HTMLResponse)
 def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -839,13 +726,12 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
             "</tr>"
         )
     html = EVENTS_HTML_TPL.substitute(
-        secret=escape_html(secret or ""),
-        limit=str(limit),
+        secret=escape_html(secret or ""), limit=str(limit),
         rows_html=rows_html or '<tr><td colspan="7" class="muted">No events.</td></tr>'
     )
     return HTMLResponse(html)
 
-# --------- Events JSON ----------
+# -------- Events JSON --------
 @app.get("/events.json")
 def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -856,17 +742,23 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
-# --------- Alias: /trades/secret=... ----------
+# -------- Alias /trades/secret=... --------
 @app.get("/trades/secret={secret}")
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
-# --------- Root CSV quick test ----------
-@app.get("/ping")
-def ping():
-    return {"ok": True}
+# -------- Self test: insert un trade factice --------
+@app.get("/selftest")
+def selftest(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    tid = f"SELFTEST_{int(time.time())}"
+    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
+    time.sleep(1)
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid})
+    return {"ok": True, "trade_id": tid}
 
-# ============ Run (local) ============
+# ============ Run local ============
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
