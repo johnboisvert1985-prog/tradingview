@@ -36,6 +36,10 @@ RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
+# Telegram rate limit helper
+TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
+_last_tg = 0.0
+
 # -------------------------
 # OpenAI client (optional)
 # -------------------------
@@ -203,11 +207,12 @@ def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
 # Build trades & stats
 # -------------------------
 class TradeOutcome:
-    NONE = "NONE"
-    TP1 = "TP1_HIT"
-    TP2 = "TP2_HIT"
-    TP3 = "TP3_HIT"
-    SL  = "SL_HIT"
+    NONE  = "NONE"
+    TP1   = "TP1_HIT"
+    TP2   = "TP2_HIT"
+    TP3   = "TP3_HIT"
+    SL    = "SL_HIT"
+    CLOSE = "CLOSE"    # neutral outcome
 
 def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
@@ -250,7 +255,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 e_tp3 = ev["tp3"]
                 entry_time = ev["received_at"]
             elif entry is not None:
-                if etype in ("TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT") and outcome_type == TradeOutcome.NONE:
+                if etype in ("TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT", "CLOSE") and outcome_type == TradeOutcome.NONE:
                     outcome_type = etype
                     outcome_time = ev["received_at"]
 
@@ -258,20 +263,21 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
             total += 1
             if outcome_time and entry_time:
                 times_to_outcome.append(int(outcome_time - entry_time))
-            is_win = outcome_type in ("TP1_HIT", "TP2_HIT", "TP3_HIT")
+            is_win = outcome_type in (TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3)
             if is_win:
                 wins += 1
                 win_streak += 1
                 best_win_streak = max(best_win_streak, win_streak)
                 loss_streak = 0
-                if outcome_type == "TP1_HIT": hit_tp1 += 1
-                elif outcome_type == "TP2_HIT": hit_tp2 += 1
-                elif outcome_type == "TP3_HIT": hit_tp3 += 1
-            elif outcome_type == "SL_HIT":
+                if outcome_type == TradeOutcome.TP1: hit_tp1 += 1
+                elif outcome_type == TradeOutcome.TP2: hit_tp2 += 1
+                elif outcome_type == TradeOutcome.TP3: hit_tp3 += 1
+            elif outcome_type == TradeOutcome.SL:
                 losses += 1
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
+            # CLOSE is neutral: no change to wins/losses/streaks
 
             trades.append(
                 {
@@ -308,12 +314,18 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (optional)
+# Telegram (optional, with cooldown)
 # -------------------------
 def send_telegram(text: str) -> bool:
+    global _last_tg
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
     try:
+        now = time.time()
+        if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
+            return False  # avoid spam / 429
+        _last_tg = now
+
         import urllib.request
         import urllib.parse
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -359,7 +371,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <div class="muted">Secret can be passed as ?secret=... or in JSON body "secret".</div>
 <div style="margin-top:8px" class="row">
   <span class="chip">ENTRY</span><span class="chip">TP1_HIT</span><span class="chip">TP2_HIT</span>
-  <span class="chip">TP3_HIT</span><span class="chip">SL_HIT</span><span class="chip">AOE_PREMIUM</span><span class="chip">AOE_DISCOUNT</span>
+  <span class="chip">TP3_HIT</span><span class="chip">SL_HIT</span><span class="chip">CLOSE</span><span class="chip">AOE_PREMIUM</span><span class="chip">AOE_DISCOUNT</span>
 </div></div></div></body></html>
 """)
 
