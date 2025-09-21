@@ -32,7 +32,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 
-# DB path default = data/data.db; fallback auto to /tmp si read-only
+# DB path default = data/data.db; fallback auto to /tmp if read-only
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
@@ -277,6 +277,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
+            # CLOSE is neutral
 
             trades.append(
                 {
@@ -409,6 +410,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
+        <a class="btn" href="/reset?secret=$secret" onclick="return confirm('Reset all events? This cannot be undone.');">Reset</a>
       </div>
     </form>
   </div>
@@ -427,26 +429,6 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       <div class="item"><div class="label">Best win streak</div><div class="value green">$best_win_streak</div></div>
       <div class="item"><div class="label">Worst loss streak</div><div class="value red">$worst_loss_streak</div></div>
     </div>
-
-    <!-- Reset controls -->
-    <div class="row" style="margin-top:10px">
-      <!-- Reset view only (no deletion) -->
-      <a class="btn" href="/trades?secret=$secret&start=$today" title="Start KPIs from today (no deletion)">Reset (view) - start = $today</a>
-
-      <!-- Hard reset DB (delete all) -->
-      <form method="post" action="/reset-trades?secret=$secret"
-            onsubmit="return confirm('Delete ALL trade events from database? This cannot be undone.');" style="display:inline">
-        <button class="btn" type="submit" title="Delete all events (hard reset)">Hard Reset DB</button>
-      </form>
-
-      <!-- Reset before today (keep only today+) -->
-      <form method="post" action="/reset-trades-before?secret=$secret&date=$today"
-            onsubmit="return confirm('Delete history BEFORE $today?');" style="display:inline">
-        <button class="btn" type="submit" title="Keep only trades from today and after">Reset before $today</button>
-      </form>
-    </div>
-    <!-- /Reset controls -->
-
     <canvas class="spark" id="spark"></canvas>
   </div>
 
@@ -523,6 +505,41 @@ def fmt_num(v) -> str:
         return s
     except Exception:
         return str(v or "")
+
+def tf_display(tf) -> str:
+    """Turn '15' -> '15m', keep '1D' as is."""
+    s = str(tf or "")
+    return (s + "m") if s.isdigit() else s
+
+def format_tg_from_payload(p: Dict[str, Any]) -> str:
+    # 1) Prefer a preformatted text from Pine (tg_text or message)
+    for k in ("tg_text", "message"):
+        if p.get(k):
+            try:
+                return str(p[k])[:4096]
+            except Exception:
+                pass
+
+    # 2) Fallback formatting
+    t   = (p.get("type") or "EVENT").upper()
+    sym = p.get("symbol") or "?"
+    tf  = tf_display(p.get("tf"))
+    side = p.get("side")
+
+    if t == "ENTRY":
+        ent = p.get("entry"); sl = p.get("sl")
+        tp1 = p.get("tp1"); tp2 = p.get("tp2"); tp3 = p.get("tp3")
+        header = f"[TV] ENTRY | {sym} | TF {tf}" + (f" | {side}" if side else "")
+        details = []
+        if ent is not None: details.append(f"Entry: {fmt_num(ent)}")
+        if sl  is not None: details.append(f"SL: {fmt_num(sl)}")
+        if tp1 is not None: details.append(f"TP1: {fmt_num(tp1)}")
+        if tp2 is not None: details.append(f"TP2: {fmt_num(tp2)}")
+        if tp3 is not None: details.append(f"TP3: {fmt_num(tp3)}")
+        msg = header if not details else (header + "\n" + "\n".join(details))
+        return msg[:4096]
+
+    return f"[TV] {t} | {sym} | TF {tf}"[:4096]
 
 # -------- Health / Ping --------
 @app.get("/ping")
@@ -619,13 +636,13 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
+    # Prefer Pine's custom text if present
     try:
-        t = payload.get("type", "EVENT")
-        sym = payload.get("symbol", "?")
-        tf = payload.get("tf", "?")
-        send_telegram(f"[TV] {t} | {sym} | TF {tf}")
-    except Exception:
-        pass
+        msg = format_tg_from_payload(payload)
+        if msg:
+            send_telegram(msg)
+    except Exception as e:
+        log.warning("Telegram format/send skipped: %s", e)
 
     return {"ok": True}
 
@@ -710,9 +727,6 @@ def trades(
             "</tr>"
         )
 
-    import datetime as dt
-    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
-
     html = TRADES_HTML_TPL.substitute(
         secret=escape_html(secret or ""),
         symbol=escape_html(symbol or ""),
@@ -731,8 +745,7 @@ def trades(
         best_win_streak=str(summary["best_win_streak"]),
         worst_loss_streak=str(summary["worst_loss_streak"]),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values),
-        today=today,  # provide $today to template
+        spark_data=json.dumps(spark_values)
     )
     return HTMLResponse(html)
 
@@ -783,6 +796,19 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
+# -------- Reset all events (GET or POST) --------
+@app.get("/reset")
+@app.post("/reset")
+async def reset_all(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events")
+        conn.commit()
+    # Redirect to trades if GET
+    return RedirectResponse(url=f"/trades?secret={secret or ''}", status_code=303)
+
 # -------- Alias /trades/secret=... --------
 @app.get("/trades/secret={secret}")
 def trades_alias(secret: str):
@@ -798,37 +824,6 @@ def selftest(secret: Optional[str] = Query(None)):
     time.sleep(1)
     save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid})
     return {"ok": True, "trade_id": tid}
-
-# -------- RESET endpoints (protected) --------
-@app.post("/reset-trades")
-def reset_trades(secret: Optional[str] = Query(None), redirect: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM events")
-        conn.commit()
-    target = redirect or f"/trades?secret={secret}"
-    return RedirectResponse(url=target, status_code=303)
-
-@app.post("/reset-trades-before")
-def reset_trades_before(
-    secret: Optional[str] = Query(None),
-    date: Optional[str] = Query(None)  # format YYYY-MM-DD
-):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    if not date:
-        raise HTTPException(status_code=400, detail="Provide ?date=YYYY-MM-DD")
-    cutoff = parse_date_to_epoch(date)
-    if not cutoff:
-        raise HTTPException(status_code=400, detail="Invalid date")
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM events WHERE received_at < ?", (cutoff,))
-        conn.commit()
-    target = f"/trades?secret={secret}&start={date}"
-    return RedirectResponse(url=target, status_code=303)
 
 # ============ Run local ============
 if __name__ == "__main__":
