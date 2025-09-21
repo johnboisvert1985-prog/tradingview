@@ -967,7 +967,39 @@ def selftest(secret: Optional[str] = Query(None)):
     save_event({"type":"TP1_HIT","symbol":"TESTUSDT","tf":"15","trade_id":tid,"entry":101.0,"tp":101.0,"whichTP":1})
     return {"ok": True, "trade_id": tid}
 
+# --- AJOUTE ÇA DANS main.py (par ex. sous /selftest) ---
+
+@app.post("/reset-trades")
+def reset_trades(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events")
+        conn.commit()
+    return {"ok": True, "deleted": "all"}
+
+@app.post("/reset-trades-before")
+def reset_trades_before(
+    secret: Optional[str] = Query(None),
+    ts: Optional[int] = Query(None, description="epoch seconds cutoff"),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (supprime AVANT cette date)")
+):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    if not ts and not date:
+        raise HTTPException(status_code=400, detail="Provide ts or date")
+    cutoff = ts or parse_date_to_epoch(date)
+    if not cutoff:
+        raise HTTPException(status_code=400, detail="Invalid date/ts")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events WHERE received_at < ?", (cutoff,))
+        conn.commit()
+    return {"ok": True, "deleted": "before", "cutoff": cutoff}
+
 # ============ Run local ============
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
