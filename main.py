@@ -32,7 +32,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 
-# DB path default = data/data.db; fallback auto to /tmp if read-only
+# DB path default = data/data.db; fallback auto to /tmp si read-only
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
@@ -87,42 +87,14 @@ def db_conn() -> sqlite3.Connection:
         pass
     return conn
 
-SCHEMA_COLUMNS = {
-    "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-    "received_at": "INTEGER NOT NULL",
-    "payload_time": "INTEGER",
-    "type": "TEXT",
-    "symbol": "TEXT",
-    "tf": "TEXT",
-    "side": "TEXT",
-    "entry": "REAL",
-    "sl": "REAL",
-    "tp1": "REAL",
-    "tp2": "REAL",
-    "tp3": "REAL",
-    "tp4": "REAL",
-    "r1": "REAL",
-    "s1": "REAL",
-    "confidence": "REAL",
-    "lev_reco": "REAL",
-    "qty_reco": "REAL",
-    "notional": "REAL",
-    "tp_hit": "REAL",
-    "which_tp": "INTEGER",
-    "trade_id": "TEXT",
-    "human": "TEXT",
-    "raw_json": "TEXT",
-}
-
 def db_init() -> None:
     with db_conn() as conn:
-        # Create table if not exists with a minimal core; we'll migrate next.
-        conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 received_at INTEGER NOT NULL,
-                payload_time INTEGER,
                 type TEXT,
                 symbol TEXT,
                 tf TEXT,
@@ -132,43 +104,17 @@ def db_init() -> None:
                 tp1 REAL,
                 tp2 REAL,
                 tp3 REAL,
-                tp4 REAL,
-                r1 REAL,
-                s1 REAL,
-                confidence REAL,
-                lev_reco REAL,
-                qty_reco REAL,
-                notional REAL,
-                tp_hit REAL,
-                which_tp INTEGER,
                 trade_id TEXT,
-                human TEXT,
                 raw_json TEXT
             )
             """
         )
-        # Indexes
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_trade ON events(trade_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(received_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_tf ON events(tf)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_trade ON events(trade_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(received_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_tf ON events(tf)")
         conn.commit()
-    db_migrate()
     log.info("DB initialized at %s", DB_PATH)
-
-def db_migrate() -> None:
-    """Ensure table has all expected columns (safe ALTER ADD)."""
-    with db_conn() as conn:
-        cur = conn.execute("PRAGMA table_info(events)")
-        have = {row["name"] for row in cur.fetchall()}
-        for col, decl in SCHEMA_COLUMNS.items():
-            if col not in have:
-                try:
-                    conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
-                    log.info("DB migrate: added column %s (%s)", col, decl)
-                except Exception as e:
-                    log.warning("DB migrate: failed to add %s: %s", col, e)
-        conn.commit()
 
 db_init()
 
@@ -178,56 +124,33 @@ def _to_float(v):
     except Exception:
         return None
 
-def _to_int(v):
-    try:
-        return int(v) if v is not None else None
-    except Exception:
-        return None
-
 def save_event(payload: Dict[str, Any]) -> None:
-    etype = payload.get("type")
-    which_tp = None
-    if isinstance(etype, str) and etype.startswith("TP") and "_HIT" in etype:
-        # TP1_HIT / TP2_HIT / TP3_HIT
-        try:
-            which_tp = int(etype[2])
-        except Exception:
-            which_tp = payload.get("whichTP") or None
     row = {
         "received_at": int(time.time()),
-        "payload_time": _to_int(payload.get("time")),
-        "type": etype,
+        "type": payload.get("type"),
         "symbol": payload.get("symbol"),
-        "tf": (str(payload.get("tf")) if payload.get("tf") is not None else None),
+        "tf": str(payload.get("tf")) if payload.get("tf") is not None else None,
         "side": payload.get("side"),
         "entry": _to_float(payload.get("entry")),
         "sl": _to_float(payload.get("sl")),
         "tp1": _to_float(payload.get("tp1")),
         "tp2": _to_float(payload.get("tp2")),
         "tp3": _to_float(payload.get("tp3")),
-        "tp4": _to_float(payload.get("tp4")),
-        "r1": _to_float(payload.get("r1")),
-        "s1": _to_float(payload.get("s1")),
-        "confidence": _to_float(payload.get("confidence")),
-        "lev_reco": _to_float(payload.get("lev_reco")),
-        "qty_reco": _to_float(payload.get("qty_reco")),
-        "notional": _to_float(payload.get("notional")),
-        "tp_hit": _to_float(payload.get("tp")),  # for TPx_HIT payloads
-        "which_tp": _to_int(payload.get("whichTP")) if payload.get("whichTP") is not None else which_tp,
         "trade_id": payload.get("trade_id"),
-        "human": payload.get("human"),
         "raw_json": json.dumps(payload, ensure_ascii=False),
     }
     with db_conn() as conn:
         cur = conn.cursor()
-        cols = ",".join(row.keys())
-        qs = ",".join([":" + k for k in row.keys()])
-        cur.execute(f"INSERT INTO events ({cols}) VALUES ({qs})", row)
+        cur.execute(
+            """
+            INSERT INTO events (received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json)
+            VALUES (:received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json)
+            """,
+            row,
+        )
         conn.commit()
-    log.info(
-        "Saved event: type=%s symbol=%s tf=%s trade_id=%s",
-        row["type"], row["symbol"], row["tf"], row["trade_id"]
-    )
+    log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s",
+             row["type"], row["symbol"], row["tf"], row["trade_id"])
 
 # -------------------------
 # Helpers: dates, filters
@@ -291,15 +214,6 @@ class TradeOutcome:
     SL    = "SL_HIT"
     CLOSE = "CLOSE"    # neutral outcome
 
-def _sym_nice(symbol: str) -> str:
-    s = symbol or ""
-    s = s.replace(".P", "").replace("PERP", "")
-    for q in ("USDT", "USDC", "FDUSD", "USD"):
-        if s.endswith(q):
-            base = s[:-len(q)]
-            return f"{base}/{q}"
-    return s
-
 def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
                           max_rows: int = 20000) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -318,18 +232,16 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     worst_loss_streak = 0
 
     for tid, items in by_tid.items():
-        items_sorted = sorted(items, key=lambda r: (r["payload_time"] or r["received_at"]))
         entry = None
         outcome_type = TradeOutcome.NONE
         outcome_time = None
         side = None
         vsymbol = None
         vtf = None
-        e_entry = e_sl = e_tp1 = e_tp2 = e_tp3 = e_tp4 = None
-        e_conf = None
+        e_entry = e_sl = e_tp1 = e_tp2 = e_tp3 = None
         entry_time = None
 
-        for ev in items_sorted:
+        for ev in items:
             etype = ev["type"]
             if etype == "ENTRY" and entry is None:
                 entry = ev
@@ -341,13 +253,11 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 e_tp1 = ev["tp1"]
                 e_tp2 = ev["tp2"]
                 e_tp3 = ev["tp3"]
-                e_tp4 = ev["tp4"]
-                e_conf = ev["confidence"]
-                entry_time = ev["payload_time"] or ev["received_at"]
-            elif entry is not None and outcome_type == TradeOutcome.NONE:
-                if etype in ("TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT", "CLOSE"):
+                entry_time = ev["received_at"]
+            elif entry is not None:
+                if etype in ("TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT", "CLOSE") and outcome_type == TradeOutcome.NONE:
                     outcome_type = etype
-                    outcome_time = ev["payload_time"] or ev["received_at"]
+                    outcome_time = ev["received_at"]
 
         if entry is not None:
             total += 1
@@ -372,7 +282,6 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 {
                     "trade_id": tid,
                     "symbol": vsymbol,
-                    "symbol_pretty": _sym_nice(vsymbol or ""),
                     "tf": vtf,
                     "side": side,
                     "entry": e_entry,
@@ -380,8 +289,6 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                     "tp1": e_tp1,
                     "tp2": e_tp2,
                     "tp3": e_tp3,
-                    "tp4": e_tp4,
-                    "confidence": e_conf,
                     "entry_time": entry_time,
                     "outcome": outcome_type,
                     "outcome_time": outcome_time,
@@ -520,6 +427,26 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       <div class="item"><div class="label">Best win streak</div><div class="value green">$best_win_streak</div></div>
       <div class="item"><div class="label">Worst loss streak</div><div class="value red">$worst_loss_streak</div></div>
     </div>
+
+    <!-- Reset controls -->
+    <div class="row" style="margin-top:10px">
+      <!-- Reset view only (no deletion) -->
+      <a class="btn" href="/trades?secret=$secret&start=$today" title="Start KPIs from today (no deletion)">Reset (view) - start = $today</a>
+
+      <!-- Hard reset DB (delete all) -->
+      <form method="post" action="/reset-trades?secret=$secret"
+            onsubmit="return confirm('Delete ALL trade events from database? This cannot be undone.');" style="display:inline">
+        <button class="btn" type="submit" title="Delete all events (hard reset)">Hard Reset DB</button>
+      </form>
+
+      <!-- Reset before today (keep only today+) -->
+      <form method="post" action="/reset-trades-before?secret=$secret&date=$today"
+            onsubmit="return confirm('Delete history BEFORE $today?');" style="display:inline">
+        <button class="btn" type="submit" title="Keep only trades from today and after">Reset before $today</button>
+      </form>
+    </div>
+    <!-- /Reset controls -->
+
     <canvas class="spark" id="spark"></canvas>
   </div>
 
@@ -575,7 +502,7 @@ input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0
   <a class="btn" href="/trades?secret=$secret">Back to Trades</a>
 </form>
 <table>
-  <thead><tr><th>Recv (server)</th><th>Payload time</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr></thead>
+  <thead><tr><th>Time (server)</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr></thead>
   <tbody>$rows_html</tbody>
 </table></div></body></html>
 """)
@@ -596,22 +523,6 @@ def fmt_num(v) -> str:
         return s
     except Exception:
         return str(v or "")
-
-def tf_nice(tf: Optional[str]) -> str:
-    if not tf:
-        return ""
-    mapping = {"1":"1m","3":"3m","5":"5m","15":"15m","30":"30m","60":"1h","120":"2h","240":"4h"}
-    return mapping.get(tf, tf)
-
-def _load_entry_for_trade(trade_id: str) -> Tuple[Optional[float], Optional[str]]:
-    """Return (entry_price, side) for ENTRY of given trade_id."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT entry, side FROM events WHERE trade_id=? AND type='ENTRY' ORDER BY received_at ASC LIMIT 1", (trade_id,))
-        row = cur.fetchone()
-        if row:
-            return (row["entry"], row["side"])
-    return (None, None)
 
 # -------- Health / Ping --------
 @app.get("/ping")
@@ -689,71 +600,6 @@ def openai_health(secret: Optional[str] = Query(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# -------- Telegram message builders (fallback if no 'human') --------
-def _msg_entry(payload: Dict[str, Any]) -> str:
-    pair = _sym_nice(payload.get("symbol") or "")
-    tfd  = tf_nice(str(payload.get("tf") or ""))
-    side = (payload.get("side") or "").upper()
-    entry = fmt_num(payload.get("entry"))
-    sl = fmt_num(payload.get("sl"))
-    t1 = fmt_num(payload.get("tp1"))
-    t2 = fmt_num(payload.get("tp2"))
-    t3 = fmt_num(payload.get("tp3"))
-    t4 = fmt_num(payload.get("tp4"))
-    conf = payload.get("confidence")
-    conf_line = f"🎯Niveau de confiance:  {conf:.2f}%" if isinstance(conf, (int,float)) else ""
-    lines = [
-        f"📩 {pair} {tfd} | Signal",
-        f"{'📈 Long' if side=='LONG' else '📉 Short'} Entry Zone: {entry}",
-        conf_line,
-        "",
-        f"Target 1 : {t1}",
-        f"Target 2 : {t2}",
-        f"Target 3 : {t3}",
-        (f"Target 4 : {t4}" if t4 else ""),
-        "_",
-        f"❌Stop-Loss: {sl}",
-    ]
-    return "\n".join([ln for ln in lines if ln != ""])
-
-def _pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    try:
-        if a is None or b is None or a == 0:
-            return None
-        return (b / a - 1.0) * 100.0
-    except Exception:
-        return None
-
-def _msg_tp(payload: Dict[str, Any]) -> str:
-    trade_id = payload.get("trade_id") or ""
-    which = payload.get("whichTP") or payload.get("which_tp")
-    mark = payload.get("entry")
-    entry_px, _side = _load_entry_for_trade(trade_id)
-    p = _pct(entry_px, mark)
-    pair = _sym_nice(payload.get("symbol") or "")
-    ptxt = f"{p:.2f}%+" if isinstance(p, float) else "—"
-    return f"#{pair}\nTarget №{which} - ✅\nMark price - {fmt_num(mark)}\nProfit - {ptxt}"
-
-def _msg_sl(payload: Dict[str, Any]) -> str:
-    pair = _sym_nice(payload.get("symbol") or "")
-    sl = fmt_num(payload.get("sl"))
-    return f"#{pair}\nSL hit - {sl}"
-
-def _msg_aoe(payload: Dict[str, Any]) -> str:
-    pair = _sym_nice(payload.get("symbol") or "")
-    tf  = tf_nice(str(payload.get("tf") or ""))
-    t   = payload.get("type")
-    if t == "AOE_PREMIUM":
-        up = fmt_num(payload.get("upper"))
-        hi = fmt_num(payload.get("hiWin"))
-        cl = fmt_num(payload.get("close"))
-        return f"🟥 AOE PREMIUM\n• Symbol: {pair}\n• TF: {tf}\n• Zone: {hi} → {up}\n• Close: {cl}"
-    else:
-        lo = fmt_num(payload.get("loWin"))
-        lw = fmt_num(payload.get("lower"))
-        cl = fmt_num(payload.get("close"))
-        return f"🟩 AOE DISCOUNT\n• Symbol: {pair}\n• TF: {tf}\n• Zone: {lw} → {lo}\n• Close: {cl}"
-
 # -------- Webhook TradingView --------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
@@ -773,30 +619,13 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
-    # Telegram: prefer 'human' from Pine; else fallback by type
     try:
         t = payload.get("type", "EVENT")
-        human = payload.get("human")
-        if human:
-            send_telegram(human)
-        else:
-            if t == "ENTRY":
-                send_telegram(_msg_entry(payload))
-            elif t in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-                send_telegram(_msg_tp(payload))
-            elif t == "SL_HIT":
-                send_telegram(_msg_sl(payload))
-            elif t in ("AOE_PREMIUM","AOE_DISCOUNT"):
-                send_telegram(_msg_aoe(payload))
-            elif t == "CLOSE":
-                pair = _sym_nice(payload.get("symbol") or "")
-                side = payload.get("side") or ""
-                reason = payload.get("reason") or "Close"
-                send_telegram(f"🔁 CLOSE • {pair} • {side}\n{reason}")
-            else:
-                send_telegram(f"[TV] {t} | {payload.get('symbol','?')} | TF {payload.get('tf','?')}")
-    except Exception as e:
-        log.warning("Telegram section failed: %s", e)
+        sym = payload.get("symbol", "?")
+        tf = payload.get("tf", "?")
+        send_telegram(f"[TV] {t} | {sym} | TF {tf}")
+    except Exception:
+        pass
 
     return {"ok": True}
 
@@ -868,7 +697,7 @@ def trades(
         rows_html += (
             "<tr>"
             f"<td>{escape_html(str(tr['trade_id']))}</td>"
-            f"<td>{escape_html(str(tr.get('symbol_pretty') or tr.get('symbol') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
             f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
             f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
             f"<td>{fmt_num(tr.get('entry'))}</td>"
@@ -880,6 +709,9 @@ def trades(
             f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
             "</tr>"
         )
+
+    import datetime as dt
+    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
 
     html = TRADES_HTML_TPL.substitute(
         secret=escape_html(secret or ""),
@@ -899,7 +731,8 @@ def trades(
         best_win_streak=str(summary["best_win_streak"]),
         worst_loss_streak=str(summary["worst_loss_streak"]),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values)
+        spark_data=json.dumps(spark_values),
+        today=today,  # provide $today to template
     )
     return HTMLResponse(html)
 
@@ -925,7 +758,6 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows_html += (
             "<tr>"
             f"<td>{escape_html(fmt_time(r['received_at']))}</td>"
-            f"<td>{escape_html(fmt_time(r['payload_time'])) if r['payload_time'] else ''}</td>"
             f"<td>{escape_html(r['type'] or '')}</td>"
             f"<td>{escape_html(r['symbol'] or '')}</td>"
             f"<td>{escape_html(r['tf'] or '')}</td>"
@@ -936,7 +768,7 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
         )
     html = EVENTS_HTML_TPL.substitute(
         secret=escape_html(secret or ""), limit=str(limit),
-        rows_html=rows_html or '<tr><td colspan="8" class="muted">No events.</td></tr>'
+        rows_html=rows_html or '<tr><td colspan="7" class="muted">No events.</td></tr>'
     )
     return HTMLResponse(html)
 
@@ -962,44 +794,43 @@ def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     tid = f"SELFTEST_{int(time.time())}"
-    save_event({"type":"ENTRY","symbol":"TESTUSDT","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"tp4":110.0,"confidence":88.8,"trade_id":tid})
+    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
     time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSDT","tf":"15","trade_id":tid,"entry":101.0,"tp":101.0,"whichTP":1})
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid})
     return {"ok": True, "trade_id": tid}
 
-# --- AJOUTE ÇA DANS main.py (par ex. sous /selftest) ---
-
+# -------- RESET endpoints (protected) --------
 @app.post("/reset-trades")
-def reset_trades(secret: Optional[str] = Query(None)):
+def reset_trades(secret: Optional[str] = Query(None), redirect: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM events")
         conn.commit()
-    return {"ok": True, "deleted": "all"}
+    target = redirect or f"/trades?secret={secret}"
+    return RedirectResponse(url=target, status_code=303)
 
 @app.post("/reset-trades-before")
 def reset_trades_before(
     secret: Optional[str] = Query(None),
-    ts: Optional[int] = Query(None, description="epoch seconds cutoff"),
-    date: Optional[str] = Query(None, description="YYYY-MM-DD (supprime AVANT cette date)")
+    date: Optional[str] = Query(None)  # format YYYY-MM-DD
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    if not ts and not date:
-        raise HTTPException(status_code=400, detail="Provide ts or date")
-    cutoff = ts or parse_date_to_epoch(date)
+    if not date:
+        raise HTTPException(status_code=400, detail="Provide ?date=YYYY-MM-DD")
+    cutoff = parse_date_to_epoch(date)
     if not cutoff:
-        raise HTTPException(status_code=400, detail="Invalid date/ts")
+        raise HTTPException(status_code=400, detail="Invalid date")
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM events WHERE received_at < ?", (cutoff,))
         conn.commit()
-    return {"ok": True, "deleted": "before", "cutoff": cutoff}
+    target = f"/trades?secret={secret}&start={date}"
+    return RedirectResponse(url=target, status_code=303)
 
 # ============ Run local ============
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
