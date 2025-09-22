@@ -11,6 +11,11 @@ from collections import defaultdict
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+# ===== ALTSEASON: deps =====
+import re
+import requests
+from bs4 import BeautifulSoup
+
 # -------------------------
 # Logging
 # -------------------------
@@ -35,6 +40,12 @@ RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 # DB path default = data/data.db; fallback auto to /tmp if read-only
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
+
+# ===== ALTSEASON: thresholds (overridable via ENV) =====
+ALT_BTC_DOM_THR    = float(os.getenv("ALT_BTC_DOM_THR", "55.0"))
+ALT_ETH_BTC_THR    = float(os.getenv("ALT_ETH_BTC_THR", "0.045"))
+ALT_ASI_THR        = float(os.getenv("ALT_ASI_THR", "75.0"))
+ALT_TOTAL2_THR_T   = float(os.getenv("ALT_TOTAL2_THR_T", "1.78"))  # trillions
 
 # Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
@@ -407,7 +418,6 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
     lev_x = parse_leverage_x(leverage)
 
     if t == "ENTRY":
-        # Example style (like you asked earlier)
         lines = []
         lines.append(f"📩 {sym} {tf_lbl} | {horizon or 'MidTerm'}")
         if side:
@@ -427,7 +437,6 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
         return "\n".join(lines)
 
     if t in {"TP1_HIT","TP2_HIT","TP3_HIT"}:
-        # Profit calculation if entry is present
         spot_pct = pct(tp, entry) if (side and tp is not None and entry is not None) else None
         lev_pct = (spot_pct * lev_x) if (spot_pct is not None and lev_x) else None
         label = {"TP1_HIT":"Target #1","TP2_HIT":"Target #2","TP3_HIT":"Target #3"}[t]
@@ -457,7 +466,6 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
             lines.append(f"Reason: {reason}")
         return "\n".join(lines)
 
-    # default fallback for unknown allowed events
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
 
 # -------------------------
@@ -471,15 +479,18 @@ INDEX_HTML_TPL = Template(r"""<!doctype html>
 :root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--yellow:#f59e0b;--border:#1f2937;--chip-bg:#0b1220}
 *{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 h1{margin:0 0 16px 0;font-size:28px;font-weight:700;letter-spacing:.2px}.grid{display:grid;grid-template-columns:1fr;gap:16px}
-@media(min-width:960px){.grid{grid-template-columns:1fr 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 16px 8px 16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+@media(min-width:1200px){.grid{grid-template-columns:1fr 1fr 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 16px 8px 16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
 .btn:hover{background:#0f1525}.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;margin-right:8px;background:var(--chip-bg)}.muted{color:var(--muted)}
 .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cta-row{margin-top:10px}
+.kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed var(--border)}.kv:last-child{border-bottom:none}
+.dot{display:inline-block;width:10px;height:10px;border-radius:10px;margin-left:8px}.ok{background:#10b981}.warn{background:#fb923c}
 </style></head><body>
 <h1>AI Trader PRO - Status</h1>
 <div class="grid">
+
 <div class="card"><div class="title">Environment</div>
 <table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>$rows_html</tbody></table>
 <div class="cta-row">
@@ -488,13 +499,51 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
   <a class="btn" href="/openai-health">/openai-health</a>
   <a class="btn" href="/trades">/trades</a>
 </div></div>
+
 <div class="card"><div class="title">Webhook</div>
 <div>POST <code>/tv-webhook</code> with JSON (TradingView).</div>
 <div class="muted">Secret can be passed as ?secret=... or in JSON body "secret".</div>
 <div style="margin-top:8px" class="row">
   <span class="chip">ENTRY</span><span class="chip">TP1_HIT</span><span class="chip">TP2_HIT</span>
   <span class="chip">TP3_HIT</span><span class="chip">SL_HIT</span><span class="chip">CLOSE</span><span class="chip">AOE_PREMIUM</span><span class="chip">AOE_DISCOUNT</span>
-</div></div></div></body></html>
+</div></div>
+
+<!-- ===== ALTSEASON: mini section dédiée ===== -->
+<div class="card"><div class="title">Altseason — État rapide</div>
+<div id="alt-asof" class="muted">Loading…</div>
+<div class="kv"><div>BTC Dominance</div><div><span id="alt-btc">…</span> <span class="muted">&lt; $btc_thr%</span><span id="dot-btc" class="dot"></span></div></div>
+<div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">…</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
+<div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
+<div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">…</span> <span class="muted">&gt; $t2_thr T$</span><span id="dot-t2" class="dot"></span></div></div>
+<div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
+</div>
+
+</div>
+
+<script>
+(function(){
+  const qs = new URLSearchParams(window.location.search);
+  const secret = qs.get("secret");
+  const url = "/altseason/check" + (secret ? ("?secret=" + encodeURIComponent(secret)) : "");
+  fetch(url).then(r=>r.json()).then(s=>{
+    const dot = (ok)=> ok ? "dot ok" : "dot warn";
+    const fmtT = (usd)=> (usd/1e12).toFixed(2) + " T$";
+    document.getElementById("alt-asof").textContent = "As of " + s.asof;
+    document.getElementById("alt-btc").textContent = s.btc_dominance.toFixed(2) + " %";
+    document.getElementById("dot-btc").className = dot(s.triggers.btc_dominance_ok);
+    document.getElementById("alt-eth").textContent = s.eth_btc.toFixed(5);
+    document.getElementById("dot-eth").className = dot(s.triggers.eth_btc_ok);
+    document.getElementById("alt-asi").textContent = (s.altseason_index===null ? "N/A" : s.altseason_index);
+    document.getElementById("dot-asi").className = dot(s.triggers.altseason_index_ok);
+    document.getElementById("alt-t2").textContent = fmtT(s.total2_usd);
+    document.getElementById("dot-t2").className = dot(s.triggers.total2_ok);
+  }).catch(e=>{
+    document.getElementById("alt-asof").textContent = "Erreur: " + e;
+  });
+})();
+</script>
+
+</body></html>
 """)
 
 TRADES_HTML_TPL = Template(r"""<!doctype html>
@@ -508,7 +557,7 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-temp
 @media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
 .kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
-.kpi .green{color:var(--green)}.kpi .red{color:var(--red)}.kpi .blue{color:var(--blue)}.kpi .yellow{color:var(--yellow)}table{width:100%;border-collapse:collapse;font-size:14px}
+.kpi .green{color:var(--green)}.kpi .red{color:#ef4444}.kpi .blue{color:var(--blue)}.kpi .yellow{color:var(--yellow)}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
@@ -641,9 +690,20 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
         ("DEBUG", str(bool(DEBUG_MODE))),
+        # ALTSEASON thresholds visibles
+        ("ALT_BTC_DOM_THR", str(ALT_BTC_DOM_THR)),
+        ("ALT_ETH_BTC_THR", str(ALT_ETH_BTC_THR)),
+        ("ALT_ASI_THR", str(ALT_ASI_THR)),
+        ("ALT_TOTAL2_THR_T", str(ALT_TOTAL2_THR_T)),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
-    html = INDEX_HTML_TPL.substitute(rows_html=trs)
+    html = INDEX_HTML_TPL.substitute(
+        rows_html=trs,
+        btc_thr=str(int(ALT_BTC_DOM_THR)),
+        eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
+        asi_thr=str(int(ALT_ASI_THR)),
+        t2_thr=f"{ALT_TOTAL2_THR_T:.2f}"
+    )
     return HTMLResponse(html)
 
 # -------- Env sanity --------
@@ -666,6 +726,12 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "RISK_PCT": RISK_PCT,
         "DB_PATH": DB_PATH,
         "DEBUG": DEBUG_MODE,
+        "ALTSEASON": {
+            "ALT_BTC_DOM_THR": ALT_BTC_DOM_THR,
+            "ALT_ETH_BTC_THR": ALT_ETH_BTC_THR,
+            "ALT_ASI_THR": ALT_ASI_THR,
+            "ALT_TOTAL2_THR_T": ALT_TOTAL2_THR_T
+        }
     }
 
 # -------- Telegram health --------
@@ -691,6 +757,83 @@ def openai_health(secret: Optional[str] = Query(None)):
         return {"ok": True, "model": LLM_MODEL, "sample": sample}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# ===== ALTSEASON: helpers + endpoints =====
+def _status(val: float, thr: float, direction: str) -> bool:
+    return (val < thr) if direction == "below" else (val > thr)
+
+def _altseason_fetch() -> Dict[str, Any]:
+    out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    g = requests.get("https://api.coingecko.com/api/v3/global", timeout=15).json()
+    mcap = g["data"]["total_market_cap"]["usd"]
+    btc_pct = g["data"]["market_cap_percentage"]["btc"]
+    out["btc_dominance"] = float(btc_pct)
+    out["total_mcap_usd"] = float(mcap)
+    out["total2_usd"] = float(mcap * (1 - btc_pct/100.0))
+    sp = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd", timeout=15).json()
+    out["eth_btc"] = float(sp["ethereum"]["btc"])
+    out["altseason_index"] = None
+    try:
+        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=15).text
+        soup = BeautifulSoup(html, "html.parser")
+        txt = soup.get_text(" ", strip=True)
+        m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
+        if m:
+            v = int(m.group(1))
+            if 0 <= v <= 100:
+                out["altseason_index"] = v
+    except Exception:
+        pass
+    return out
+
+def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
+    btc_ok = _status(float(snap["btc_dominance"]), ALT_BTC_DOM_THR, "below")
+    eth_ok = _status(float(snap["eth_btc"]), ALT_ETH_BTC_THR, "above")
+    t2_ok  = _status(float(snap["total2_usd"]), ALT_TOTAL2_THR_T * 1e12, "above")
+    asi    = snap.get("altseason_index")
+    asi_ok = (asi is not None) and _status(float(asi), ALT_ASI_THR, "above")
+    greens = sum([btc_ok, eth_ok, t2_ok, asi_ok])
+    on     = greens >= 2
+    return {
+        "asof": snap.get("asof"),
+        "btc_dominance": float(snap["btc_dominance"]),
+        "eth_btc": float(snap["eth_btc"]),
+        "total2_usd": float(snap["total2_usd"]),
+        "altseason_index": (None if asi is None else int(asi)),
+        "thresholds": {
+            "btc": ALT_BTC_DOM_THR, "eth_btc": ALT_ETH_BTC_THR, "asi": ALT_ASI_THR, "total2_trillions": ALT_TOTAL2_THR_T
+        },
+        "triggers": {
+            "btc_dominance_ok": btc_ok,
+            "eth_btc_ok": eth_ok,
+            "total2_ok": t2_ok,
+            "altseason_index_ok": asi_ok
+        },
+        "greens": greens,
+        "ALTSEASON_ON": on
+    }
+
+@app.get("/altseason/check")
+def altseason_check(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    snap = _altseason_fetch()
+    return _altseason_summary(snap)
+
+@app.post("/altseason/notify")
+def altseason_notify(
+    secret: Optional[str] = Query(None),
+    force: Optional[bool] = Query(False),
+    message: Optional[str] = Query(None)
+):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    s = _altseason_summary(_altseason_fetch())
+    sent = None
+    if s["ALTSEASON_ON"] or force:
+        msg = message or f"[Altseason] {s['asof']} — Greens={s['greens']} — ALTSEASON_ON={'YES' if s['ALTSEASON_ON'] else 'NO'}"
+        sent = send_telegram(msg)
+    return {"summary": s, "telegram_sent": sent}
 
 # -------- Webhook TradingView --------
 @app.post("/tv-webhook")
