@@ -439,7 +439,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <div class="kv"><div>BTC Dominance</div><div><span id="alt-btc">…</span> <span class="muted">&lt; $btc_thr%</span><span id="dot-btc" class="dot"></span></div></div>
 <div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">…</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
 <div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
-<div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">…</span> <span class="muted">&gt; $t2_thr T$</span><span id="dot-t2" class="dot"></span></div></div>
+<div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">…</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
 <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
 </div>
 
