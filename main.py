@@ -411,7 +411,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
   const url = "/altseason/check" + (secret ? ("?secret=" + encodeURIComponent(secret)) : "");
   fetch(url).then(r=>r.json()).then(s=>{
     const dot = (ok)=> ok ? "dot ok" : "dot warn";
-    const fmtT = (usd)=> (usd/1e12).toFixed(2) + " T$$";
+    const fmtT = (usd)=> (usd/1e12).toFixed(2) + " T$";
     document.getElementById("alt-asof").textContent = "As of " + s.asof;
     document.getElementById("alt-btc").textContent = s.btc_dominance.toFixed(2) + " %";
     document.getElementById("dot-btc").className = dot(s.triggers.btc_dominance_ok);
@@ -447,7 +447,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
-.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
 <h1>AI Trader PRO - Trades</h1>
@@ -505,7 +505,7 @@ if (canvas && data && data.length > 0) {
   function y(v){ return H - pad - (v-0)*(H-2*pad)/(1-0); }
   ctx.lineWidth=2; ctx.strokeStyle='#3b82f6'; ctx.beginPath();
   for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); } ctx.stroke();
-  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.MoveTo=ctx.moveTo; ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 </script>
 </body></html>
@@ -528,7 +528,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
-.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600;margin-right:8px}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
 <h1>AI Trader PRO - Trades (Admin)</h1>
@@ -609,8 +609,8 @@ body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui
 h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
 table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600}
-input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600}
+input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
 </style></head><body>
 <h1>AI Trader PRO - Raw Events</h1>
 <div class="card">
@@ -660,7 +660,7 @@ def index():
         ("ALT_TOTAL2_THR_T", str(ALT_TOTAL2_THR_T)),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
-    html = INDEX_HTML_TPL.substitute(
+    html = INDEX_HTML_TPL.safe_substitute(  # << safe_substitute pour éviter ValueError
         rows_html=trs,
         btc_thr=str(int(ALT_BTC_DOM_THR)),
         eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
@@ -745,7 +745,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception:
             raise RuntimeError(f"{url} -> Non-JSON response: {body_preview}")
 
-    # Global market cap + BTC dominance
+    # Global market cap + BTC dominance (Coingecko -> Paprika)
     mcap_usd = btc_dom = None; cg_err = cp_err = None
     try:
         g = get_json("https://api.coingecko.com/api/v3/global")
@@ -768,7 +768,7 @@ def _altseason_fetch() -> Dict[str, Any]:
     out["btc_dominance"]  = btc_dom
     out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
 
-    # ETH/BTC
+    # ETH/BTC (Coingecko -> Paprika -> USD ratio)
     eth_btc = None; cg2_err = cp2_err = None
     try:
         sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
@@ -790,7 +790,7 @@ def _altseason_fetch() -> Dict[str, Any]:
             raise HTTPException(status_code=502, detail=f"ETH/BTC fetch failed (CG: {cg2_err}; Paprika: {cp2_err}; USD fallback: {e})")
     out["eth_btc"] = float(eth_btc)
 
-    # Altseason Index (optionnel)
+    # Altseason Index (scrape best-effort)
     out["altseason_index"] = None
     try:
         from bs4 import BeautifulSoup  # lazy import
@@ -836,11 +836,26 @@ def altseason_check_public():
     snap = _altseason_fetch()
     return _altseason_summary(snap)
 
-# PROTÉGÉ: envoi Telegram
-@app.post("/altseason/notify")
-def altseason_notify(secret: Optional[str] = Query(None), force: Optional[bool] = Query(False), message: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+# GET+POST: notify (PROTÉGÉ)
+@app.api_route("/altseason/notify", methods=["GET", "POST"])
+async def altseason_notify(request: Request,
+                           secret: Optional[str] = Query(None),
+                           force: Optional[bool] = Query(False),
+                           message: Optional[str] = Query(None)):
+    body = {}
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    body_secret = body.get("secret") if isinstance(body, dict) else None
+    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid secret")
+
+    if request.method == "POST":
+        force = bool(body.get("force", force))
+        message = body.get("message", message)
+
     s = _altseason_summary(_altseason_fetch())
     sent = None
     if s["ALTSEASON_ON"] or force:
@@ -849,12 +864,11 @@ def altseason_notify(secret: Optional[str] = Query(None), force: Optional[bool] 
     return {"summary": s, "telegram_sent": sent}
 
 # -------------------------
-# Webhook TradingView (PROTÉGÉ)
+# Webhook TradingView (PROTÉGÉ) — accepte secret en query OU dans JSON
 # -------------------------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+    # lire d'abord le JSON pour récupérer "secret" éventuel
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -862,6 +876,10 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     except Exception as e:
         log.error("Invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    body_secret = payload.get("secret")
+    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid secret")
 
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
