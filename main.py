@@ -23,30 +23,25 @@ log = logging.getLogger("aitrader")
 WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 LLM_ENABLED        = os.getenv("LLM_ENABLED", "0") in ("1", "true", "True")
 LLM_MODEL          = os.getenv("LLM_MODEL", "gpt-4o-mini")
 FORCE_LLM          = os.getenv("FORCE_LLM", "0") in ("1", "true", "True")
-
 CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 
-# Messages: ignorer tele_msg venant du Pine ?
-IGNORE_TELE_MSG    = os.getenv("IGNORE_TELE_MSG", "1") in ("1","true","True")  # par défaut ON (recommandé)
-
 # DB path default = data/data.db; fallback auto to /tmp si non inscriptible
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
-DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1","true","True")
+DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
-# Telegram rate limit helper
+# Telegram rate-limit simple
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
 _last_tg = 0.0
 
 # -------------------------
-# OpenAI client (facultatif)
+# OpenAI client (optionnel)
 # -------------------------
 _openai_client = None
 _llm_reason_down = None
@@ -60,10 +55,10 @@ else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
 # -------------------------
-# SQLite
+# SQLite (persistent)
 # -------------------------
 def resolve_db_path() -> None:
-    """Crée le répertoire du DB_PATH; si refus d'écriture, fallback -> /tmp/ai_trader/data.db."""
+    """Crée le dossier DB si possible; sinon bascule vers /tmp/ai_trader/data.db."""
     global DB_PATH
     d = os.path.dirname(DB_PATH) or "."
     try:
@@ -157,6 +152,18 @@ def save_event(payload: Dict[str, Any]) -> None:
     log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s",
              row["type"], row["symbol"], row["tf"], row["trade_id"])
 
+def get_first_entry_for_trade(trade_id: Optional[str]) -> Optional[sqlite3.Row]:
+    if not trade_id:
+        return None
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM events WHERE trade_id = ? AND type = 'ENTRY' ORDER BY received_at ASC LIMIT 1",
+            (trade_id,)
+        )
+        row = cur.fetchone()
+        return row
+
 # -------------------------
 # Helpers: dates, filters
 # -------------------------
@@ -217,7 +224,7 @@ class TradeOutcome:
     TP2   = "TP2_HIT"
     TP3   = "TP3_HIT"
     SL    = "SL_HIT"
-    CLOSE = "CLOSE"
+    CLOSE = "CLOSE"    # neutral outcome
 
 def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
@@ -282,6 +289,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
+            # CLOSE neutre
 
             trades.append(
                 {
@@ -318,7 +326,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (cooldown)
+# Telegram (avec cooldown)
 # -------------------------
 def send_telegram(text: str) -> bool:
     global _last_tg
@@ -327,7 +335,7 @@ def send_telegram(text: str) -> bool:
     try:
         now = time.time()
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
-            return False  # éviter 429
+            return False  # anti-spam / 429
         _last_tg = now
 
         import urllib.request
@@ -343,29 +351,11 @@ def send_telegram(text: str) -> bool:
         return False
 
 # -------------------------
-# Rich Telegram formatting
+# Format helpers
 # -------------------------
-def tf_to_str(tf_raw: Any) -> str:
-    s = str(tf_raw or "").upper()
-    # nombres (m)
-    if s.isdigit():
-        v = int(s)
-        if v == 1: return "1m"
-        if v == 3: return "3m"
-        if v == 5: return "5m"
-        if v == 15: return "15m"
-        if v == 30: return "30m"
-        if v == 60: return "1h"
-        if v == 120: return "2h"
-        if v == 240: return "4h"
-        return f"{v}m"
-    # déjà "1D", "1W"...
-    return s
-
-def tier_from_tf(tf_str: str) -> str:
-    if tf_str.endswith("h") or tf_str in ("1D","1W","1M"):
-        return "MidTerm"
-    return "Intraday"
+def escape_html(s: str) -> str:
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+             .replace('"',"&quot;").replace("'","&#39;"))
 
 def fmt_num(v) -> str:
     try:
@@ -375,76 +365,148 @@ def fmt_num(v) -> str:
     except Exception:
         return str(v or "")
 
-def build_rich_message(payload: Dict[str, Any]) -> str:
-    # Si le Pine fournit tele_msg et qu'on ne veut PAS l'ignorer -> le renvoyer tel quel
-    tele_msg = (payload.get("tele_msg") or "").strip()
-    if tele_msg and not IGNORE_TELE_MSG:
-        return tele_msg
+def tf_to_label(tf: Optional[str], tf_label_field: Optional[str]) -> str:
+    """Retourne un label '15m', '1h'… basé sur tf_label si fourni par Pine; sinon mappe tf brut."""
+    if tf_label_field:
+        return tf_label_field
+    tf = (tf or "").upper()
+    m = {
+        "1":"1m","3":"3m","5":"5m","15":"15m","30":"30m",
+        "60":"1h","120":"2h","240":"4h","1D":"1D","4H":"4h"
+    }
+    return m.get(tf, tf or "?")
 
-    t = (payload.get("type") or "EVENT").upper()
-    sym = payload.get("symbol") or "?"
-    tf  = tf_to_str(payload.get("tf"))
-    side = (payload.get("side") or "").upper()
+def pct_move(entry: Optional[float], price_now: Optional[float], side: Optional[str]) -> Optional[float]:
+    try:
+        if entry is None or price_now is None or entry == 0 or not side:
+            return None
+        if side.upper() == "LONG":
+            return (price_now - entry) / entry * 100.0
+        else:
+            return (entry - price_now) / entry * 100.0
+    except Exception:
+        return None
 
-    # entrées / targets / SL
-    entry = payload.get("entry")
-    sl    = payload.get("sl")
-    tp1   = payload.get("tp1")
-    tp2   = payload.get("tp2")
-    tp3   = payload.get("tp3")
+def build_msg_entry(p: Dict[str, Any]) -> str:
+    sym = p.get("symbol","?")
+    tf_label = tf_to_label(str(p.get("tf")), p.get("tf_label"))
+    side = (p.get("side") or "").upper()
+    entry = p.get("entry")
+    sl    = p.get("sl")
+    tp1   = p.get("tp1")
+    tp2   = p.get("tp2")
+    tp3   = p.get("tp3")
+    lev   = p.get("lev_reco")
+    qty   = p.get("qty_reco")
+    r1    = p.get("r1")
+    s1    = p.get("s1")
 
-    # enrichissements optionnels
-    lev   = os.getenv("MSG_DEFAULT_LEV", "20x cross")
-    confp = os.getenv("MSG_DEFAULT_CONFIDENCE", "92.0")  # %
-    tier  = tier_from_tf(tf)
+    dir_word = "Long" if side == "LONG" else "Short"
+    arrow = "📈" if side == "LONG" else "📉"
 
-    # Messages par type (ASCII only; emojis ok)
+    lines = []
+    lines.append(f"📩 {sym} {tf_label} | Signal")
+    lines.append(f"{arrow} {dir_word} Entry: {fmt_num(entry)}")
+    if sl is not None:
+        lines.append(f"❌ Stop-Loss: {fmt_num(sl)}")
+    # Targets
+    tgt_hdr = "🎯 Targets:"
+    tlines = []
+    if tp1 is not None: tlines.append(f" - TP1: {fmt_num(tp1)}")
+    if tp2 is not None: tlines.append(f" - TP2: {fmt_num(tp2)}")
+    if tp3 is not None: tlines.append(f" - TP3: {fmt_num(tp3)}")
+    if tlines:
+        lines.append(tgt_hdr)
+        lines += tlines
+    # Levier & sizing si dispo
+    if lev is not None:
+        try:
+            lines.append(f"💡 Leverage suggéré: {float(lev):.1f}x")
+        except Exception:
+            lines.append(f"💡 Leverage suggéré: {lev}x")
+    if qty is not None:
+        lines.append(f"📦 Qty reco: {fmt_num(qty)}")
+    # S/R si fourni
+    if r1 is not None or s1 is not None:
+        sr = []
+        if r1 is not None: sr.append(f"R1 {fmt_num(r1)}")
+        if s1 is not None: sr.append(f"S1 {fmt_num(s1)}")
+        if sr:
+            lines.append("🧭 " + " | ".join(sr))
+    # Petit rappel
+    lines.append("ℹ️ Après TP1, placer SL au BE.")
+    # Trade id s'il existe
+    if p.get("trade_id"):
+        lines.append(f"ID: {p['trade_id']}")
+
+    return "\n".join(lines)
+
+def build_msg_tp(p: Dict[str, Any], rank: int) -> str:
+    sym = p.get("symbol","?")
+    tf_label = tf_to_label(str(p.get("tf")), p.get("tf_label"))
+    price = p.get("tp") or p.get("entry")  # Pine envoie 'tp' dans TP*_HIT
+    tid = p.get("trade_id")
+
+    # Calcul P&L % en retrouvant l'ENTRY
+    pnl_txt = ""
+    entry_row = get_first_entry_for_trade(tid)
+    if entry_row is not None:
+        base_entry = entry_row["entry"]
+        side = (entry_row["side"] or "").upper()
+        pct = pct_move(base_entry, float(price) if price is not None else None, side)
+        if pct is not None:
+            pnl_txt = f"\nProfit ~ {pct:.2f}%"
+
+    return f"✅ {sym} {tf_label}\nTarget #{rank} - ✅\nMark price - {fmt_num(price)}{pnl_txt}\nID: {tid or ''}"
+
+def build_msg_sl(p: Dict[str, Any]) -> str:
+    sym = p.get("symbol","?")
+    tf_label = tf_to_label(str(p.get("tf")), p.get("tf_label"))
+    price = p.get("tp") or p.get("entry") or p.get("sl")
+    tid = p.get("trade_id")
+    return f"🛑 {sym} {tf_label}\nStop-Loss atteint\nMark price - {fmt_num(price)}\nID: {tid or ''}"
+
+def build_msg_close(p: Dict[str, Any]) -> str:
+    sym = p.get("symbol","?")
+    tf_label = tf_to_label(str(p.get("tf")), p.get("tf_label"))
+    side = p.get("side") or ""
+    reason = p.get("reason") or "Close"
+    tid = p.get("trade_id")
+    return f"🔁 {sym} {tf_label}\nCLOSE ({side}) — {reason}\nID: {tid or ''}"
+
+def build_msg_aoe(p: Dict[str, Any], kind: str) -> str:
+    sym = p.get("symbol","?")
+    tf_label = tf_to_label(str(p.get("tf")), p.get("tf_label"))
+    if kind == "AOE_PREMIUM":
+        up = p.get("upper")
+        hi = p.get("hiWin")
+        cl = p.get("close")
+        return f"🟥 Premium Zone | {sym} {tf_label}\nHigh window: {fmt_num(hi)} – Upper: {fmt_num(up)}\nClose: {fmt_num(cl)}"
+    else:
+        low = p.get("lower")
+        lo  = p.get("loWin")
+        cl  = p.get("close")
+        return f"🟩 Discount Zone | {sym} {tf_label}\nLow window: {fmt_num(lo)} – Lower: {fmt_num(low)}\nClose: {fmt_num(cl)}"
+
+def format_telegram(payload: Dict[str, Any]) -> str:
+    t = (payload.get("type") or "").upper()
     if t == "ENTRY":
-        direction = "Long" if side == "LONG" else ("Short" if side == "SHORT" else "Signal")
-        hdr = f"📩 {sym} {tf} | {tier}"
-        line1 = f"📈 {direction} Entry Zone: {fmt_num(entry)}"
-        line2 = f"🎯Niveau de confiance:  {confp}%"
-        lines_targets = []
-        if tp1 is not None: lines_targets.append(f"Target 1 : {fmt_num(tp1)}")
-        if tp2 is not None: lines_targets.append(f"Target 2 : {fmt_num(tp2)}")
-        if tp3 is not None: lines_targets.append(f"Target 3 : {fmt_num(tp3)}")
-        targets_block = "\n".join(lines_targets) if lines_targets else "Targets: n/d"
-        sl_line = f"❌Stop-Loss: {fmt_num(sl)}" if sl is not None else "❌Stop-Loss: n/d"
-        tips = "💡Après le premier TP1, vous mettez SLBE."
-        return "\n".join([
-            hdr, line1, line2, "", f" -  💡Leverage: {lev}",
-            targets_block, sl_line, tips
-        ])
-
-    if t in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-        tp_label = t.replace("_HIT","")
-        return "\n".join([
-            f"🎯 {tp_label} atteint — {sym} {tf}",
-            f"Side: {side or 'n/d'}",
-            f"Entrée: {fmt_num(entry)}",
-            f"{tp_label}: {fmt_num(payload.get('tp')) if payload.get('tp') is not None else (fmt_num(tp1 if t=='TP1_HIT' else tp2 if t=='TP2_HIT' else tp3))}",
-            "✔️ Gestion: pensez à sécuriser le trade (SL->BE/partiel)."
-        ])
-
+        return build_msg_entry(payload)
+    if t == "TP1_HIT":
+        return build_msg_tp(payload, 1)
+    if t == "TP2_HIT":
+        return build_msg_tp(payload, 2)
+    if t == "TP3_HIT":
+        return build_msg_tp(payload, 3)
     if t == "SL_HIT":
-        return "\n".join([
-            f"🛑 SL touché — {sym} {tf}",
-            f"Side: {side or 'n/d'}",
-            f"Entrée: {fmt_num(entry)}",
-            f"SL: {fmt_num(sl)}",
-            "❗Trade clôturé sur stop."
-        ])
-
+        return build_msg_sl(payload)
     if t == "CLOSE":
-        reason = payload.get("reason") or "Close"
-        return f"🔁 CLOSE — {sym} {tf}\nRaison: {reason}"
-
-    if t == "AOE_PREMIUM":
-        return f"🟥 AOE PREMIUM — {sym} {tf}\nPrix proche de zone Premium (haut de fenêtre)."
-    if t == "AOE_DISCOUNT":
-        return f"🟩 AOE DISCOUNT — {sym} {tf}\nPrix proche de zone Discount (bas de fenêtre)."
-
+        return build_msg_close(payload)
+    if t in ("AOE_PREMIUM","AOE_DISCOUNT"):
+        return build_msg_aoe(payload, t)
     # fallback
+    sym = payload.get("symbol","?")
+    tf = payload.get("tf","?")
     return f"[TV] {t} | {sym} | TF {tf}"
 
 # -------------------------
@@ -502,6 +564,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
+.warn{color:#f59e0b}.danger{color:#ef4444}
 </style></head><body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
@@ -519,11 +582,10 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
-        <form method="post" action="/reset" style="display:inline">
-          <input type="hidden" name="secret" value="$secret">
-          <button class="btn" type="submit" onclick="return confirm('Delete ALL events ?')">Delete ALL</button>
-        </form>
       </div>
+      <form method="post" action="/admin/reset?secret=$secret" onsubmit="return confirm('Delete ALL events? This cannot be undone.');">
+        <button class="btn danger" type="submit">🧹 Delete ALL (Reset)</button>
+      </form>
     </form>
   </div>
 
@@ -606,10 +668,6 @@ input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0
 # -------------------------
 app = FastAPI(title="AI Trader PRO")
 
-def escape_html(s: str) -> str:
-    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-             .replace('"',"&quot;").replace("'","&#39;"))
-
 # -------- Health / Ping --------
 @app.get("/ping")
 def ping():
@@ -635,7 +693,6 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
         ("DEBUG", str(bool(DEBUG_MODE))),
-        ("IGNORE_TELE_MSG", str(bool(IGNORE_TELE_MSG))),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.substitute(rows_html=trs)
@@ -661,7 +718,6 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "RISK_PCT": RISK_PCT,
         "DB_PATH": DB_PATH,
         "DEBUG": DEBUG_MODE,
-        "IGNORE_TELE_MSG": IGNORE_TELE_MSG,
     }
 
 # -------- Telegram health --------
@@ -688,18 +744,6 @@ def openai_health(secret: Optional[str] = Query(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# -------- RESET (Delete ALL) --------
-@app.post("/reset")
-def reset(secret: Optional[str] = Form(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM events")
-        conn.commit()
-    send_telegram("♻️ Dashboard reset: all events deleted.")
-    return RedirectResponse(url=f"/trades?secret={secret or ''}", status_code=303)
-
 # -------- Webhook TradingView --------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
@@ -716,25 +760,19 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         log.warning("Invalid secret on tv-webhook")
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # normaliser TF
-    if "tf" in payload:
-        payload["tf"] = str(payload["tf"])
-
     log.info("Webhook payload: %s", json.dumps(payload)[:500])
     save_event(payload)
 
-    # Compose et envoie message Telegram riche
+    # Message Telegram riche
     try:
-        msg = build_rich_message(payload)
+        msg = format_telegram(payload)
         if msg:
             send_telegram(msg)
     except Exception as e:
-        log.warning("Telegram formatting failed: %s", e)
-        # fallback ultra simple:
+        log.warning("Telegram format/send failed: %s", e)
+        # fallback très simple
         try:
-            t = payload.get("type", "EVENT")
-            sym = payload.get("symbol", "?")
-            tf = payload.get("tf", "?")
+            t = payload.get("type","EVENT"); sym = payload.get("symbol","?"); tf = payload.get("tf","?")
             send_telegram(f"[TV] {t} | {sym} | TF {tf}")
         except Exception:
             pass
@@ -788,7 +826,7 @@ def trades(
     secret: Optional[str] = Query(None),
     symbol: Optional[str] = Query(None),
     tf: Optional[str] = Query(None),
-    start: Optional:str := Query(None),
+    start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
     limit: int = Query(100)
 ):
@@ -891,6 +929,21 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
+# -------- Admin: Reset (POST) --------
+@app.post("/admin/reset")
+def admin_reset(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events")
+        try:
+            cur.execute("VACUUM")
+        except Exception:
+            pass
+        conn.commit()
+    return JSONResponse({"ok": True, "deleted": "all"})
+
 # -------- Alias /trades/secret=... --------
 @app.get("/trades/secret={secret}")
 def trades_alias(secret: str):
@@ -902,9 +955,9 @@ def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     tid = f"SELFTEST_{int(time.time())}"
-    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
+    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","tf_label":"15m","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
     time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","entry":100.0,"tp":101.0,"trade_id":tid})
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","tf_label":"15m","trade_id":tid,"tp":101.0})
     return {"ok": True, "trade_id": tid}
 
 # ============ Run local ============
