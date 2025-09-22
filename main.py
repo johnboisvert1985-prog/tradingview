@@ -41,7 +41,7 @@ DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
 # -------------------------
-# Optional: Templates override via ENV (ASCII only)
+# Templates (ASCII only côté HTML, mais Telegram peut avoir des emojis)
 # -------------------------
 def _env_or(name: str, default: str) -> str:
     v = os.getenv(name)
@@ -59,7 +59,7 @@ TPL_ENTRY = _env_or("TELEGRAM_TEMPLATE_ENTRY",
 • TP3: {tp3}
 ❌ Stop-Loss: {sl}
 
-Note: apres TP1, passer le SL a BE.
+💡 Après TP1, mettez le SL à BE.
 """).strip()
 
 TPL_TP_HIT = _env_or("TELEGRAM_TEMPLATE_TP",
@@ -73,7 +73,7 @@ Trade ID: {trade_id}
 TPL_SL_HIT = _env_or("TELEGRAM_TEMPLATE_SL",
 """🟥 SL_HIT | {symbol} {tfm}
 Side: {side}
-SL: {sl}
+SL touché: {sl}
 Perte: {profit_pct}
 Trade ID: {trade_id}
 """).strip()
@@ -90,7 +90,7 @@ Zone: {zone_info}
 """).strip()
 
 # -------------------------
-# OpenAI (optional)
+# OpenAI (optionnel)
 # -------------------------
 _openai_client = None
 _llm_reason_down = None
@@ -386,7 +386,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # -------------------------
-# HTML templates (ASCII only)
+# HTML templates (ASCII pour HTML)
 # -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
@@ -457,11 +457,11 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
-        <form method="post" action="/reset/trades?secret=$secret" onsubmit="return confirm('Delete ALL trades?');" style="display:inline-block">
-          <input type="hidden" name="confirm" value="YES"/>
-          <button class="btn" type="submit" style="border-color:#5c1e1e;color:#ef4444">Delete ALL</button>
-        </form>
       </div>
+    </form>
+    <form method="post" action="/reset/trades?secret=$secret" onsubmit="return confirm('Delete ALL trades?');" class="row" style="margin-top:8px">
+      <input type="hidden" name="confirm" value="YES"/>
+      <button class="btn" type="submit" style="border-color:#5c1e1e;color:#ef4444">Delete ALL</button>
     </form>
   </div>
 
@@ -540,7 +540,7 @@ input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0
 """)
 
 # -------------------------
-# FastAPI app
+# App
 # -------------------------
 app = FastAPI(title="AI Trader PRO")
 
@@ -597,15 +597,6 @@ def _profit_pct(hit: Optional[float], entry: Optional[float], side: Optional[str
     except Exception:
         return None
 
-def _first_nonempty(*vals: Iterable[Optional[str]]) -> str:
-    for v in vals:
-        if v is None: 
-            continue
-        if isinstance(v, str) and v.strip() == "":
-            continue
-        return str(v)
-    return ""
-
 def _fmt_pct(v: Optional[float]) -> str:
     if v is None:
         return ""
@@ -647,8 +638,15 @@ def build_rich_message(payload: Dict[str, Any]) -> str:
         if tp2 is None: tp2 = entry_row["tp2"]
         if tp3 is None: tp3 = entry_row["tp3"]
 
-    # Optional: read extra fields from raw_json
-    hit_price = _safe_float(payload.get("tp")) or _safe_float(payload.get("price")) or _safe_float(payload.get("hit")) or _safe_float(payload.get("mark"))
+    # hit price
+    hit_price = (
+        _safe_float(payload.get("tp")) or
+        _safe_float(payload.get("price")) or
+        _safe_float(payload.get("hit")) or
+        _safe_float(payload.get("mark")) or
+        (_safe_float(payload.get("entry")) if t in ("TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT") else None)
+    )
+
     # confidence, leverage
     confidence_pct = ""
     conf = payload.get("confidence")
@@ -658,14 +656,12 @@ def build_rich_message(payload: Dict[str, Any]) -> str:
         except Exception:
             confidence_pct = str(conf)
 
-    # Leverage from ENTRY lev_reco if present
     leverage = ""
     if entry_row is not None:
         try:
             rj = json.loads(entry_row["raw_json"] or "{}")
             lev = rj.get("lev_reco")
             if lev is not None:
-                # display as Nx cross rounded
                 try:
                     leverage = f"{float(lev):.0f}x cross"
                 except Exception:
@@ -673,10 +669,9 @@ def build_rich_message(payload: Dict[str, Any]) -> str:
         except Exception:
             pass
 
-    # Friendly tier text (you peux adapter selon tf)
-    tier = "MidTerm" if tf in ("60", "1h", "120", "180", "240", "2h", "3h", "4h") else "Intraday"
+    # Friendly tier
+    tier = "MidTerm" if tf in ("60","1h","120","180","240","2h","3h","4h") else "Intraday"
 
-    # Format numbers
     mapping = {
         "symbol": symbol,
         "tfm": tf,
@@ -693,14 +688,14 @@ def build_rich_message(payload: Dict[str, Any]) -> str:
         "reason": reason or "flip / manual",
         "event": t,
         "hit_price": fmt_num(hit_price),
-        "profit_pct": "",  # may fill below
+        "profit_pct": "",
         "zone_info": "",
         "label": "",
     }
 
-    # compute profit pct for TP / SL when possible
+    # compute profit pct for TP / SL
     if t in ("TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT") and entry is not None:
-        p = _profit_pct(hit_price if hit_price is not None else entry, entry, mapping["side"])
+        p = _profit_pct(hit_price if hit_price is not None else entry, _safe_float(entry), mapping["side"])
         mapping["profit_pct"] = _fmt_pct(p)
 
     # AOE extras
@@ -728,10 +723,8 @@ def build_rich_message(payload: Dict[str, Any]) -> str:
     elif t in ("AOE_PREMIUM","AOE_DISCOUNT"):
         tpl = TPL_AOE
     else:
-        # fallback simple
         return f"[TV] {t} | {symbol} | TF {tf}"
 
-    # Render
     try:
         msg = tpl.format(**mapping)
         return msg.strip()
@@ -1010,7 +1003,7 @@ def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     tid = f"SELFTEST_{int(time.time())}"
-    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid, "lev_reco": 10})
+    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid, "lev_reco": 20})
     time.sleep(1)
     save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid, "tp": 101.0})
     return {"ok": True, "trade_id": tid}
