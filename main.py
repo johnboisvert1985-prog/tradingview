@@ -1,5 +1,6 @@
 # main.py
 import os
+import re
 import json
 import time
 import sqlite3
@@ -10,11 +11,6 @@ from collections import defaultdict
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-
-# ===== ALTSEASON: deps =====
-import re
-import requests
-from bs4 import BeautifulSoup
 
 # -------------------------
 # Logging
@@ -41,7 +37,9 @@ RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
-# ===== ALTSEASON: thresholds (overridable via ENV) =====
+# -------------------------
+# ALTSEASON thresholds (ENV override possible)
+# -------------------------
 ALT_BTC_DOM_THR    = float(os.getenv("ALT_BTC_DOM_THR", "55.0"))
 ALT_ETH_BTC_THR    = float(os.getenv("ALT_ETH_BTC_THR", "0.045"))
 ALT_ASI_THR        = float(os.getenv("ALT_ASI_THR", "75.0"))
@@ -202,7 +200,6 @@ def pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
         return None
 
 def parse_leverage_x(leverage: Optional[str]) -> Optional[float]:
-    # e.g. "20x cross" -> 20.0
     if not leverage:
         return None
     try:
@@ -223,7 +220,7 @@ class TradeOutcome:
     TP2   = "TP2_HIT"
     TP3   = "TP3_HIT"
     SL    = "SL_HIT"
-    CLOSE = "CLOSE"    # neutral outcome
+    CLOSE = "CLOSE"
 
 def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
     if not date_str:
@@ -336,7 +333,6 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
-            # CLOSE is neutral: no change to wins/losses/streaks
 
             trades.append(
                 {
@@ -397,77 +393,6 @@ def send_telegram(text: str) -> bool:
         log.warning("Telegram send failed: %s", e)
         return False
 
-def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
-    """Build a rich Telegram message for ENTRY/TP/SL/CLOSE. Return None to skip."""
-    t = str(payload.get("type") or "EVENT").upper()
-    if t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
-        return None  # explicit suppression
-
-    sym = str(payload.get("symbol") or "?")
-    tf_lbl = tf_label_of(payload)
-    side = str(payload.get("side") or "")
-    entry = _to_float(payload.get("entry"))
-    sl = _to_float(payload.get("sl"))
-    tp = _to_float(payload.get("tp"))  # for TP/SL hits 'tp' carries the level hit
-    tp1 = _to_float(payload.get("tp1"))
-    tp2 = _to_float(payload.get("tp2"))
-    tp3 = _to_float(payload.get("tp3"))
-    conf = payload.get("confidence")
-    horizon = payload.get("horizon")
-    leverage = payload.get("leverage")
-    lev_x = parse_leverage_x(leverage)
-
-    if t == "ENTRY":
-        lines = []
-        lines.append(f"📩 {sym} {tf_lbl} | {horizon or 'MidTerm'}")
-        if side:
-            lines.append(("📈 Long Entry:" if side.upper()=="LONG" else "📉 Short Entry:") + f" {fmt_num(entry)}")
-        if conf is not None:
-            try:
-                lines.append(f"🎯Niveau de confiance: {float(conf):.2f}%")
-            except Exception:
-                lines.append(f"🎯Niveau de confiance: {conf}")
-        if leverage:
-            lines.append(f"💡Leverage: {leverage}")
-        if tp1: lines.append(f"Target 1 : {fmt_num(tp1)}")
-        if tp2: lines.append(f"Target 2 : {fmt_num(tp2)}")
-        if tp3: lines.append(f"Target 3 : {fmt_num(tp3)}")
-        if sl:  lines.append(f"❌Stop-Loss: {fmt_num(sl)}")
-        lines.append("💡Apres le premier TP1, mettez SLBE.")
-        return "\n".join(lines)
-
-    if t in {"TP1_HIT","TP2_HIT","TP3_HIT"}:
-        spot_pct = pct(tp, entry) if (side and tp is not None and entry is not None) else None
-        lev_pct = (spot_pct * lev_x) if (spot_pct is not None and lev_x) else None
-        label = {"TP1_HIT":"Target #1","TP2_HIT":"Target #2","TP3_HIT":"Target #3"}[t]
-        lines = []
-        lines.append(f"✅ {label} - {sym} {tf_lbl}")
-        if tp is not None:
-            lines.append(f"Mark price - {fmt_num(tp)}")
-        if spot_pct is not None:
-            base = f"Profit (spot) - {spot_pct:.2f}%"
-            if lev_pct is not None:
-                base += f"  |  with {int(lev_x)}x: {lev_pct:.2f}%"
-            lines.append(base)
-        return "\n".join(lines)
-
-    if t == "SL_HIT":
-        lines = []
-        lines.append(f"🟥 Stop-Loss - {sym} {tf_lbl}")
-        if tp is not None:
-            lines.append(f"Filled at - {fmt_num(tp)}")
-        return "\n".join(lines)
-
-    if t == "CLOSE":
-        lines = []
-        lines.append(f"🔔 Close - {sym} {tf_lbl}")
-        reason = payload.get("reason")
-        if reason:
-            lines.append(f"Reason: {reason}")
-        return "\n".join(lines)
-
-    return f"[TV] {t} | {sym} | TF {tf_lbl}"
-
 # -------------------------
 # HTML templates (ASCII only)
 # -------------------------
@@ -523,7 +448,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <script>
 (function(){
   const qs = new URLSearchParams(window.location.search);
-  const secret = qs.get("secret");
+  const secret = qs.get("secret"); // optionnel
   const url = "/altseason/check" + (secret ? ("?secret=" + encodeURIComponent(secret)) : "");
   fetch(url).then(r=>r.json()).then(s=>{
     const dot = (ok)=> ok ? "dot ok" : "dot warn";
@@ -557,7 +482,7 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-temp
 @media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
 .kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
-.kpi .green{color:var(--green)}.kpi .red{color:#ef4444}.kpi .blue{color:var(--blue)}.kpi .yellow{color:var(--yellow)}table{width:100%;border-collapse:collapse;font-size:14px}
+.kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
@@ -671,10 +596,9 @@ def ping():
     return {"ok": True}
 
 # -------- Index --------
+# PUBLIC: aucune vérification de secret ici
 @app.get("/", response_class=HTMLResponse)
-def index(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+def index():
     rows = [
         ("WEBHOOK_SECRET_set", str(bool(WEBHOOK_SECRET))),
         ("TELEGRAM_BOT_TOKEN_set", str(bool(TELEGRAM_BOT_TOKEN))),
@@ -690,7 +614,6 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
         ("DEBUG", str(bool(DEBUG_MODE))),
-        # ALTSEASON thresholds visibles
         ("ALT_BTC_DOM_THR", str(ALT_BTC_DOM_THR)),
         ("ALT_ETH_BTC_THR", str(ALT_ETH_BTC_THR)),
         ("ALT_ASI_THR", str(ALT_ASI_THR)),
@@ -706,7 +629,7 @@ def index(secret: Optional[str] = Query(None)):
     )
     return HTMLResponse(html)
 
-# -------- Env sanity --------
+# -------- Env sanity (PROTÉGÉ) --------
 @app.get("/env-sanity")
 def env_sanity(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -734,7 +657,7 @@ def env_sanity(secret: Optional[str] = Query(None)):
         }
     }
 
-# -------- Telegram health --------
+# -------- Telegram health (PROTÉGÉ) --------
 @app.get("/tg-health")
 def tg_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -742,7 +665,7 @@ def tg_health(secret: Optional[str] = Query(None)):
     ok = send_telegram("Test Telegram: OK")
     return {"ok": ok}
 
-# -------- OpenAI health --------
+# -------- OpenAI health (PROTÉGÉ) --------
 @app.get("/openai-health")
 def openai_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -758,23 +681,50 @@ def openai_health(secret: Optional[str] = Query(None)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ===== ALTSEASON: helpers + endpoints =====
+# -------------------------
+# ALTSEASON helpers + endpoints
+# -------------------------
 def _status(val: float, thr: float, direction: str) -> bool:
     return (val < thr) if direction == "below" else (val > thr)
 
 def _altseason_fetch() -> Dict[str, Any]:
     out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    g = requests.get("https://api.coingecko.com/api/v3/global", timeout=15).json()
-    mcap = g["data"]["total_market_cap"]["usd"]
-    btc_pct = g["data"]["market_cap_percentage"]["btc"]
-    out["btc_dominance"] = float(btc_pct)
-    out["total_mcap_usd"] = float(mcap)
-    out["total2_usd"] = float(mcap * (1 - btc_pct/100.0))
-    sp = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd", timeout=15).json()
-    out["eth_btc"] = float(sp["ethereum"]["btc"])
+    try:
+        import requests
+    except Exception:
+        raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
+
+    headers = {"User-Agent": "altseason-bot/1.0"}
+
+    # CoinGecko global
+    try:
+        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=15, headers=headers).json()
+        mcap = g["data"]["total_market_cap"]["usd"]
+        btc_pct = g["data"]["market_cap_percentage"]["btc"]
+        out["btc_dominance"] = float(btc_pct)
+        out["total_mcap_usd"] = float(mcap)
+        out["total2_usd"] = float(mcap * (1 - btc_pct/100.0))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Coingecko global fetch failed: {e}")
+
+    # ETH/BTC
+    try:
+        sp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd",
+            timeout=15, headers=headers
+        ).json()
+        out["eth_btc"] = float(sp["ethereum"]["btc"])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Coingecko simple/price failed: {e}")
+
+    # Altseason Index (optional)
     out["altseason_index"] = None
     try:
-        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=15).text
+        from bs4 import BeautifulSoup
+        html = requests.get(
+            "https://www.blockchaincenter.net/altcoin-season-index/",
+            timeout=15, headers=headers
+        ).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
@@ -784,6 +734,7 @@ def _altseason_fetch() -> Dict[str, Any]:
                 out["altseason_index"] = v
     except Exception:
         pass
+
     return out
 
 def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -813,13 +764,13 @@ def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
         "ALTSEASON_ON": on
     }
 
+# PUBLIC: lecture seule
 @app.get("/altseason/check")
-def altseason_check(secret: Optional[str] = Query(None)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
+def altseason_check_public():
     snap = _altseason_fetch()
     return _altseason_summary(snap)
 
+# PROTÉGÉ: déclenche Telegram, donc garde le secret
 @app.post("/altseason/notify")
 def altseason_notify(
     secret: Optional[str] = Query(None),
@@ -835,9 +786,13 @@ def altseason_notify(
         sent = send_telegram(msg)
     return {"summary": s, "telegram_sent": sent}
 
-# -------- Webhook TradingView --------
+# -------------------------
+# Webhook TradingView (PROTÉGÉ)
+# -------------------------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -846,25 +801,22 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         log.error("Invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    body_secret = payload.get("secret")
-    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
-        log.warning("Invalid secret on tv-webhook")
-        raise HTTPException(status_code=401, detail="Invalid secret")
-
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
-    # Telegram: only for trading events (no AOE)
-    try:
-        msg = telegram_rich_message(payload)
-        if msg:
-            send_telegram(msg)
-    except Exception:
-        pass
+    # Optionnel: message Telegram formaté (si tu veux notifier ici)
+    # try:
+    #     msg = telegram_rich_message(payload)
+    #     if msg:
+    #         send_telegram(msg)
+    # except Exception:
+    #     pass
 
     return {"ok": True}
 
-# -------- Trades JSON --------
+# -------------------------
+# Trades JSON (PROTÉGÉ)
+# -------------------------
 @app.get("/trades.json")
 def trades_json(
     secret: Optional[str] = Query(None),
@@ -881,7 +833,9 @@ def trades_json(
     trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit*10))
     return JSONResponse({"summary": summary, "trades": trades[-limit:] if limit else trades})
 
-# -------- Trades CSV --------
+# -------------------------
+# Trades CSV (PROTÉGÉ)
+# -------------------------
 @app.get("/trades.csv")
 def trades_csv(
     secret: Optional[str] = Query(None),
@@ -905,7 +859,9 @@ def trades_csv(
         lines.append(",".join(row))
     return Response(content="\n".join(lines), media_type="text/csv")
 
-# -------- Trades HTML --------
+# -------------------------
+# Trades HTML (PROTÉGÉ)
+# -------------------------
 @app.get("/trades", response_class=HTMLResponse)
 def trades(
     secret: Optional[str] = Query(None),
@@ -967,7 +923,9 @@ def trades(
     )
     return HTMLResponse(html)
 
-# -------- Events raw HTML --------
+# -------------------------
+# Events (PROTÉGÉ)
+# -------------------------
 @app.get("/events", response_class=HTMLResponse)
 def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -1003,7 +961,9 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
     )
     return HTMLResponse(html)
 
-# -------- Events JSON --------
+# -------------------------
+# Events JSON (PROTÉGÉ)
+# -------------------------
 @app.get("/events.json")
 def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
@@ -1014,12 +974,16 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
-# -------- Alias /trades/secret=... --------
+# -------------------------
+# Alias /trades/secret=... (PROTÉGÉ)
+# -------------------------
 @app.get("/trades/secret={secret}")
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
-# -------- Reset (GET, no python-multipart needed) --------
+# -------------------------
+# Reset (PROTÉGÉ)
+# -------------------------
 @app.get("/reset")
 def reset_all(secret: Optional[str] = Query(None),
               confirm: Optional[str] = Query(None),
@@ -1036,7 +1000,9 @@ def reset_all(secret: Optional[str] = Query(None),
         return RedirectResponse(url=redirect, status_code=303)
     return {"ok": True, "deleted": "all"}
 
-# -------- Self test: insert a sample trade --------
+# -------------------------
+# Self test (PROTÉGÉ)
+# -------------------------
 @app.get("/selftest")
 def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
