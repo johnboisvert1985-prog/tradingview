@@ -688,39 +688,93 @@ def _status(val: float, thr: float, direction: str) -> bool:
     return (val < thr) if direction == "below" else (val > thr)
 
 def _altseason_fetch() -> Dict[str, Any]:
+    """Fetch live metrics with robust fallbacks and clear errors."""
     out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
     try:
-        import requests
+        import requests  # lazy import
     except Exception:
         raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
 
-    headers = {"User-Agent": "altseason-bot/1.0"}
+    headers = {"User-Agent": "altseason-bot/1.1"}
 
-    # CoinGecko global
+    def get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        body_preview = (r.text or "")[:220].replace("\n", " ").replace("\r", " ")
+        if r.status_code != 200:
+            raise RuntimeError(f"{url} -> HTTP {r.status_code}: {body_preview}")
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError(f"{url} -> Non-JSON response: {body_preview}")
+
+    # ---- 1) Global market cap + BTC dominance
+    mcap_usd: Optional[float] = None
+    btc_dom: Optional[float] = None
+    cg_err = None
+    cp_err = None
+
+    # CoinGecko
     try:
-        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=15, headers=headers).json()
-        mcap = g["data"]["total_market_cap"]["usd"]
-        btc_pct = g["data"]["market_cap_percentage"]["btc"]
-        out["btc_dominance"] = float(btc_pct)
-        out["total_mcap_usd"] = float(mcap)
-        out["total2_usd"] = float(mcap * (1 - btc_pct/100.0))
+        g = get_json("https://api.coingecko.com/api/v3/global")
+        data = g.get("data") or {}
+        mcap_usd = float(data["total_market_cap"]["usd"])
+        btc_dom  = float(data["market_cap_percentage"]["btc"])
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Coingecko global fetch failed: {e}")
+        cg_err = e
 
-    # ETH/BTC
+    # Fallback: CoinPaprika
+    if mcap_usd is None or btc_dom is None:
+        try:
+            pg = get_json("https://api.coinpaprika.com/v1/global")
+            mcap_usd = float(pg["market_cap_usd"])
+            btc_dom  = float(pg["bitcoin_dominance_percentage"])
+        except Exception as e:
+            cp_err = e
+
+    if mcap_usd is None or btc_dom is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Global fetch failed (CG: {cg_err}; Paprika: {cp_err})"
+        )
+
+    out["total_mcap_usd"] = mcap_usd
+    out["btc_dominance"]  = btc_dom
+    out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
+
+    # ---- 2) ETH/BTC
+    eth_btc: Optional[float] = None
+    cg2_err = None
+    cp2_err = None
     try:
-        sp = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd",
-            timeout=15, headers=headers
-        ).json()
-        out["eth_btc"] = float(sp["ethereum"]["btc"])
+        sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
+        eth_btc = float(sp["ethereum"]["btc"])
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Coingecko simple/price failed: {e}")
+        cg2_err = e
 
-    # Altseason Index (optional)
+    if eth_btc is None:
+        try:
+            tkr = get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum?quotes=BTC")
+            eth_btc = float(tkr["quotes"]["BTC"]["price"])
+        except Exception as e:
+            cp2_err = e
+
+    if eth_btc is None:
+        try:
+            eth_usd = float(get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum")["quotes"]["USD"]["price"])
+            btc_usd = float(get_json("https://api.coinpaprika.com/v1/tickers/btc-bitcoin")["quotes"]["USD"]["price"])
+            eth_btc = eth_usd / btc_usd
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ETH/BTC fetch failed (CG: {cg2_err}; Paprika: {cp2_err}; USD fallback: {e})"
+            )
+    out["eth_btc"] = float(eth_btc)
+
+    # ---- 3) Altseason Index (optionnel)
     out["altseason_index"] = None
     try:
-        from bs4 import BeautifulSoup
+        from bs4 import BeautifulSoup  # lazy import
         html = requests.get(
             "https://www.blockchaincenter.net/altcoin-season-index/",
             timeout=15, headers=headers
@@ -804,7 +858,7 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
-    # Optionnel: message Telegram formaté (si tu veux notifier ici)
+    # Optionnel: notifier Telegram ici si souhaité
     # try:
     #     msg = telegram_rich_message(payload)
     #     if msg:
