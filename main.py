@@ -2,14 +2,13 @@
 import os
 import json
 import time
-import math
 import sqlite3
 import logging
 from typing import Optional, Dict, Any, List, Tuple
 from string import Template
 from collections import defaultdict
 
-from fastapi import FastAPI, Request, HTTPException, Query, Form
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 # -------------------------
@@ -32,20 +31,15 @@ CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
-
-# DB path default = data/data.db; fallback auto to /tmp si non-inscriptible
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
-
-# Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
+TELEGRAM_STYLE     = os.getenv("TELEGRAM_STYLE", "rich").lower().strip()  # rich | plain
+
 _last_tg = 0.0
 
-# Style d’envoi Telegram (rich/plain) — on force "rich" par défaut
-TELEGRAM_STYLE = os.getenv("TELEGRAM_STYLE", "rich").lower().strip()
-
 # -------------------------
-# OpenAI client (optionnel)
+# OpenAI client (optional)
 # -------------------------
 _openai_client = None
 _llm_reason_down = None
@@ -62,7 +56,7 @@ else:
 # SQLite (persistent)
 # -------------------------
 def resolve_db_path() -> None:
-    """Crée le dossier DB_PATH; si permission refusée, fallback vers /tmp/ai_trader/data.db."""
+    """Try to create directory for DB_PATH; if permission denied, fallback to /tmp/ai_trader/data.db."""
     global DB_PATH
     d = os.path.dirname(DB_PATH) or "."
     try:
@@ -157,8 +151,20 @@ def save_event(payload: Dict[str, Any]) -> None:
              row["type"], row["symbol"], row["tf"], row["trade_id"])
 
 # -------------------------
-# Helpers: format / dates / symbol
+# Helpers
 # -------------------------
+def escape_html(s: str) -> str:
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+             .replace('"',"&quot;").replace("'","&#39;"))
+
+def fmt_num(v) -> str:
+    try:
+        if v is None: return ""
+        s = f"{float(v):,.6f}".rstrip("0").rstrip(".")
+        return s
+    except Exception:
+        return str(v or "")
+
 def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
     if not date_str:
         return None
@@ -180,6 +186,34 @@ def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
         return int(dtobj.timestamp())
     except Exception:
         return None
+
+def tf_label_from(tf: Optional[str], default: str = "") -> str:
+    if not tf:
+        return default
+    s = str(tf).upper().strip()
+    # Pine envoie souvent "15" etc., parfois "1D"
+    if s.isdigit():
+        m = int(s)
+        if m < 60:
+            return f"{m}m"
+        if m % 60 == 0:
+            h = m // 60
+            return f"{h}h"
+        return f"{m}m"
+    # mots-clés
+    mapping = {"1D":"1D","3D":"3D","1W":"1W","1M":"1M","D":"1D","W":"1W","M":"1M","60":"1h","240":"4h"}
+    return mapping.get(s, s)
+
+# -------------------------
+# Build trades & stats
+# -------------------------
+class TradeOutcome:
+    NONE  = "NONE"
+    TP1   = "TP1_HIT"
+    TP2   = "TP2_HIT"
+    TP3   = "TP3_HIT"
+    SL    = "SL_HIT"
+    CLOSE = "CLOSE"    # neutral outcome
 
 def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
@@ -206,76 +240,6 @@ def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
         cur = conn.cursor()
         cur.execute(sql, tuple(args))
         return cur.fetchall()
-
-def escape_html(s: str) -> str:
-    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-             .replace('"',"&quot;").replace("'","&#39;"))
-
-def fmt_num(v, decimals: int = 6) -> str:
-    try:
-        if v is None: return ""
-        s = f"{float(v):.{decimals}f}"
-        # nettoie zéros finaux
-        s = s.rstrip("0").rstrip(".")
-        return s
-    except Exception:
-        return str(v or "")
-
-def tf_label_from_payload(p: Dict[str, Any]) -> str:
-    tl = p.get("tf_label")
-    if tl:
-        return str(tl)
-    tf = str(p.get("tf") or "").upper()
-    if tf in ("1D", "1W", "1M"): return tf
-    # numériques en minutes
-    try:
-        val = int(tf)
-        mapping = {
-            1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m", 45: "45m",
-            60: "1h", 120: "2h", 180: "3h", 240: "4h"
-        }
-        return mapping.get(val, f"{val}m")
-    except Exception:
-        return tf or "—"
-
-def prettify_symbol(sym: str) -> str:
-    if not sym:
-        return "—"
-    base = sym
-    # retire suffixes .P / .PERP etc.
-    if "." in base:
-        base = base.split(".")[0]
-    # Ajoute la barre AAA/USDT si possible
-    for quote in ("USDT","USDC","BTC","ETH","USD"):
-        if base.endswith(quote):
-            return f"{base[:-len(quote)]}/{quote}"
-    # fallback
-    return base
-
-def pct_change(entry: Optional[float], price: Optional[float], side: Optional[str]) -> Optional[float]:
-    try:
-        if entry is None or price is None or not side:
-            return None
-        if entry == 0:
-            return None
-        if side.upper() == "LONG":
-            return (price - entry) / entry * 100.0
-        if side.upper() == "SHORT":
-            return (entry - price) / entry * 100.0
-        return None
-    except Exception:
-        return None
-
-# -------------------------
-# Build trades & stats
-# -------------------------
-class TradeOutcome:
-    NONE  = "NONE"
-    TP1   = "TP1_HIT"
-    TP2   = "TP2_HIT"
-    TP3   = "TP3_HIT"
-    SL    = "SL_HIT"
-    CLOSE = "CLOSE"    # neutral outcome
 
 def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
@@ -340,7 +304,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
-            # CLOSE est neutre
+            # CLOSE = neutre
 
             trades.append(
                 {
@@ -377,7 +341,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (avec cooldown)
+# Telegram (cooldown + rich messages)
 # -------------------------
 def send_telegram(text: str) -> bool:
     global _last_tg
@@ -386,9 +350,8 @@ def send_telegram(text: str) -> bool:
     try:
         now = time.time()
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
-            return False  # évite spam / 429
+            return False  # anti-429
         _last_tg = now
-
         import urllib.request
         import urllib.parse
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -401,156 +364,121 @@ def send_telegram(text: str) -> bool:
         log.warning("Telegram send failed: %s", e)
         return False
 
-# -------------------------
-# Message builder (RICH)
-# -------------------------
+def _fmt_pct(v: Optional[float]) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.2f}%"
+    except Exception:
+        return str(v)
+
 def build_rich_message(payload: Dict[str, Any]) -> str:
-    t = str(payload.get("type", "")).upper()
-    sym = str(payload.get("symbol", "") or "")
-    tfL = tf_label_from_payload(payload)
-    sym_pretty = prettify_symbol(sym)
+    """
+    Messages riches FR, style demandé :
+    - ENTRY : 📩 SYMBOL TF | horizon
+             📈 Long/Short Entry Zone: entry
+             🎯 Niveau de confiance: 98.64%
+             - 💡Leverage: 20x cross
+             Target 1..3 + 🚀
+             ❌Stop-Loss: SL
+             💡Après le premier TP1, vous mettez SLBE.
+    - TPx/SL/CLOSE/ AOE_*
+    """
+    t = (payload.get("type") or "").upper()
+    sym = payload.get("symbol") or "?"
+    tf  = tf_label_from(str(payload.get("tf") or ""), payload.get("tf_label") or "")
+    side = (payload.get("side") or "").upper()
+    confidence = payload.get("confidence")  # number 0-100
+    horizon = payload.get("horizon") or ""  # "MidTerm"…
+    leverage = payload.get("leverage") or ""  # "20x cross"…
+    entry = payload.get("entry")
+    sl = payload.get("sl") or payload.get("stop") or payload.get("stoploss")
+    tp1 = payload.get("tp1") or payload.get("tp")
+    tp2 = payload.get("tp2")
+    tp3 = payload.get("tp3")
 
-    # champs éventuels
-    side   = payload.get("side")
-    entry  = _to_float(payload.get("entry"))
-    sl     = _to_float(payload.get("sl"))
-    tp1    = _to_float(payload.get("tp1"))
-    tp2    = _to_float(payload.get("tp2"))
-    tp3    = _to_float(payload.get("tp3"))
-    hit    = _to_float(payload.get("tp"))  # pour TP*_HIT et SL_HIT
-    conf   = payload.get("confidence")  # int/float optionnel
-    horiz  = str(payload.get("horizon") or "").strip()
-    levg   = str(payload.get("leverage") or "").strip()
-    tid    = str(payload.get("trade_id") or "")
-    r1     = payload.get("r1")
-    s1     = payload.get("s1")
+    def fmt(v): return fmt_num(v)
 
-    # en-tête
-    header = ""
     if t == "ENTRY":
-        # ex: 📩 SAND/USDT 15m | MidTerm
-        header = f"📩 {sym_pretty} {tfL}"
-        if horiz:
-            header += f" | {horiz}"
-    elif t in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-        target_no = t.replace("_HIT","").upper()
-        header = f"🏁 {target_no} atteint — {sym_pretty} {tfL}"
-    elif t == "SL_HIT":
-        header = f"🛑 Stop touché — {sym_pretty} {tfL}"
-    elif t == "CLOSE":
-        header = f"📪 Close — {sym_pretty} {tfL}"
-    elif t == "AOE_PREMIUM":
-        header = f"🟥 AOE Premium — {sym_pretty} {tfL}"
-    elif t == "AOE_DISCOUNT":
-        header = f"🟩 AOE Discount — {sym_pretty} {tfL}"
-    else:
-        header = f"[TV] {t} | {sym} | TF {tfL}"
+        arrow = "📈" if side == "LONG" else "📉"
+        pre = f"📩 {sym} {tf} | {horizon or '—'}"
+        lines = [
+            pre,
+            f"{arrow} {'Long' if side=='LONG' else 'Short'} Entry Zone: {fmt(entry)}",
+            f"🎯Niveau de confiance: {str(confidence) + '%' if confidence is not None else '—'}",
+        ]
+        if leverage:
+            lines.append(f" -  💡Leverage: {leverage}")
+        if tp1: lines.append(f"Target 1 : {fmt(tp1)}")
+        if tp2: lines.append(f"Target 2 : {fmt(tp2)}")
+        if tp3: lines.append(f"Target 3 : {fmt(tp3)}")
+        # petit extra “Target 5 : 🚀🚀🚀”
+        lines.append("Target 5 : 🚀🚀🚀")
+        if sl:
+            lines.append(f"❌Stop-Loss: {fmt(sl)}")
+        lines.append("💡Après le premier TP1, vous mettez SLBE.")
+        return "\n".join(lines)
 
-    lines: List[str] = [header]
+    if t in ("TP1_HIT","TP2_HIT","TP3_HIT"):
+        mapn = {"TP1_HIT":"1","TP2_HIT":"2","TP3_HIT":"3"}
+        n = mapn.get(t, "?")
+        txt = [
+            f"✅ TP{n} atteint",
+            f"{sym} {tf} | {side or '—'}",
+        ]
+        if entry: txt.append(f"Entrée: {fmt(entry)}")
+        if payload.get("tp"): txt.append(f"TP{n}: {fmt(payload.get('tp'))}")
+        return "\n".join(txt)
 
-    # bloc ENTRY riche
-    if t == "ENTRY":
-        if side:
-            lines.append(f"🧭 Côté: {side}")
-        if entry is not None:
-            lines.append(f"📈 Long Entry Zone: {fmt_num(entry)}" if (side and side.upper()=="LONG")
-                         else f"📉 Short Entry Zone: {fmt_num(entry)}")
-        if conf is not None:
-            try:
-                conf_v = float(conf)
-                lines.append(f"🎯 Niveau de confiance: {conf_v:.0f}%")
-            except Exception:
-                pass
-        if levg:
-            lines.append(f"• 💡 Leverage: {levg}")
+    if t == "SL_HIT":
+        txt = [
+            "🛑 Stop-Loss touché",
+            f"{sym} {tf} | {side or '—'}",
+        ]
+        if entry: txt.append(f"Entrée: {fmt(entry)}")
+        if sl: txt.append(f"SL: {fmt(sl)}")
+        return "\n".join(txt)
 
-        # Targets
-        if tp1 is not None: lines.append(f"🎯 Target 1 : {fmt_num(tp1)}")
-        if tp2 is not None: lines.append(f"🎯 Target 2 : {fmt_num(tp2)}")
-        if tp3 is not None: lines.append(f"🎯 Target 3 : {fmt_num(tp3)}")
+    if t == "CLOSE":
+        reason = payload.get("reason") or "Signal de clôture"
+        return f"🔔 CLOSE\n{sym} {tf}\nRaison: {reason}"
 
-        # Stop Loss
-        if sl is not None:
-            lines.append(f"❌ Stop-Loss : {fmt_num(sl)}")
+    if t == "AOE_PREMIUM":
+        hi = payload.get("hiWin")
+        up = payload.get("upper")
+        cl = payload.get("close")
+        return (
+            f"🟥 AOE PREMIUM\n"
+            f"• Symbol: {sym}\n• TF: {tf}\n"
+            f"• HiWindow: {fmt(hi)}\n• Upper: {fmt(up)}\n• Close: {fmt(cl)}"
+        )
 
-        # Hints
-        if side and side.upper()=="LONG":
-            lines.append("💡 Après TP1, mettez SL au BE (Break Even).")
-        elif side and side.upper()=="SHORT":
-            lines.append("💡 Après TP1, serrer le SL (au prix d’entrée).")
+    if t == "AOE_DISCOUNT":
+        lo = payload.get("loWin")
+        low = payload.get("lower")
+        cl = payload.get("close")
+        return (
+            f"🟩 AOE DISCOUNT\n"
+            f"• Symbol: {sym}\n• TF: {tf}\n"
+            f"• LoWindow: {fmt(lo)}\n• Lower: {fmt(low)}\n• Close: {fmt(cl)}"
+        )
 
-        # S/R (si fournis)
-        rs_line = []
-        if r1 is not None: rs_line.append(f"R1: {fmt_num(r1)}")
-        if s1 is not None: rs_line.append(f"S1: {fmt_num(s1)}")
-        if rs_line:
-            lines.append("• " + " | ".join(rs_line))
-
-        if tid:
-            lines.append(f"\nID: {tid}")
-
-    # bloc TP/SL/CLOSE
-    elif t in ("TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT","CLOSE"):
-        if side:
-            lines.append(f"🧭 Côté: {side}")
-        if entry is not None:
-            lines.append(f"💵 Entrée: {fmt_num(entry)}")
-
-        label = ""
-        if t == "SL_HIT":
-            label = "SL"
-        elif t.startswith("TP"):
-            label = t.replace("_HIT", "")
-        elif t == "CLOSE":
-            label = "Close"
-
-        if hit is not None:
-            lines.append(f"🎯 {label} : {fmt_num(hit)}")
-
-        # % profit si possible
-        p = pct_change(entry, hit, side)
-        if p is not None:
-            sign = "+" if p >= 0 else ""
-            lines.append(f"📈 Profit ≈ {sign}{p:.2f}%")
-
-        if tid:
-            lines.append(f"\nID: {tid}")
-
-    # AOE messages enrichis si infos fournies
-    elif t in ("AOE_PREMIUM","AOE_DISCOUNT"):
-        if t == "AOE_PREMIUM":
-            hiWin = _to_float(payload.get("hiWin"))
-            upper = _to_float(payload.get("upper"))
-            close = _to_float(payload.get("close"))
-            if hiWin is not None and upper is not None and close is not None:
-                lines.append(f"Zone haute [{fmt_num(hiWin)} – {fmt_num(upper)}]")
-                lines.append(f"Clôture: {fmt_num(close)}")
-        if t == "AOE_DISCOUNT":
-            loWin = _to_float(payload.get("loWin"))
-            lower = _to_float(payload.get("lower"))
-            close = _to_float(payload.get("close"))
-            if loWin is not None and lower is not None and close is not None:
-                lines.append(f"Zone basse [{fmt_num(lower)} – {fmt_num(loWin)}]")
-                lines.append(f"Clôture: {fmt_num(close)}")
-
-    # fallback brut si rien
-    return "\n".join(lines)
+    # fallback simple
+    return f"[TV] {t} | {sym} | TF {tf}"
 
 def build_plain_message(payload: Dict[str, Any]) -> str:
-    # vieux format simple (fallback si TELEGRAM_STYLE=plain)
     t = payload.get("type", "EVENT")
     sym = payload.get("symbol", "?")
-    tfL = tf_label_from_payload(payload)
-    return f"[TV] {t} | {sym} | TF {tfL}"
+    tf  = tf_label_from(str(payload.get("tf") or ""), payload.get("tf_label") or "")
+    return f"[TV] {t} | {sym} | TF {tf}"
 
 def build_telegram_message(payload: Dict[str, Any]) -> str:
     if TELEGRAM_STYLE == "plain":
         return build_plain_message(payload)
-    # par défaut "rich"
     return build_rich_message(payload)
 
 # -------------------------
-# HTML templates (ASCII only)
+# HTML templates
 # -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
@@ -603,14 +531,14 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
-.btn:hover{background:#0f1525}.btn.danger{border-color:#5c1e1e;color:#ffb4b4;background:#2a0f12}
-.note{margin-top:8px;color:var(--muted)}
+.btn:hover{background:#0f1525}.btn.danger{border-color:#5c1e1e;color:#ef4444}.alert{background:#0b1220;border:1px solid #0f5132;color:#10b981;border-radius:10px;padding:10px;margin-bottom:10px}
 .spark{width:100%;height:60px}
 </style></head><body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
   <div class="card">
     <div class="title">Filters</div>
+    $maybe_alert
     <form method="get" class="filter">
       <input type="hidden" name="secret" value="$secret">
       <label>Symbol <input type="text" name="symbol" value="$symbol" placeholder="ex: BTCUSDT"></label>
@@ -625,11 +553,11 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
       </div>
     </form>
-    <form method="post" action="/reset" onsubmit="return confirm('Delete ALL events? This cannot be undone.');" style="margin-top:10px;">
-      <input type="hidden" name="secret" value="$secret">
+    <form method="post" action="/reset?secret=$secret"
+          onsubmit="return confirm('Delete ALL events? This cannot be undone.');"
+          style="margin-top:10px;">
       <button class="btn danger" type="submit">🧹 Delete all (reset)</button>
     </form>
-    $reset_msg
   </div>
 
   <div class="card">
@@ -659,7 +587,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       </tr></thead>
       <tbody>$rows_html</tbody>
     </table>
-    <div class="note">Showing up to $limit trades (grouped by trade_id).</div>
+    <div class="muted">Showing up to $limit trades (grouped by trade_id).</div>
   </div>
 </div>
 
@@ -738,7 +666,7 @@ def index(secret: Optional[str] = Query(None)):
         ("DEBUG", str(bool(DEBUG_MODE))),
         ("TELEGRAM_STYLE", TELEGRAM_STYLE),
     ]
-    trs = "".join([f"<tr><td>{k}</td><td>{(str(v))}</td></tr>" for (k, v) in rows])
+    trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.substitute(rows_html=trs)
     return HTMLResponse(html)
 
@@ -805,29 +733,21 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         log.warning("Invalid secret on tv-webhook")
         raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # Ajout label TF si nécessaire
+    if "tf_label" not in payload or not payload.get("tf_label"):
+        payload["tf_label"] = tf_label_from(str(payload.get("tf") or ""))
+
     log.info("Webhook payload: %s", json.dumps(payload)[:500])
     save_event(payload)
 
-    # Telegram riche
+    # Telegram enrichi
     try:
         msg = build_telegram_message(payload)
-        if msg:
-            send_telegram(msg)
+        send_telegram(msg)
     except Exception as e:
         log.warning("Telegram build/send failed: %s", e)
 
     return {"ok": True}
-
-# -------- Reset (delete all) --------
-@app.post("/reset")
-def reset(secret: str = Form(...)):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM events")
-        conn.commit()
-    return RedirectResponse(url=f"/trades?secret={secret}&reset_ok=1", status_code=303)
 
 # -------- Trades JSON --------
 @app.get("/trades.json")
@@ -899,7 +819,7 @@ def trades(
             "<tr>"
             f"<td>{escape_html(str(tr['trade_id']))}</td>"
             f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
+            f"<td>{escape_html(tf_label_from(str(tr.get('tf') or '')))}</td>"
             f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
             f"<td>{fmt_num(tr.get('entry'))}</td>"
             f"<td>{fmt_num(tr.get('sl'))}</td>"
@@ -911,7 +831,7 @@ def trades(
             "</tr>"
         )
 
-    reset_msg = "<div class='note'>✅ Reset done.</div>" if reset_ok else ""
+    maybe_alert = '<div class="alert">✅ Reset OK — all events deleted.</div>' if reset_ok else ""
 
     html = TRADES_HTML_TPL.substitute(
         secret=escape_html(secret or ""),
@@ -930,9 +850,9 @@ def trades(
         avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
         best_win_streak=str(summary["best_win_streak"]),
         worst_loss_streak=str(summary["worst_loss_streak"]),
-        rows_html=rows_html or '<tr><td colspan="11" class="note">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
+        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
         spark_data=json.dumps(spark_values),
-        reset_msg=reset_msg
+        maybe_alert=maybe_alert
     )
     return HTMLResponse(html)
 
@@ -960,7 +880,7 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
             f"<td>{escape_html(fmt_time(r['received_at']))}</td>"
             f"<td>{escape_html(r['type'] or '')}</td>"
             f"<td>{escape_html(r['symbol'] or '')}</td>"
-            f"<td>{escape_html(r['tf'] or '')}</td>"
+            f"<td>{escape_html(tf_label_from(str(r['tf'] or '')))}</td>"
             f"<td>{escape_html(r['side'] or '')}</td>"
             f"<td>{escape_html(r['trade_id'] or '')}</td>"
             f"<td><pre style='white-space:pre-wrap;margin:0'>{escape_html(r['raw_json'] or '')}</pre></td>"
@@ -988,6 +908,17 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
+# -------- Reset (Delete all) --------
+@app.post("/reset")
+def reset(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events")
+        conn.commit()
+    return RedirectResponse(url=f"/trades?secret={secret}&reset_ok=1", status_code=303)
+
 # -------- Self test: insert a sample trade --------
 @app.get("/selftest")
 def selftest(secret: Optional[str] = Query(None)):
@@ -996,7 +927,7 @@ def selftest(secret: Optional[str] = Query(None)):
     tid = f"SELFTEST_{int(time.time())}"
     save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
     time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"tp":101.0,"trade_id":tid})
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid,"tp":101.0,"side":"LONG","entry":100.0})
     return {"ok": True, "trade_id": tid}
 
 # ============ Run local ============
