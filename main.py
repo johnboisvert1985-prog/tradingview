@@ -5,8 +5,8 @@ import time
 import sqlite3
 import logging
 from typing import Optional, Dict, Any, List, Tuple
-from string import Template
 from collections import defaultdict
+from string import Template
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -32,7 +32,7 @@ PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 
-# DB path default = data/data.db; fallback auto to /tmp if read-only
+# DB path default = data/data.db; fallback to /tmp if not writable
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
@@ -58,7 +58,7 @@ else:
 # SQLite (persistent)
 # -------------------------
 def resolve_db_path() -> None:
-    """Try to create directory for DB_PATH; if permission denied, fallback to /tmp/ai_trader/data.db."""
+    """Check DB dir is writable; else fallback to /tmp/ai_trader/data.db."""
     global DB_PATH
     d = os.path.dirname(DB_PATH) or "."
     try:
@@ -203,18 +203,6 @@ def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
         cur.execute(sql, tuple(args))
         return cur.fetchall()
 
-def find_entry_for_trade_id(tid: Optional[str]) -> Optional[sqlite3.Row]:
-    if not tid:
-        return None
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM events WHERE trade_id=? AND type='ENTRY' ORDER BY received_at ASC LIMIT 1",
-            (tid,),
-        )
-        row = cur.fetchone()
-        return row
-
 # -------------------------
 # Build trades & stats
 # -------------------------
@@ -326,7 +314,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (optional, with cooldown)
+# Telegram (with basic cooldown)
 # -------------------------
 def send_telegram(text: str) -> bool:
     global _last_tg
@@ -335,13 +323,16 @@ def send_telegram(text: str) -> bool:
     try:
         now = time.time()
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
-            return False  # avoid spam / 429
+            return False  # avoid spam/429
         _last_tg = now
 
         import urllib.request
         import urllib.parse
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text
+        }).encode()
         req = urllib.request.Request(api_url, data=data)
         with urllib.request.urlopen(req, timeout=10) as resp:
             _ = resp.read()
@@ -351,7 +342,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # -------------------------
-# HTML templates (ASCII only)
+# HTML templates (ASCII only to avoid unicode issues)
 # -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
@@ -422,10 +413,14 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
-        <form method="post" action="/admin/reset" style="display:inline" onsubmit="return confirm('Delete ALL events and reset stats?')">
-          <input type="hidden" name="secret" value="$secret">
-          <button class="btn" type="submit">Reset (delete all)</button>
-        </form>
+        <!-- Reset button: POST + query secret to avoid form parsing dependency -->
+        <button class="btn"
+                type="submit"
+                formmethod="post"
+                formaction="/admin/reset?secret=$secret"
+                onclick="return confirm('Delete ALL events and reset stats?')">
+          Reset (delete all)
+        </button>
       </div>
     </form>
   </div>
@@ -505,11 +500,10 @@ input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0
 """)
 
 # -------------------------
-# App
+# FastAPI app
 # -------------------------
 app = FastAPI(title="AI Trader PRO")
 
-# ---------- Utils ----------
 def escape_html(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
              .replace('"',"&quot;").replace("'","&#39;"))
@@ -521,129 +515,6 @@ def fmt_num(v) -> str:
         return s
     except Exception:
         return str(v or "")
-
-def prettify_symbol(sym: Optional[str]) -> str:
-    if not sym:
-        return "?"
-    s = str(sym)
-    for suf in (".P", ".PERP", ".F", ".SPOT", ".p", ".f"):
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-    quotes = ("USDT", "USDC", "BUSD", "USD", "EUR", "BTC", "ETH")
-    for q in quotes:
-        if s.endswith(q) and len(s) > len(q):
-            base = s[: -len(q)]
-            return f"{base}/{q}"
-    return s
-
-def tf_display(tf) -> str:
-    s = str(tf or "")
-    return (s + "m") if s.isdigit() else s
-
-def _tf_bucket_label(tf) -> str:
-    s = str(tf or "")
-    if s.isdigit():
-        mins = int(s)
-        if mins <= 5: return "Scalp"
-        if mins <= 15: return "MidTerm"
-        if mins <= 240: return "Intraday"
-    return "Swing"
-
-def fmt_pct(v) -> str:
-    try:
-        return f"{float(v):.2f}%"
-    except Exception:
-        return ""
-
-# ---------- Telegram formatter ----------
-def format_tg_from_payload(p: Dict[str, Any]) -> str:
-    # If Pine already includes text
-    for k in ("tg_text", "message"):
-        if p.get(k):
-            try:
-                return str(p[k])[:4096]
-            except Exception:
-                pass
-
-    t   = (p.get("type") or "EVENT").upper()
-    sym_raw = p.get("symbol") or "?"
-    sym = prettify_symbol(sym_raw)
-    tf  = tf_display(p.get("tf"))
-    bucket = _tf_bucket_label(p.get("tf"))
-    side = (p.get("side") or "").upper()
-
-    # ENTRY message (long & styled)
-    if t == "ENTRY":
-        entry = p.get("entry")
-        sl    = p.get("sl")
-        tp1   = p.get("tp1")
-        tp2   = p.get("tp2")
-        tp3   = p.get("tp3")
-        lev   = p.get("lev") or p.get("lev_reco")
-        conf  = p.get("confidence") or p.get("confidence_pct")
-
-        head  = f"📩 {sym} {tf} | {bucket}"
-        line2 = "📈 Long Entry Zone: " + (fmt_num(entry) if entry is not None else "—") if side == "LONG" \
-                else "📉 Short Entry Zone: " + (fmt_num(entry) if entry is not None else "—")
-        line3 = "🎯Niveau de confiance: " + (f"{float(conf):.2f}%" if conf is not None else "—")
-        levln = f" -  💡Leverage: {int(round(float(lev)))}x cross" if lev not in (None, "", 0) else ""
-
-        targets = []
-        if tp1 is not None: targets.append(f"Target 1 : {fmt_num(tp1)}")
-        if tp2 is not None: targets.append(f"Target 2 : {fmt_num(tp2)}")
-        if tp3 is not None: targets.append(f"Target 3 : {fmt_num(tp3)}")
-        targets.append("Target 5 : 🚀🚀🚀")
-
-        sl_line = f"❌Stop-Loss: {fmt_num(sl)}" if sl is not None else "❌Stop-Loss: —"
-        be_hint = "💡Après le premier TP1, vous mettez SLBE."
-
-        blocks = [
-            head,
-            line2,
-            line3,
-            "",
-            levln if levln else None,
-            "\n".join([t for t in targets if t]),
-            "_",
-            sl_line,
-            be_hint,
-        ]
-        msg = "\n".join([b for b in blocks if b])
-        return msg[:4096]
-
-    # TP / SL messages
-    if t in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"):
-        tag = {"TP1_HIT":"№1","TP2_HIT":"№2","TP3_HIT":"№3"}.get(t, "")
-        mark = p.get("entry") or p.get("price") or p.get("close")
-        entry_row = find_entry_for_trade_id(p.get("trade_id"))
-        entry_price = entry_row["entry"] if entry_row and entry_row["entry"] is not None else None
-        side = (p.get("side") or "").upper()
-        pct_txt = ""
-        if entry_price is not None and mark not in (None, "") and side in ("LONG", "SHORT"):
-            try:
-                mark_f  = float(mark)
-                ent_f   = float(entry_price)
-                move    = (mark_f - ent_f) / ent_f * 100.0
-                if side == "SHORT":
-                    move = -move
-                pct_txt = f"\nProfit - {move:.2f}%"
-            except Exception:
-                pct_txt = ""
-
-        if t == "SL_HIT":
-            return (f"#{sym}\n❌ Stop-Loss hit\nMark price - {fmt_num(mark)}").strip()[:4096]
-        return (f"#{sym}\nTarget {tag} - ✅\nMark price - {fmt_num(mark)}{pct_txt}").strip()[:4096]
-
-    # AOE zones
-    if t == "AOE_PREMIUM":
-        up  = p.get("upper"); hi = p.get("hiWin"); cls = p.get("close")
-        return (f"🟥 Premium Zone touch\n{sym} {tf}\nRange: {fmt_num(hi)} → {fmt_num(up)}\nPrice: {fmt_num(cls)}")[:4096]
-    if t == "AOE_DISCOUNT":
-        lo  = p.get("lower"); lw = p.get("loWin"); cls = p.get("close")
-        return (f"🟩 Discount Zone touch\n{sym} {tf}\nRange: {fmt_num(lw)} → {fmt_num(lo)}\nPrice: {fmt_num(cls)}")[:4096]
-
-    # fallback
-    return f"[TV] {t} | {sym_raw} | TF {tf}"[:4096]
 
 # -------- Health / Ping --------
 @app.get("/ping")
@@ -740,11 +611,18 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
+    # Lightweight Telegram ping (for full custom messages, format in Pine and send as 'tele_msg')
     try:
-        tg_msg = format_tg_from_payload(payload)
-        send_telegram(tg_msg)
-    except Exception as e:
-        log.warning("format/send telegram failed: %s", e)
+        custom_text = payload.get("tele_msg")
+        if custom_text:
+            send_telegram(custom_text)
+        else:
+            t = payload.get("type", "EVENT")
+            sym = payload.get("symbol", "?")
+            tf = payload.get("tf", "?")
+            send_telegram(f"[TV] {t} | {sym} | TF {tf}")
+    except Exception:
+        pass
 
     return {"ok": True}
 
@@ -898,30 +776,33 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
-# -------- Alias /trades/secret=... --------
-@app.get("/trades/secret={secret}")
-def trades_alias(secret: str):
-    return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
-
-# -------- Admin: reset DB (POST) --------
+# -------- Admin reset (POST button) --------
 @app.post("/admin/reset")
-async def admin_reset(request: Request, secret: Optional[str] = Query(None)):
-    form_secret = None
-    try:
-        form = await request.form()
-        form_secret = form.get("secret")
-    except Exception:
-        pass
-    eff_secret = secret or form_secret
-    if WEBHOOK_SECRET and eff_secret != WEBHOOK_SECRET:
+def admin_reset(secret: Optional[str] = Query(None)):
+    # secret is passed in the query by the form button; avoids form parsing dependency
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM events")
         conn.commit()
-    # redirect back to trades
-    to = f"/trades?secret={eff_secret or ''}"
-    return RedirectResponse(url=to, status_code=303)
+    return RedirectResponse(url=f"/trades?secret={secret or ''}", status_code=303)
+
+# -------- Admin reset (GET alias) --------
+@app.get("/admin/reset")
+def admin_reset_get(secret: Optional[str] = Query(None)):
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM events")
+        conn.commit()
+    return RedirectResponse(url=f"/trades?secret={secret or ''}", status_code=303)
+
+# -------- Alias /trades/secret=... --------
+@app.get("/trades/secret={secret}")
+def trades_alias(secret: str):
+    return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
 # -------- Self test: insert a sample trade --------
 @app.get("/selftest")
@@ -931,7 +812,7 @@ def selftest(secret: Optional[str] = Query(None)):
     tid = f"SELFTEST_{int(time.time())}"
     save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
     time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","side":"LONG","entry":101.0,"trade_id":tid})
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid})
     return {"ok": True, "trade_id": tid}
 
 # ============ Run local ============
