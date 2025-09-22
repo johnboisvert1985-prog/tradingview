@@ -44,6 +44,7 @@ ALT_BTC_DOM_THR    = float(os.getenv("ALT_BTC_DOM_THR", "55.0"))
 ALT_ETH_BTC_THR    = float(os.getenv("ALT_ETH_BTC_THR", "0.045"))
 ALT_ASI_THR        = float(os.getenv("ALT_ASI_THR", "75.0"))
 ALT_TOTAL2_THR_T   = float(os.getenv("ALT_TOTAL2_THR_T", "1.78"))  # trillions
+ALT_CACHE_TTL      = int(os.getenv("ALT_CACHE_TTL", "120"))        # seconds
 
 # Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
@@ -365,7 +366,7 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700;letter-spacing:.2px}.grid{di
 @media(min-width:1200px){.grid{grid-template-columns:1fr 1fr 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 16px 8px 16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
-.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
+.btn{display:inline-block;padding:8px 12px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;border-radius:8px}
 .btn:hover{background:#0f1525}.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;margin-right:8px;background:var(--chip-bg)}.muted{color:var(--muted)}
 .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.cta-row{margin-top:10px}
 .kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed var(--border)}.kv:last-child{border-bottom:none}
@@ -406,9 +407,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 
 <script>
 (function(){
-  const qs = new URLSearchParams(window.location.search);
-  const secret = qs.get("secret"); // optionnel
-  const url = "/altseason/check" + (secret ? ("?secret=" + encodeURIComponent(secret)) : "");
+  const url = "/altseason/check";
   fetch(url).then(r=>r.json()).then(s=>{
     const dot = (ok)=> ok ? "dot ok" : "dot warn";
     const fmtT = (usd)=> (usd/1e12).toFixed(2) + " T$";
@@ -505,7 +504,7 @@ if (canvas && data && data.length > 0) {
   function y(v){ return H - pad - (v-0)*(H-2*pad)/(1-0); }
   ctx.lineWidth=2; ctx.strokeStyle='#3b82f6'; ctx.beginPath();
   for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); } ctx.stroke();
-  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.MoveTo=ctx.moveTo; ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 </script>
 </body></html>
@@ -658,9 +657,10 @@ def index():
         ("ALT_ETH_BTC_THR", str(ALT_ETH_BTC_THR)),
         ("ALT_ASI_THR", str(ALT_ASI_THR)),
         ("ALT_TOTAL2_THR_T", str(ALT_TOTAL2_THR_T)),
+        ("ALT_CACHE_TTL", str(ALT_CACHE_TTL)),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
-    html = INDEX_HTML_TPL.safe_substitute(  # << safe_substitute pour éviter ValueError
+    html = INDEX_HTML_TPL.safe_substitute(
         rows_html=trs,
         btc_thr=str(int(ALT_BTC_DOM_THR)),
         eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
@@ -693,7 +693,8 @@ def env_sanity(secret: Optional[str] = Query(None)):
             "ALT_BTC_DOM_THR": ALT_BTC_DOM_THR,
             "ALT_ETH_BTC_THR": ALT_ETH_BTC_THR,
             "ALT_ASI_THR": ALT_ASI_THR,
-            "ALT_TOTAL2_THR_T": ALT_TOTAL2_THR_T
+            "ALT_TOTAL2_THR_T": ALT_TOTAL2_THR_T,
+            "ALT_CACHE_TTL": ALT_CACHE_TTL,
         }
     }
 
@@ -727,13 +728,25 @@ def openai_health(secret: Optional[str] = Query(None)):
 def _status(val: float, thr: float, direction: str) -> bool:
     return (val < thr) if direction == "below" else (val > thr)
 
+# Cache en mémoire pour altseason
+_alt_cache: Dict[str, Any] = {"ts": 0, "snap": None}
+
+def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
+    now = time.time()
+    if (not force) and _alt_cache["snap"] and (now - _alt_cache["ts"] < ALT_CACHE_TTL):
+        return _alt_cache["snap"]
+    snap = _altseason_fetch()
+    _alt_cache["snap"] = snap
+    _alt_cache["ts"] = now
+    return snap
+
 def _altseason_fetch() -> Dict[str, Any]:
     out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     try:
         import requests  # lazy import
     except Exception:
         raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
-    headers = {"User-Agent": "altseason-bot/1.1"}
+    headers = {"User-Agent": "altseason-bot/1.2"}
 
     def get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
         r = requests.get(url, headers=headers, timeout=timeout)
@@ -745,8 +758,11 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception:
             raise RuntimeError(f"{url} -> Non-JSON response: {body_preview}")
 
-    # Global market cap + BTC dominance (Coingecko -> Paprika)
-    mcap_usd = btc_dom = None; cg_err = cp_err = None
+    # === Global market cap & BTC dominance ===
+    mcap_usd = btc_dom = None
+    cg_err = cp_err = cc_err = None
+
+    # 1) CoinGecko
     try:
         g = get_json("https://api.coingecko.com/api/v3/global")
         data = g.get("data") or {}
@@ -754,6 +770,8 @@ def _altseason_fetch() -> Dict[str, Any]:
         btc_dom  = float(data["market_cap_percentage"]["btc"])
     except Exception as e:
         cg_err = e
+
+    # 2) CoinPaprika
     if mcap_usd is None or btc_dom is None:
         try:
             pg = get_json("https://api.coinpaprika.com/v1/global")
@@ -761,39 +779,89 @@ def _altseason_fetch() -> Dict[str, Any]:
             btc_dom  = float(pg["bitcoin_dominance_percentage"])
         except Exception as e:
             cp_err = e
-    if mcap_usd is None or btc_dom is None:
-        raise HTTPException(status_code=502, detail=f"Global fetch failed (CG: {cg_err}; Paprika: {cp_err})")
 
-    out["total_mcap_usd"] = mcap_usd
-    out["btc_dominance"]  = btc_dom
+    # 3) CoinCap fallback (agrégation locale)
+    if mcap_usd is None or btc_dom is None:
+        try:
+            cc = get_json("https://api.coincap.io/v2/assets?limit=2000")
+            assets = cc.get("data") or []
+            total = 0.0
+            btc_mcap = 0.0
+            for a in assets:
+                mc = a.get("marketCapUsd")
+                if mc is not None:
+                    try:
+                        total += float(mc)
+                    except Exception:
+                        pass
+            for a in assets:
+                if a.get("id") == "bitcoin":
+                    try:
+                        btc_mcap = float(a.get("marketCapUsd") or 0.0)
+                    except Exception:
+                        btc_mcap = 0.0
+                    break
+            if total > 0:
+                mcap_usd = total
+                btc_dom = (btc_mcap / total) * 100.0
+        except Exception as e:
+            cc_err = e
+
+    if mcap_usd is None or btc_dom is None:
+        raise HTTPException(status_code=502, detail=f"Global fetch failed (CG: {cg_err}; Paprika: {cp_err}; CoinCap: {cc_err})")
+
+    out["total_mcap_usd"] = float(mcap_usd)
+    out["btc_dominance"]  = float(btc_dom)
     out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
 
-    # ETH/BTC (Coingecko -> Paprika -> USD ratio)
-    eth_btc = None; cg2_err = cp2_err = None
+    # === ETH/BTC ===
+    eth_btc = None
+    cg2_err = cp2_err = cc2_err = bin_err = None
+
+    # 1) CoinGecko simple price
     try:
         sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
         eth_btc = float(sp["ethereum"]["btc"])
     except Exception as e:
         cg2_err = e
+
+    # 2) CoinPaprika ticker
     if eth_btc is None:
         try:
             tkr = get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum?quotes=BTC")
             eth_btc = float(tkr["quotes"]["BTC"]["price"])
         except Exception as e:
             cp2_err = e
+
+    # 3) CoinCap ratio (USD -> ratio)
     if eth_btc is None:
         try:
-            eth_usd = float(get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum")["quotes"]["USD"]["price"])
-            btc_usd = float(get_json("https://api.coinpaprika.com/v1/tickers/btc-bitcoin")["quotes"]["USD"]["price"])
+            cc_eth = get_json("https://api.coincap.io/v2/assets/ethereum")
+            cc_btc = get_json("https://api.coincap.io/v2/assets/bitcoin")
+            eth_usd = float(cc_eth["data"]["priceUsd"])
+            btc_usd = float(cc_btc["data"]["priceUsd"])
             eth_btc = eth_usd / btc_usd
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"ETH/BTC fetch failed (CG: {cg2_err}; Paprika: {cp2_err}; USD fallback: {e})")
+            cc2_err = e
+
+    # 4) Binance public (au cas où)
+    if eth_btc is None:
+        try:
+            j = get_json("https://api.binance.com/api/v3/ticker/price?symbol=ETHBTC")
+            eth_btc = float(j["price"])
+        except Exception as e:
+            bin_err = e
+
+    if eth_btc is None:
+        raise HTTPException(status_code=502, detail=f"ETH/BTC fetch failed (CG: {cg2_err}; Paprika: {cp2_err}; CoinCap: {cc2_err}; Binance: {bin_err})")
+
     out["eth_btc"] = float(eth_btc)
 
-    # Altseason Index (scrape best-effort)
+    # === Altseason Index (best-effort) ===
     out["altseason_index"] = None
     try:
         from bs4 import BeautifulSoup  # lazy import
+        import requests
         html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=15, headers=headers).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
@@ -830,10 +898,10 @@ def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
         "greens": greens, "ALTSEASON_ON": on
     }
 
-# PUBLIC: lecture seule
+# PUBLIC: lecture (avec cache)
 @app.get("/altseason/check")
 def altseason_check_public():
-    snap = _altseason_fetch()
+    snap = _altseason_snapshot(force=False)
     return _altseason_summary(snap)
 
 # GET+POST: notify (PROTÉGÉ)
@@ -856,7 +924,7 @@ async def altseason_notify(request: Request,
         force = bool(body.get("force", force))
         message = body.get("message", message)
 
-    s = _altseason_summary(_altseason_fetch())
+    s = _altseason_summary(_altseason_snapshot(force=bool(force)))
     sent = None
     if s["ALTSEASON_ON"] or force:
         msg = message or f"[Altseason] {s['asof']} — Greens={s['greens']} — ALTSEASON_ON={'YES' if s['ALTSEASON_ON'] else 'NO'}"
@@ -868,7 +936,6 @@ async def altseason_notify(request: Request,
 # -------------------------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
-    # lire d'abord le JSON pour récupérer "secret" éventuel
     try:
         payload = await request.json()
         if not isinstance(payload, dict):
