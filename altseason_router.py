@@ -1,6 +1,4 @@
-
 # altseason_router.py
-# APIRouter version for clean integration into your existing FastAPI main.py
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
