@@ -31,11 +31,13 @@ CONFIDENCE_MIN     = float(os.getenv("CONFIDENCE_MIN", "0.0") or 0.0)
 PORT               = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL   = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT           = float(os.getenv("RISK_PCT", "1.0") or 1.0)
+
+# DB path default = data/data.db; fallback auto to /tmp if read-only
 DB_PATH            = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE         = os.getenv("DEBUG", "0") in ("1", "true", "True")
-TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
-TELEGRAM_STYLE     = os.getenv("TELEGRAM_STYLE", "rich").lower().strip()  # rich | plain
 
+# Telegram rate limit helper
+TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
 _last_tg = 0.0
 
 # -------------------------
@@ -62,7 +64,7 @@ def resolve_db_path() -> None:
     try:
         os.makedirs(d, exist_ok=True)
         probe = os.path.join(d, ".write_test")
-        with open(probe, "w") as f:
+        with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe)
         log.info("DB dir OK: %s (using %s)", d, DB_PATH)
@@ -151,7 +153,7 @@ def save_event(payload: Dict[str, Any]) -> None:
              row["type"], row["symbol"], row["tf"], row["trade_id"])
 
 # -------------------------
-# Helpers
+# Helpers: format / tf / math
 # -------------------------
 def escape_html(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -164,6 +166,53 @@ def fmt_num(v) -> str:
         return s
     except Exception:
         return str(v or "")
+
+def tf_label_of(payload: Dict[str, Any]) -> str:
+    label = str(payload.get("tf_label") or payload.get("tf") or "?")
+    try:
+        if label.isdigit():
+            n = int(label)
+            if n < 60:
+                return f"{n}m"
+            if n % 60 == 0 and n < 1440:
+                return f"{n//60}h"
+            if n == 1440:
+                return "1D"
+    except Exception:
+        pass
+    return label
+
+def pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    try:
+        if a is None or b is None or b == 0:
+            return None
+        return (a - b) / b * 100.0
+    except Exception:
+        return None
+
+def parse_leverage_x(leverage: Optional[str]) -> Optional[float]:
+    # e.g. "20x cross" -> 20.0
+    if not leverage:
+        return None
+    try:
+        s = leverage.lower().replace("x"," ").split()
+        for token in s:
+            if token.replace(".","",1).isdigit():
+                return float(token)
+    except Exception:
+        return None
+    return None
+
+# -------------------------
+# Build trades & stats
+# -------------------------
+class TradeOutcome:
+    NONE  = "NONE"
+    TP1   = "TP1_HIT"
+    TP2   = "TP2_HIT"
+    TP3   = "TP3_HIT"
+    SL    = "SL_HIT"
+    CLOSE = "CLOSE"    # neutral outcome
 
 def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
     if not date_str:
@@ -186,34 +235,6 @@ def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
         return int(dtobj.timestamp())
     except Exception:
         return None
-
-def tf_label_from(tf: Optional[str], default: str = "") -> str:
-    if not tf:
-        return default
-    s = str(tf).upper().strip()
-    # Pine envoie souvent "15" etc., parfois "1D"
-    if s.isdigit():
-        m = int(s)
-        if m < 60:
-            return f"{m}m"
-        if m % 60 == 0:
-            h = m // 60
-            return f"{h}h"
-        return f"{m}m"
-    # mots-clés
-    mapping = {"1D":"1D","3D":"3D","1W":"1W","1M":"1M","D":"1D","W":"1W","M":"1M","60":"1h","240":"4h"}
-    return mapping.get(s, s)
-
-# -------------------------
-# Build trades & stats
-# -------------------------
-class TradeOutcome:
-    NONE  = "NONE"
-    TP1   = "TP1_HIT"
-    TP2   = "TP2_HIT"
-    TP3   = "TP3_HIT"
-    SL    = "SL_HIT"
-    CLOSE = "CLOSE"    # neutral outcome
 
 def fetch_events_filtered(symbol: Optional[str], tf: Optional[str],
                           start_ep: Optional[int], end_ep: Optional[int],
@@ -304,7 +325,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
                 win_streak = 0
-            # CLOSE = neutre
+            # CLOSE is neutral: no change to wins/losses/streaks
 
             trades.append(
                 {
@@ -341,7 +362,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
     return trades, summary
 
 # -------------------------
-# Telegram (cooldown + rich messages)
+# Telegram
 # -------------------------
 def send_telegram(text: str) -> bool:
     global _last_tg
@@ -350,8 +371,9 @@ def send_telegram(text: str) -> bool:
     try:
         now = time.time()
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
-            return False  # anti-429
+            return False  # avoid spam / 429
         _last_tg = now
+
         import urllib.request
         import urllib.parse
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -364,121 +386,82 @@ def send_telegram(text: str) -> bool:
         log.warning("Telegram send failed: %s", e)
         return False
 
-def _fmt_pct(v: Optional[float]) -> str:
-    if v is None:
-        return ""
-    try:
-        return f"{float(v):.2f}%"
-    except Exception:
-        return str(v)
+def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
+    """Build a rich Telegram message for ENTRY/TP/SL/CLOSE. Return None to skip."""
+    t = str(payload.get("type") or "EVENT").upper()
+    if t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
+        return None  # explicit suppression
 
-def build_rich_message(payload: Dict[str, Any]) -> str:
-    """
-    Messages riches FR, style demandé :
-    - ENTRY : 📩 SYMBOL TF | horizon
-             📈 Long/Short Entry Zone: entry
-             🎯 Niveau de confiance: 98.64%
-             - 💡Leverage: 20x cross
-             Target 1..3 + 🚀
-             ❌Stop-Loss: SL
-             💡Après le premier TP1, vous mettez SLBE.
-    - TPx/SL/CLOSE/ AOE_*
-    """
-    t = (payload.get("type") or "").upper()
-    sym = payload.get("symbol") or "?"
-    tf  = tf_label_from(str(payload.get("tf") or ""), payload.get("tf_label") or "")
-    side = (payload.get("side") or "").upper()
-    confidence = payload.get("confidence")  # number 0-100
-    horizon = payload.get("horizon") or ""  # "MidTerm"…
-    leverage = payload.get("leverage") or ""  # "20x cross"…
-    entry = payload.get("entry")
-    sl = payload.get("sl") or payload.get("stop") or payload.get("stoploss")
-    tp1 = payload.get("tp1") or payload.get("tp")
-    tp2 = payload.get("tp2")
-    tp3 = payload.get("tp3")
-
-    def fmt(v): return fmt_num(v)
+    sym = str(payload.get("symbol") or "?")
+    tf_lbl = tf_label_of(payload)
+    side = str(payload.get("side") or "")
+    entry = _to_float(payload.get("entry"))
+    sl = _to_float(payload.get("sl"))
+    tp = _to_float(payload.get("tp"))  # for TP/SL hits 'tp' carries the level hit
+    tp1 = _to_float(payload.get("tp1"))
+    tp2 = _to_float(payload.get("tp2"))
+    tp3 = _to_float(payload.get("tp3"))
+    conf = payload.get("confidence")
+    horizon = payload.get("horizon")
+    leverage = payload.get("leverage")
+    lev_x = parse_leverage_x(leverage)
 
     if t == "ENTRY":
-        arrow = "📈" if side == "LONG" else "📉"
-        pre = f"📩 {sym} {tf} | {horizon or '—'}"
-        lines = [
-            pre,
-            f"{arrow} {'Long' if side=='LONG' else 'Short'} Entry Zone: {fmt(entry)}",
-            f"🎯Niveau de confiance: {str(confidence) + '%' if confidence is not None else '—'}",
-        ]
+        # Example style (like you asked earlier)
+        lines = []
+        lines.append(f"📩 {sym} {tf_lbl} | {horizon or 'MidTerm'}")
+        if side:
+            lines.append(("📈 Long Entry:" if side.upper()=="LONG" else "📉 Short Entry:") + f" {fmt_num(entry)}")
+        if conf is not None:
+            try:
+                lines.append(f"🎯Niveau de confiance: {float(conf):.2f}%")
+            except Exception:
+                lines.append(f"🎯Niveau de confiance: {conf}")
         if leverage:
-            lines.append(f" -  💡Leverage: {leverage}")
-        if tp1: lines.append(f"Target 1 : {fmt(tp1)}")
-        if tp2: lines.append(f"Target 2 : {fmt(tp2)}")
-        if tp3: lines.append(f"Target 3 : {fmt(tp3)}")
-        # petit extra “Target 5 : 🚀🚀🚀”
-        lines.append("Target 5 : 🚀🚀🚀")
-        if sl:
-            lines.append(f"❌Stop-Loss: {fmt(sl)}")
-        lines.append("💡Après le premier TP1, vous mettez SLBE.")
+            lines.append(f"💡Leverage: {leverage}")
+        if tp1: lines.append(f"Target 1 : {fmt_num(tp1)}")
+        if tp2: lines.append(f"Target 2 : {fmt_num(tp2)}")
+        if tp3: lines.append(f"Target 3 : {fmt_num(tp3)}")
+        if sl:  lines.append(f"❌Stop-Loss: {fmt_num(sl)}")
+        lines.append("💡Apres le premier TP1, mettez SLBE.")
         return "\n".join(lines)
 
-    if t in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-        mapn = {"TP1_HIT":"1","TP2_HIT":"2","TP3_HIT":"3"}
-        n = mapn.get(t, "?")
-        txt = [
-            f"✅ TP{n} atteint",
-            f"{sym} {tf} | {side or '—'}",
-        ]
-        if entry: txt.append(f"Entrée: {fmt(entry)}")
-        if payload.get("tp"): txt.append(f"TP{n}: {fmt(payload.get('tp'))}")
-        return "\n".join(txt)
+    if t in {"TP1_HIT","TP2_HIT","TP3_HIT"}:
+        # Profit calculation if entry is present
+        spot_pct = pct(tp, entry) if (side and tp is not None and entry is not None) else None
+        lev_pct = (spot_pct * lev_x) if (spot_pct is not None and lev_x) else None
+        label = {"TP1_HIT":"Target #1","TP2_HIT":"Target #2","TP3_HIT":"Target #3"}[t]
+        lines = []
+        lines.append(f"✅ {label} - {sym} {tf_lbl}")
+        if tp is not None:
+            lines.append(f"Mark price - {fmt_num(tp)}")
+        if spot_pct is not None:
+            base = f"Profit (spot) - {spot_pct:.2f}%"
+            if lev_pct is not None:
+                base += f"  |  with {int(lev_x)}x: {lev_pct:.2f}%"
+            lines.append(base)
+        return "\n".join(lines)
 
     if t == "SL_HIT":
-        txt = [
-            "🛑 Stop-Loss touché",
-            f"{sym} {tf} | {side or '—'}",
-        ]
-        if entry: txt.append(f"Entrée: {fmt(entry)}")
-        if sl: txt.append(f"SL: {fmt(sl)}")
-        return "\n".join(txt)
+        lines = []
+        lines.append(f"🟥 Stop-Loss - {sym} {tf_lbl}")
+        if tp is not None:
+            lines.append(f"Filled at - {fmt_num(tp)}")
+        return "\n".join(lines)
 
     if t == "CLOSE":
-        reason = payload.get("reason") or "Signal de clôture"
-        return f"🔔 CLOSE\n{sym} {tf}\nRaison: {reason}"
+        lines = []
+        lines.append(f"🔔 Close - {sym} {tf_lbl}")
+        reason = payload.get("reason")
+        if reason:
+            lines.append(f"Reason: {reason}")
+        return "\n".join(lines)
 
-    if t == "AOE_PREMIUM":
-        hi = payload.get("hiWin")
-        up = payload.get("upper")
-        cl = payload.get("close")
-        return (
-            f"🟥 AOE PREMIUM\n"
-            f"• Symbol: {sym}\n• TF: {tf}\n"
-            f"• HiWindow: {fmt(hi)}\n• Upper: {fmt(up)}\n• Close: {fmt(cl)}"
-        )
-
-    if t == "AOE_DISCOUNT":
-        lo = payload.get("loWin")
-        low = payload.get("lower")
-        cl = payload.get("close")
-        return (
-            f"🟩 AOE DISCOUNT\n"
-            f"• Symbol: {sym}\n• TF: {tf}\n"
-            f"• LoWindow: {fmt(lo)}\n• Lower: {fmt(low)}\n• Close: {fmt(cl)}"
-        )
-
-    # fallback simple
-    return f"[TV] {t} | {sym} | TF {tf}"
-
-def build_plain_message(payload: Dict[str, Any]) -> str:
-    t = payload.get("type", "EVENT")
-    sym = payload.get("symbol", "?")
-    tf  = tf_label_from(str(payload.get("tf") or ""), payload.get("tf_label") or "")
-    return f"[TV] {t} | {sym} | TF {tf}"
-
-def build_telegram_message(payload: Dict[str, Any]) -> str:
-    if TELEGRAM_STYLE == "plain":
-        return build_plain_message(payload)
-    return build_rich_message(payload)
+    # default fallback for unknown allowed events
+    return f"[TV] {t} | {sym} | TF {tf_lbl}"
 
 # -------------------------
-# HTML templates
+# HTML templates (ASCII only)
 # -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
@@ -531,14 +514,12 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:600;margin-right:8px}
-.btn:hover{background:#0f1525}.btn.danger{border-color:#5c1e1e;color:#ef4444}.alert{background:#0b1220;border:1px solid #0f5132;color:#10b981;border-radius:10px;padding:10px;margin-bottom:10px}
-.spark{width:100%;height:60px}
+.btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
   <div class="card">
     <div class="title">Filters</div>
-    $maybe_alert
     <form method="get" class="filter">
       <input type="hidden" name="secret" value="$secret">
       <label>Symbol <input type="text" name="symbol" value="$symbol" placeholder="ex: BTCUSDT"></label>
@@ -551,12 +532,8 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         <a class="btn" href="/trades.csv?secret=$secret&symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Export CSV</a>
         <a class="btn" href="/events?secret=$secret">Raw events</a>
         <a class="btn" href="/selftest?secret=$secret">Self test</a>
+        <a class="btn" href="/reset?secret=$secret&confirm=yes&redirect=/trades?secret=$secret" onclick="return confirm('Delete ALL events? This cannot be undone.');">Reset (Delete All)</a>
       </div>
-    </form>
-    <form method="post" action="/reset?secret=$secret"
-          onsubmit="return confirm('Delete ALL events? This cannot be undone.');"
-          style="margin-top:10px;">
-      <button class="btn danger" type="submit">🧹 Delete all (reset)</button>
     </form>
   </div>
 
@@ -664,7 +641,6 @@ def index(secret: Optional[str] = Query(None)):
         ("RISK_PCT", str(RISK_PCT)),
         ("DB_PATH", DB_PATH),
         ("DEBUG", str(bool(DEBUG_MODE))),
-        ("TELEGRAM_STYLE", TELEGRAM_STYLE),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.substitute(rows_html=trs)
@@ -690,7 +666,6 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "RISK_PCT": RISK_PCT,
         "DB_PATH": DB_PATH,
         "DEBUG": DEBUG_MODE,
-        "TELEGRAM_STYLE": TELEGRAM_STYLE,
     }
 
 # -------- Telegram health --------
@@ -733,19 +708,16 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
         log.warning("Invalid secret on tv-webhook")
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # Ajout label TF si nécessaire
-    if "tf_label" not in payload or not payload.get("tf_label"):
-        payload["tf_label"] = tf_label_from(str(payload.get("tf") or ""))
-
-    log.info("Webhook payload: %s", json.dumps(payload)[:500])
+    log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
-    # Telegram enrichi
+    # Telegram: only for trading events (no AOE)
     try:
-        msg = build_telegram_message(payload)
-        send_telegram(msg)
-    except Exception as e:
-        log.warning("Telegram build/send failed: %s", e)
+        msg = telegram_rich_message(payload)
+        if msg:
+            send_telegram(msg)
+    except Exception:
+        pass
 
     return {"ok": True}
 
@@ -798,8 +770,7 @@ def trades(
     tf: Optional[str] = Query(None),
     start: Optional[str] = Query(None),
     end: Optional[str] = Query(None),
-    limit: int = Query(100),
-    reset_ok: Optional[int] = Query(None)
+    limit: int = Query(100)
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
@@ -819,7 +790,7 @@ def trades(
             "<tr>"
             f"<td>{escape_html(str(tr['trade_id']))}</td>"
             f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-            f"<td>{escape_html(tf_label_from(str(tr.get('tf') or '')))}</td>"
+            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
             f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
             f"<td>{fmt_num(tr.get('entry'))}</td>"
             f"<td>{fmt_num(tr.get('sl'))}</td>"
@@ -830,8 +801,6 @@ def trades(
             f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
             "</tr>"
         )
-
-    maybe_alert = '<div class="alert">✅ Reset OK — all events deleted.</div>' if reset_ok else ""
 
     html = TRADES_HTML_TPL.substitute(
         secret=escape_html(secret or ""),
@@ -851,8 +820,7 @@ def trades(
         best_win_streak=str(summary["best_win_streak"]),
         worst_loss_streak=str(summary["worst_loss_streak"]),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values),
-        maybe_alert=maybe_alert
+        spark_data=json.dumps(spark_values)
     )
     return HTMLResponse(html)
 
@@ -880,7 +848,7 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
             f"<td>{escape_html(fmt_time(r['received_at']))}</td>"
             f"<td>{escape_html(r['type'] or '')}</td>"
             f"<td>{escape_html(r['symbol'] or '')}</td>"
-            f"<td>{escape_html(tf_label_from(str(r['tf'] or '')))}</td>"
+            f"<td>{escape_html(r['tf'] or '')}</td>"
             f"<td>{escape_html(r['side'] or '')}</td>"
             f"<td>{escape_html(r['trade_id'] or '')}</td>"
             f"<td><pre style='white-space:pre-wrap;margin:0'>{escape_html(r['raw_json'] or '')}</pre></td>"
@@ -908,16 +876,22 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades?secret={secret}", status_code=307)
 
-# -------- Reset (Delete all) --------
-@app.post("/reset")
-def reset(secret: Optional[str] = Query(None)):
+# -------- Reset (GET, no python-multipart needed) --------
+@app.get("/reset")
+def reset_all(secret: Optional[str] = Query(None),
+              confirm: Optional[str] = Query(None),
+              redirect: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
+    if confirm not in ("yes","true","1","YES","True"):
+        return {"ok": False, "error": "Confirmation required: add &confirm=yes"}
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM events")
         conn.commit()
-    return RedirectResponse(url=f"/trades?secret={secret}&reset_ok=1", status_code=303)
+    if redirect:
+        return RedirectResponse(url=redirect, status_code=303)
+    return {"ok": True, "deleted": "all"}
 
 # -------- Self test: insert a sample trade --------
 @app.get("/selftest")
@@ -927,7 +901,7 @@ def selftest(secret: Optional[str] = Query(None)):
     tid = f"SELFTEST_{int(time.time())}"
     save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
     time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","trade_id":tid,"tp":101.0,"side":"LONG","entry":100.0})
+    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"tp":101.0,"trade_id":tid})
     return {"ok": True, "trade_id": tid}
 
 # ============ Run local ============
