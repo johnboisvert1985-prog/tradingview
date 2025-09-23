@@ -49,6 +49,31 @@ ALT_CACHE_TTL      = int(os.getenv("ALT_CACHE_TTL", "120"))        # seconds
 # Epinglage par défaut des alertes altseason
 TELEGRAM_PIN_ALTSEASON = os.getenv("TELEGRAM_PIN_ALTSEASON", "0") in ("1", "true", "True")
 
+# --- Altseason file cache helpers (dernier snapshot connu) ---
+def _alt_cache_file_path() -> str:
+    return os.getenv("ALT_CACHE_FILE", "/tmp/altseason_last.json")
+
+def _load_last_snapshot() -> Optional[Dict[str, Any]]:
+    try:
+        p = _alt_cache_file_path()
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+        return snap if isinstance(snap, dict) else None
+    except Exception:
+        return None
+
+def _save_last_snapshot(snap: Dict[str, Any]) -> None:
+    try:
+        p = _alt_cache_file_path()
+        d = os.path.dirname(p) or "/tmp"
+        os.makedirs(d, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+    except Exception:
+        pass
+
 # Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
 _last_tg = 0.0
@@ -497,7 +522,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
         if (!(k in s)) throw new Error("Missing key: " + k);
       }
 
-      setText("alt-asof", "As of " + (s.asof || "now"));
+      setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
 
       const btc = num(s.btc_dominance);
       const eth = num(s.eth_btc);
@@ -641,7 +666,7 @@ if (canvas && data && data.length > 0) {
       const need = ["btc_dominance","eth_btc","total2_usd","triggers"];
       for (const k of need){ if (!(k in s)) throw new Error("Missing key: " + k); }
 
-      setText("alt-asof", "As of " + (s.asof || "now"));
+      setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
 
       const btc = num(s.btc_dominance);
       const eth = num(s.eth_btc);
@@ -900,23 +925,55 @@ def _status(val: float, thr: float, direction: str) -> bool:
 _alt_cache: Dict[str, Any] = {"ts": 0, "snap": None}
 
 def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
+    """
+    Retourne tjrs un dict. Si toutes les sources échouent,
+    on renvoie le dernier snapshot mémoire ou disque, marqué stale=True.
+    """
     now = time.time()
     if (not force) and _alt_cache["snap"] and (now - _alt_cache["ts"] < ALT_CACHE_TTL):
-        return _alt_cache["snap"]
-    snap = _altseason_fetch()
-    _alt_cache["snap"] = snap
-    _alt_cache["ts"] = now
-    return snap
+        snap = dict(_alt_cache["snap"])
+        snap.setdefault("stale", False)
+        return snap
+
+    try:
+        snap = _altseason_fetch()  # peut contenir errors[], mais ne jette plus
+        snap["stale"] = False
+        _alt_cache["snap"] = snap
+        _alt_cache["ts"] = now
+        _save_last_snapshot(snap)
+        return snap
+    except Exception as e:
+        # fallback mémoire
+        if _alt_cache["snap"]:
+            s = dict(_alt_cache["snap"])
+            s["stale"] = True
+            s.setdefault("errors", []).append(f"live_fetch_exception: {e!r}")
+            return s
+        # fallback disque
+        disk = _load_last_snapshot()
+        if isinstance(disk, dict):
+            disk = dict(disk)
+            disk["stale"] = True
+            disk.setdefault("errors", []).append(f"live_fetch_exception: {e!r}")
+            return disk
+        # rien: snapshot minimal pour éviter 502
+        return {
+            "asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "btc_dominance": None, "eth_btc": None, "total2_usd": None, "altseason_index": None,
+            "errors": [f"live_fetch_exception: {e!r}"],
+            "stale": True,
+        }
 
 def _altseason_fetch() -> Dict[str, Any]:
-    out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "errors": []}
     try:
-        import requests  # lazy import
+        import requests
     except Exception:
-        raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
+        out["errors"].append("Missing dependency: requests")
+        return out
 
     headers = {
-        "User-Agent": "altseason-bot/1.4",
+        "User-Agent": "altseason-bot/1.5",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Connection": "close",
@@ -932,11 +989,9 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception:
             raise RuntimeError(f"{url} -> Non-JSON response: {body_preview}")
 
-    # === Global market cap & BTC dominance ===
+    # ===== Global mcap & BTC dominance =====
     mcap_usd = btc_dom = None
-    alt_err = cg_err = cp_err = cc_err = cl_err = None
 
-    # 0) Alternative.me
     try:
         alt = get_json("https://api.alternative.me/v2/global/")
         d0 = (alt.get("data") or [{}])[0]
@@ -944,12 +999,10 @@ def _altseason_fetch() -> Dict[str, Any]:
         mcap = qusd.get("total_market_cap")
         dom = d0.get("bitcoin_percentage_of_market_cap")
         if mcap is not None and dom is not None:
-            mcap_usd = float(mcap)
-            btc_dom = float(dom)
+            mcap_usd = float(mcap); btc_dom = float(dom)
     except Exception as e:
-        alt_err = repr(e)
+        out["errors"].append(f"alternative.me: {e!r}")
 
-    # 1) CoinGecko
     if mcap_usd is None or btc_dom is None:
         try:
             g = get_json("https://api.coingecko.com/api/v3/global")
@@ -957,45 +1010,36 @@ def _altseason_fetch() -> Dict[str, Any]:
             mcap_usd = float(data["total_market_cap"]["usd"])
             btc_dom  = float(data["market_cap_percentage"]["btc"])
         except Exception as e:
-            cg_err = repr(e)
+            out["errors"].append(f"coingecko: {e!r}")
 
-    # 2) CoinPaprika
     if mcap_usd is None or btc_dom is None:
         try:
             pg = get_json("https://api.coinpaprika.com/v1/global")
             mcap_usd = float(pg["market_cap_usd"])
             btc_dom  = float(pg["bitcoin_dominance_percentage"])
         except Exception as e:
-            cp_err = repr(e)
+            out["errors"].append(f"coinpaprika: {e!r}")
 
-    # 3) CoinCap
     if mcap_usd is None or btc_dom is None:
         try:
             cc = get_json("https://api.coincap.io/v2/assets?limit=2000")
             assets = cc.get("data") or []
-            total = 0.0
-            btc_mcap = 0.0
+            total = 0.0; btc_mcap = 0.0
             for a in assets:
                 mc = a.get("marketCapUsd")
                 if mc is not None:
-                    try:
-                        total += float(mc)
-                    except Exception:
-                        pass
+                    try: total += float(mc)
+                    except: pass
             for a in assets:
                 if a.get("id") == "bitcoin":
-                    try:
-                        btc_mcap = float(a.get("marketCapUsd") or 0.0)
-                    except Exception:
-                        btc_mcap = 0.0
+                    try: btc_mcap = float(a.get("marketCapUsd") or 0.0)
+                    except: btc_mcap = 0.0
                     break
             if total > 0:
-                mcap_usd = total
-                btc_dom = (btc_mcap / total) * 100.0
+                mcap_usd = total; btc_dom = (btc_mcap / total) * 100.0
         except Exception as e:
-            cc_err = repr(e)
+            out["errors"].append(f"coincap: {e!r}")
 
-    # 4) Coinlore (fallback)
     if mcap_usd is None or btc_dom is None:
         try:
             cl = get_json("https://api.coinlore.net/api/global/")
@@ -1003,51 +1047,35 @@ def _altseason_fetch() -> Dict[str, Any]:
             mcap = g.get("total_mcap_usd") or g.get("total_mcap") or g.get("mcap_total_usd")
             dom  = g.get("btc_d") or g.get("bitcoin_dominance_percentage") or g.get("btc_dominance")
             if mcap is not None and dom is not None:
-                mcap_usd = float(mcap)
-                btc_dom  = float(dom)
+                mcap_usd = float(mcap); btc_dom = float(dom)
         except Exception as e:
-            cl_err = repr(e)
+            out["errors"].append(f"coinlore: {e!r}")
 
-    if mcap_usd is None or btc_dom is None:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Global fetch failed "
-                f"(Alternative.me: {alt_err}; "
-                f"CG: {cg_err}; "
-                f"Paprika: {cp_err}; "
-                f"CoinCap: {cc_err}; "
-                f"Coinlore: {cl_err})"
-            )
-        )
+    out["total_mcap_usd"] = (None if mcap_usd is None else float(mcap_usd))
+    out["btc_dominance"]  = (None if btc_dom   is None else float(btc_dom))
+    out["total2_usd"]     = (None if (mcap_usd is None or btc_dom is None) else float(mcap_usd * (1.0 - btc_dom/100.0)))
 
-    out["total_mcap_usd"] = float(mcap_usd)
-    out["btc_dominance"]  = float(btc_dom)
-    out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
-
-    # === ETH/BTC (Binance en premier) ===
+    # ===== ETH/BTC =====
     eth_btc = None
-    bin_err = cg2_err = cp2_err = cc2_err = None
-
     try:
         j = get_json("https://api.binance.com/api/v3/ticker/price?symbol=ETHBTC")
         eth_btc = float(j["price"])
     except Exception as e:
-        bin_err = repr(e)
+        out["errors"].append(f"binance: {e!r}")
 
     if eth_btc is None:
         try:
             sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
             eth_btc = float(sp["ethereum"]["btc"])
         except Exception as e:
-            cg2_err = repr(e)
+            out["errors"].append(f"coingecko_simple: {e!r}")
 
     if eth_btc is None:
         try:
             tkr = get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum?quotes=BTC")
             eth_btc = float(tkr["quotes"]["BTC"]["price"])
         except Exception as e:
-            cp2_err = repr(e)
+            out["errors"].append(f"coinpaprika_ethbtc: {e!r}")
 
     if eth_btc is None:
         try:
@@ -1057,28 +1085,16 @@ def _altseason_fetch() -> Dict[str, Any]:
             btc_usd = float(cc_btc["data"]["priceUsd"])
             eth_btc = eth_usd / btc_usd
         except Exception as e:
-            cc2_err = repr(e)
+            out["errors"].append(f"coincap_ethbtc: {e!r}")
 
-    if eth_btc is None:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "ETH/BTC fetch failed "
-                f"(Binance: {bin_err}; CG: {cg2_err}; Paprika: {cp2_err}; CoinCap: {cc2_err})"
-            )
-        )
+    out["eth_btc"] = (None if eth_btc is None else float(eth_btc))
 
-    out["eth_btc"] = float(eth_btc)
-
-    # === Altseason Index (best-effort scraping) ===
+    # ===== Altseason Index (best-effort) =====
     out["altseason_index"] = None
     try:
-        from bs4 import BeautifulSoup  # lazy import
-        html = requests.get(
-            "https://www.blockchaincenter.net/altcoin-season-index/",
-            timeout=12,
-            headers=headers
-        ).text
+        from bs4 import BeautifulSoup
+        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/",
+                            timeout=12, headers=headers).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
@@ -1086,24 +1102,36 @@ def _altseason_fetch() -> Dict[str, Any]:
             v = int(m.group(1))
             if 0 <= v <= 100:
                 out["altseason_index"] = v
-    except Exception:
-        pass
+    except Exception as e:
+        out["errors"].append(f"altseason_index_scrape: {e!r}")
 
     return out
 
 def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
-    btc_ok = _status(float(snap["btc_dominance"]), ALT_BTC_DOM_THR, "below")
-    eth_ok = _status(float(snap["eth_btc"]), ALT_ETH_BTC_THR, "above")
-    t2_ok  = _status(float(snap["total2_usd"]), ALT_TOTAL2_THR_T * 1e12, "above")
-    asi    = snap.get("altseason_index")
-    asi_ok = (asi is not None) and _status(float(asi), ALT_ASI_THR, "above")
+    def _ok(val: Optional[float], thr: float, direction: str) -> bool:
+        if val is None: return False
+        return (val < thr) if direction == "below" else (val > thr)
+
+    btc = snap.get("btc_dominance")
+    eth = snap.get("eth_btc")
+    t2  = snap.get("total2_usd")
+    asi = snap.get("altseason_index")
+
+    btc_ok = _ok(btc, ALT_BTC_DOM_THR, "below")
+    eth_ok = _ok(eth, ALT_ETH_BTC_THR, "above")
+    t2_ok  = _ok(t2,  ALT_TOTAL2_THR_T * 1e12, "above")
+    asi_ok = (asi is not None) and _ok(float(asi), ALT_ASI_THR, "above")
+
     greens = sum([btc_ok, eth_ok, t2_ok, asi_ok])
     on     = greens >= 2
+
     return {
         "asof": snap.get("asof"),
-        "btc_dominance": float(snap["btc_dominance"]),
-        "eth_btc": float(snap["eth_btc"]),
-        "total2_usd": float(snap["total2_usd"]),
+        "stale": bool(snap.get("stale", False)),
+        "errors": snap.get("errors", []),
+        "btc_dominance": (None if btc is None else float(btc)),
+        "eth_btc": (None if eth is None else float(eth)),
+        "total2_usd": (None if t2  is None else float(t2)),
         "altseason_index": (None if asi is None else int(asi)),
         "thresholds": {
             "btc": ALT_BTC_DOM_THR, "eth_btc": ALT_ETH_BTC_THR, "asi": ALT_ASI_THR, "total2_trillions": ALT_TOTAL2_THR_T
