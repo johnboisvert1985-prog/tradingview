@@ -46,6 +46,9 @@ ALT_ASI_THR        = float(os.getenv("ALT_ASI_THR", "75.0"))
 ALT_TOTAL2_THR_T   = float(os.getenv("ALT_TOTAL2_THR_T", "1.78"))  # trillions
 ALT_CACHE_TTL      = int(os.getenv("ALT_CACHE_TTL", "120"))        # seconds
 
+# Epinglage par défaut des alertes altseason
+TELEGRAM_PIN_ALTSEASON = os.getenv("TELEGRAM_PIN_ALTSEASON", "0") in ("1", "true", "True")
+
 # Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
 _last_tg = 0.0
@@ -332,6 +335,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
 # Telegram
 # -------------------------
 def send_telegram(text: str) -> bool:
+    """Envoi simple (historique) sans pin + cooldown."""
     global _last_tg
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
@@ -351,6 +355,68 @@ def send_telegram(text: str) -> bool:
     except Exception as e:
         log.warning("Telegram send failed: %s", e)
         return False
+
+def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
+    """
+    Envoie un message Telegram et, si pin=True, l'épingle.
+    Retour: {"ok": bool, "message_id": int|None, "pinned": bool, "error": str|None}
+    """
+    result = {"ok": False, "message_id": None, "pinned": False, "error": None}
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        result["error"] = "Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"
+        return result
+
+    try:
+        import urllib.request, urllib.parse, json as _json, time as _time
+        global _last_tg
+        now = _time.time()
+        if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
+            result["ok"] = True
+            result["error"] = "rate-limited (cooldown)"
+            return result
+        _last_tg = now
+
+        api_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+        # 1) sendMessage
+        send_url = f"{api_base}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+        req = urllib.request.Request(send_url, data=data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        payload = _json.loads(raw)
+        if not payload.get("ok"):
+            result["error"] = f"sendMessage failed: {raw[:200]}"
+            return result
+
+        msg = payload.get("result") or {}
+        mid = msg.get("message_id")
+        result["ok"] = True
+        result["message_id"] = mid
+
+        # 2) pinChatMessage
+        if pin and mid is not None:
+            pin_url = f"{api_base}/pinChatMessage"
+            pin_data = urllib.parse.urlencode({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": mid,
+                # "disable_notification": True,
+            }).encode()
+            preq = urllib.request.Request(pin_url, data=pin_data)
+            try:
+                with urllib.request.urlopen(preq, timeout=10) as presp:
+                    praw = presp.read().decode("utf-8", "ignore")
+                pp = _json.loads(praw)
+                if pp.get("ok"):
+                    result["pinned"] = True
+                else:
+                    result["error"] = f"pinChatMessage failed: {praw[:200]}"
+            except Exception as e:
+                result["error"] = f"pinChatMessage exception: {e}"
+
+        return result
+    except Exception as e:
+        result["error"] = f"send_telegram_ex exception: {e}"
+        return result
 
 # -------------------------
 # HTML templates (ASCII only)
@@ -426,7 +492,6 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       let s;
       try { s = JSON.parse(txt); } catch(e){ throw new Error("Invalid JSON: " + txt.slice(0, 200)); }
 
-      // Validation minimale du payload
       if (typeof s !== "object" || s === null) throw new Error("Empty payload");
       const need = ["btc_dominance","eth_btc","total2_usd","triggers"];
       for (const k of need){
@@ -682,6 +747,7 @@ def index():
         ("WEBHOOK_SECRET_set", str(bool(WEBHOOK_SECRET))),
         ("TELEGRAM_BOT_TOKEN_set", str(bool(TELEGRAM_BOT_TOKEN))),
         ("TELEGRAM_CHAT_ID_set", str(bool(TELEGRAM_CHAT_ID))),
+        ("TELEGRAM_PIN_ALTSEASON", str(bool(TELEGRAM_PIN_ALTSEASON))),
         ("LLM_ENABLED", str(bool(LLM_ENABLED))),
         ("LLM_CLIENT_READY", str(bool(_openai_client is not None))),
         ("LLM_DOWN_REASON", _llm_reason_down or ""),
@@ -718,6 +784,7 @@ def env_sanity(secret: Optional[str] = Query(None)):
         "WEBHOOK_SECRET_set": bool(WEBHOOK_SECRET),
         "TELEGRAM_BOT_TOKEN_set": bool(TELEGRAM_BOT_TOKEN),
         "TELEGRAM_CHAT_ID_set": bool(TELEGRAM_CHAT_ID),
+        "TELEGRAM_PIN_ALTSEASON": bool(TELEGRAM_PIN_ALTSEASON),
         "LLM_ENABLED": bool(LLM_ENABLED),
         "LLM_CLIENT_READY": bool(_openai_client is not None),
         "LLM_DOWN_REASON": _llm_reason_down,
@@ -808,7 +875,7 @@ def _altseason_fetch() -> Dict[str, Any]:
     mcap_usd = btc_dom = None
     alt_err = cg_err = cp_err = cc_err = cl_err = None
 
-    # 0) Alternative.me (souvent permissif)
+    # 0) Alternative.me
     try:
         alt = get_json("https://api.alternative.me/v2/global/")
         d0 = (alt.get("data") or [{}])[0]
@@ -867,7 +934,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cc_err = repr(e)
 
-    # 4) Coinlore (nouveau fallback)
+    # 4) Coinlore (fallback)
     if mcap_usd is None or btc_dom is None:
         try:
             cl = get_json("https://api.coinlore.net/api/global/")
@@ -992,12 +1059,13 @@ def altseason_check_public():
     snap = _altseason_snapshot(force=False)
     return _altseason_summary(snap)
 
-# GET+POST: notify (PROTÉGÉ)
+# GET+POST: notify (PROTÉGÉ) avec pin
 @app.api_route("/altseason/notify", methods=["GET", "POST"])
 async def altseason_notify(request: Request,
                            secret: Optional[str] = Query(None),
                            force: Optional[bool] = Query(False),
-                           message: Optional[str] = Query(None)):
+                           message: Optional[str] = Query(None),
+                           pin: Optional[bool] = Query(False)):
     body = {}
     if request.method == "POST":
         try:
@@ -1008,16 +1076,35 @@ async def altseason_notify(request: Request,
     if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid secret")
 
+    # override via body
     if request.method == "POST":
         force = bool(body.get("force", force))
         message = body.get("message", message)
+        pin = bool(body.get("pin", pin))
+
+    # Applique le default via ENV si non précisé
+    pin = bool(pin or TELEGRAM_PIN_ALTSEASON)
 
     s = _altseason_summary(_altseason_snapshot(force=bool(force)))
     sent = None
+    pin_res = None
     if s["ALTSEASON_ON"] or force:
-        msg = message or f"[Altseason] {s['asof']} — Greens={s['greens']} — ALTSEASON_ON={'YES' if s['ALTSEASON_ON'] else 'NO'}"
-        sent = send_telegram(msg)
-    return {"summary": s, "telegram_sent": sent}
+        # Message par défaut (modifiable via ?message=... ou body JSON)
+        if message:
+            msg = message
+        else:
+            if s["ALTSEASON_ON"]:
+                msg = f"[ALERTE ALTSEASON] {s['asof']} — Greens={s['greens']} — ALTSEASON DÉBUTÉ !"
+            else:
+                msg = f"[ALERTE ALTSEASON] {s['asof']} — Greens={s['greens']} — EN VEILLE (conditions insuffisantes)"
+
+        pin_result = send_telegram_ex(msg, pin=bool(pin))
+        sent = pin_result.get("ok")
+        pin_res = {"pinned": pin_result.get("pinned"),
+                   "message_id": pin_result.get("message_id"),
+                   "error": pin_result.get("error")}
+
+    return {"summary": s, "telegram_sent": sent, "pin_result": pin_res}
 
 # -------------------------
 # Webhook TradingView (PROTÉGÉ)
