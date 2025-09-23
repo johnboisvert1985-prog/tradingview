@@ -440,9 +440,9 @@ body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui
 h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-template-columns:1fr;gap:16px}
 @media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
 .title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
-.kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
+.kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:#94a3b8;font-size:12px}.kpi .value{font-size:22px;font-weight:700}
 .kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
+th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:#94a3b8;font-weight:600}tr:last-child td{border-bottom:none}
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:#e5e7eb}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
@@ -517,17 +517,17 @@ TRADES_ADMIN_HTML_TPL = Template(r"""<!doctype html>
 <title>AI Trader PRO - Trades (Admin)</title>
 <style>
 :root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--yellow:#f59e0b;--border:#1f2937;--chip-bg:#0b1220}
-body{margin:0;padding:24px;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+body{margin:0;padding:24px;background:#0f172a;color:#e5e7eb;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
 h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-template-columns:1fr;gap:16px}
-@media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
-.title{font-size:16px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
-.kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
+@media(min-width:1100px){.grid{grid-template-columns:360px 1fr}}.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.title{font-size:16px;color:#94a3b8;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}.kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:6px}
+.kpi .item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px}.kpi .label{color:#94a3b8;font-size:12px}.kpi .value{font-size:22px;font-weight:700}
 .kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
-.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
+th,td{padding:8px 10px;border-bottom:1px solid #1f2937}th{text-align:left;color:#94a3b8;font-weight:600}tr:last-child td{border-bottom:none}
+.chip{display:inline-block;padding:2px 8px;border:1px solid #1f2937;border-radius:999px;background:#0b1220}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:#e5e7eb}.row{display:flex;gap:8px;flex-wrap:wrap}
-.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
-.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600;margin-right:8px}
+.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb}
+.btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #1f2937;background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600;margin-right:8px}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
 <h1>AI Trader PRO - Trades (Admin)</h1>
@@ -747,15 +747,14 @@ def _altseason_fetch() -> Dict[str, Any]:
     except Exception:
         raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
 
-    # Headers plus permissifs (certains fournisseurs exigent Accept)
     headers = {
-        "User-Agent": "altseason-bot/1.3",
-        "Accept": "application/json",
+        "User-Agent": "altseason-bot/1.4",
+        "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Connection": "close",
     }
 
-    def get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
+    def get_json(url: str, timeout: int = 12) -> Dict[str, Any]:
         r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         body_preview = (r.text or "")[:220].replace("\n", " ").replace("\r", " ")
         if r.status_code != 200:
@@ -767,9 +766,9 @@ def _altseason_fetch() -> Dict[str, Any]:
 
     # === Global market cap & BTC dominance ===
     mcap_usd = btc_dom = None
-    cg_err = cp_err = cc_err = alt_err = None
+    alt_err = cg_err = cp_err = cc_err = cl_err = None
 
-    # 0) Alternative.me (NOUVEAU fallback prioritaire car très permissif)
+    # 0) Alternative.me (très permissif en général)
     try:
         alt = get_json("https://api.alternative.me/v2/global/")
         d0 = (alt.get("data") or [{}])[0]
@@ -780,7 +779,7 @@ def _altseason_fetch() -> Dict[str, Any]:
             mcap_usd = float(mcap)
             btc_dom = float(dom)
     except Exception as e:
-        alt_err = e
+        alt_err = repr(e)
 
     # 1) CoinGecko (peut renvoyer 429)
     if mcap_usd is None or btc_dom is None:
@@ -790,7 +789,7 @@ def _altseason_fetch() -> Dict[str, Any]:
             mcap_usd = float(data["total_market_cap"]["usd"])
             btc_dom  = float(data["market_cap_percentage"]["btc"])
         except Exception as e:
-            cg_err = e
+            cg_err = repr(e)
 
     # 2) CoinPaprika (souvent 402 en gratuit)
     if mcap_usd is None or btc_dom is None:
@@ -799,7 +798,7 @@ def _altseason_fetch() -> Dict[str, Any]:
             mcap_usd = float(pg["market_cap_usd"])
             btc_dom  = float(pg["bitcoin_dominance_percentage"])
         except Exception as e:
-            cp_err = e
+            cp_err = repr(e)
 
     # 3) CoinCap (parfois 404 derrière des proxys)
     if mcap_usd is None or btc_dom is None:
@@ -826,7 +825,22 @@ def _altseason_fetch() -> Dict[str, Any]:
                 mcap_usd = total
                 btc_dom = (btc_mcap / total) * 100.0
         except Exception as e:
-            cc_err = e
+            cc_err = repr(e)
+
+    # 4) NEW: Coinlore (extrêmement permissif)
+    if mcap_usd is None or btc_dom is None:
+        try:
+            cl = get_json("https://api.coinlore.net/api/global/")
+            # Coinlore renvoie souvent une liste avec un unique dict
+            g = cl[0] if isinstance(cl, list) and cl else cl
+            # champs possibles: total_mcap, total_mcap_usd, btc_d
+            mcap = g.get("total_mcap_usd") or g.get("total_mcap") or g.get("mcap_total_usd")
+            dom  = g.get("btc_d") or g.get("bitcoin_dominance_percentage") or g.get("btc_dominance")
+            if mcap is not None and dom is not None:
+                mcap_usd = float(mcap)
+                btc_dom  = float(dom)
+        except Exception as e:
+            cl_err = repr(e)
 
     if mcap_usd is None or btc_dom is None:
         raise HTTPException(
@@ -836,7 +850,8 @@ def _altseason_fetch() -> Dict[str, Any]:
                 f"(Alternative.me: {alt_err}; "
                 f"CG: {cg_err}; "
                 f"Paprika: {cp_err}; "
-                f"CoinCap: {cc_err})"
+                f"CoinCap: {cc_err}; "
+                f"Coinlore: {cl_err})"
             )
         )
 
@@ -844,34 +859,30 @@ def _altseason_fetch() -> Dict[str, Any]:
     out["btc_dominance"]  = float(btc_dom)
     out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
 
-    # === ETH/BTC (Binance en premier pour éviter 429) ===
+    # === ETH/BTC (Binance en premier) ===
     eth_btc = None
     bin_err = cg2_err = cp2_err = cc2_err = None
 
-    # 1) Binance public
     try:
         j = get_json("https://api.binance.com/api/v3/ticker/price?symbol=ETHBTC")
         eth_btc = float(j["price"])
     except Exception as e:
-        bin_err = e
+        bin_err = repr(e)
 
-    # 2) CoinGecko simple price
     if eth_btc is None:
         try:
             sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
             eth_btc = float(sp["ethereum"]["btc"])
         except Exception as e:
-            cg2_err = e
+            cg2_err = repr(e)
 
-    # 3) CoinPaprika
     if eth_btc is None:
         try:
             tkr = get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum?quotes=BTC")
             eth_btc = float(tkr["quotes"]["BTC"]["price"])
         except Exception as e:
-            cp2_err = e
+            cp2_err = repr(e)
 
-    # 4) CoinCap ratio (ETH/USD / BTC/USD)
     if eth_btc is None:
         try:
             cc_eth = get_json("https://api.coincap.io/v2/assets/ethereum")
@@ -880,7 +891,7 @@ def _altseason_fetch() -> Dict[str, Any]:
             btc_usd = float(cc_btc["data"]["priceUsd"])
             eth_btc = eth_usd / btc_usd
         except Exception as e:
-            cc2_err = e
+            cc2_err = repr(e)
 
     if eth_btc is None:
         raise HTTPException(
@@ -899,7 +910,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         from bs4 import BeautifulSoup  # lazy import
         html = requests.get(
             "https://www.blockchaincenter.net/altcoin-season-index/",
-            timeout=15,
+            timeout=12,
             headers=headers
         ).text
         soup = BeautifulSoup(html, "html.parser")
@@ -971,7 +982,7 @@ async def altseason_notify(request: Request,
     return {"summary": s, "telegram_sent": sent}
 
 # -------------------------
-# Webhook TradingView (PROTÉGÉ) — accepte secret en query OU dans JSON
+# Webhook TradingView (PROTÉGÉ)
 # -------------------------
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
@@ -1031,7 +1042,7 @@ def trades_csv(secret: Optional[str] = Query(None),
     return Response(content="\n".join(lines), media_type="text/csv")
 
 # -------------------------
-# Trades PUBLIC (nouvelle page)
+# Trades PUBLIC
 # -------------------------
 @app.get("/trades", response_class=HTMLResponse)
 def trades_public(symbol: Optional[str] = Query(None),
