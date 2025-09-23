@@ -396,10 +396,10 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <!-- ===== ALTSEASON: mini section dédiée ===== -->
 <div class="card"><div class="title">Altseason — État rapide</div>
 <div id="alt-asof" class="muted">Loading…</div>
-<div class="kv"><div>BTC Dominance</div><div><span id="alt-btc">…</span> <span class="muted">&lt; $btc_thr%</span><span id="dot-btc" class="dot"></span></div></div>
-<div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">…</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
+<div class="kv"><div>BTC Dominance</div><div><span id="alt-btc">—</span> <span class="muted">&lt; $btc_thr%</span><span id="dot-btc" class="dot"></span></div></div>
+<div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">—</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
 <div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
-<div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">…</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
+<div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">—</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
 <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
 </div>
 
@@ -408,21 +408,61 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <script>
 (function(){
   const url = "/altseason/check";
-  fetch(url).then(r=>r.json()).then(s=>{
-    const dot = (ok)=> ok ? "dot ok" : "dot warn";
-    const fmtT = (usd)=> (usd/1e12).toFixed(2) + " T$";
-    document.getElementById("alt-asof").textContent = "As of " + s.asof;
-    document.getElementById("alt-btc").textContent = s.btc_dominance.toFixed(2) + " %";
-    document.getElementById("dot-btc").className = dot(s.triggers.btc_dominance_ok);
-    document.getElementById("alt-eth").textContent = s.eth_btc.toFixed(5);
-    document.getElementById("dot-eth").className = dot(s.triggers.eth_btc_ok);
-    document.getElementById("alt-asi").textContent = (s.altseason_index===null ? "N/A" : s.altseason_index);
-    document.getElementById("dot-asi").className = dot(s.triggers.altseason_index_ok);
-    document.getElementById("alt-t2").textContent = fmtT(s.total2_usd);
-    document.getElementById("dot-t2").className = dot(s.triggers.total2_ok);
-  }).catch(e=>{
-    document.getElementById("alt-asof").textContent = "Erreur: " + e;
-  });
+
+  function setText(id, txt){
+    const el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+  function setDot(id, ok){
+    const el = document.getElementById(id);
+    if (el) el.className = "dot " + (ok ? "ok" : "warn");
+  }
+  function num(v){ return typeof v === "number" ? v : Number(v); }
+
+  fetch(url)
+    .then(async (r) => {
+      const txt = await r.text();
+      if (!r.ok) throw new Error(txt.slice(0, 300));
+      let s;
+      try { s = JSON.parse(txt); } catch(e){ throw new Error("Invalid JSON: " + txt.slice(0, 200)); }
+
+      // Validation minimale du payload
+      if (typeof s !== "object" || s === null) throw new Error("Empty payload");
+      const need = ["btc_dominance","eth_btc","total2_usd","triggers"];
+      for (const k of need){
+        if (!(k in s)) throw new Error("Missing key: " + k);
+      }
+
+      setText("alt-asof", "As of " + (s.asof || "now"));
+
+      const btc = num(s.btc_dominance);
+      const eth = num(s.eth_btc);
+      const t2  = num(s.total2_usd);
+      const asi = s.altseason_index;
+
+      setText("alt-btc",  Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—");
+      setDot ("dot-btc", !!(s.triggers && s.triggers.btc_dominance_ok));
+
+      setText("alt-eth",  Number.isFinite(eth) ? eth.toFixed(5) : "—");
+      setDot ("dot-eth", !!(s.triggers && s.triggers.eth_btc_ok));
+
+      setText("alt-asi",  (asi == null) ? "N/A" : String(asi));
+      setDot ("dot-asi", !!(s.triggers && s.triggers.altseason_index_ok));
+
+      setText("alt-t2",   Number.isFinite(t2)  ? (t2/1e12).toFixed(2) + " T$" : "—");
+      setDot ("dot-t2", !!(s.triggers && s.triggers.total2_ok));
+    })
+    .catch((e) => {
+      setText("alt-asof", "Erreur: " + (e && e.message ? e.message : e));
+      setText("alt-btc", "—");
+      setText("alt-eth", "—");
+      setText("alt-asi", "N/A");
+      setText("alt-t2",  "—");
+      setDot("dot-btc", false);
+      setDot("dot-eth", false);
+      setDot("dot-asi", false);
+      setDot("dot-t2",  false);
+    });
 })();
 </script>
 
@@ -768,7 +808,7 @@ def _altseason_fetch() -> Dict[str, Any]:
     mcap_usd = btc_dom = None
     alt_err = cg_err = cp_err = cc_err = cl_err = None
 
-    # 0) Alternative.me (très permissif en général)
+    # 0) Alternative.me (souvent permissif)
     try:
         alt = get_json("https://api.alternative.me/v2/global/")
         d0 = (alt.get("data") or [{}])[0]
@@ -781,7 +821,7 @@ def _altseason_fetch() -> Dict[str, Any]:
     except Exception as e:
         alt_err = repr(e)
 
-    # 1) CoinGecko (peut renvoyer 429)
+    # 1) CoinGecko
     if mcap_usd is None or btc_dom is None:
         try:
             g = get_json("https://api.coingecko.com/api/v3/global")
@@ -791,7 +831,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cg_err = repr(e)
 
-    # 2) CoinPaprika (souvent 402 en gratuit)
+    # 2) CoinPaprika
     if mcap_usd is None or btc_dom is None:
         try:
             pg = get_json("https://api.coinpaprika.com/v1/global")
@@ -800,7 +840,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cp_err = repr(e)
 
-    # 3) CoinCap (parfois 404 derrière des proxys)
+    # 3) CoinCap
     if mcap_usd is None or btc_dom is None:
         try:
             cc = get_json("https://api.coincap.io/v2/assets?limit=2000")
@@ -827,13 +867,11 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cc_err = repr(e)
 
-    # 4) NEW: Coinlore (extrêmement permissif)
+    # 4) Coinlore (nouveau fallback)
     if mcap_usd is None or btc_dom is None:
         try:
             cl = get_json("https://api.coinlore.net/api/global/")
-            # Coinlore renvoie souvent une liste avec un unique dict
             g = cl[0] if isinstance(cl, list) and cl else cl
-            # champs possibles: total_mcap, total_mcap_usd, btc_d
             mcap = g.get("total_mcap_usd") or g.get("total_mcap") or g.get("mcap_total_usd")
             dom  = g.get("btc_d") or g.get("bitcoin_dominance_percentage") or g.get("btc_dominance")
             if mcap is not None and dom is not None:
