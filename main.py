@@ -444,8 +444,8 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-temp
 .kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
-.badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
-.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+.badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:#e5e7eb}.row{display:flex;gap:8px;flex-wrap:wrap}
+.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
@@ -525,8 +525,8 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-temp
 .kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:var(--muted);font-weight:600}tr:last-child td{border-bottom:none}
 .chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
-.badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:var(--muted)}.row{display:flex;gap:8px;flex-wrap:wrap}
-.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
+.badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:#e5e7eb}.row{display:flex;gap:8px;flex-wrap:wrap}
+.filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600;margin-right:8px}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
 </style></head><body>
@@ -746,10 +746,17 @@ def _altseason_fetch() -> Dict[str, Any]:
         import requests  # lazy import
     except Exception:
         raise HTTPException(status_code=500, detail="Missing dependency: requests (pip install requests)")
-    headers = {"User-Agent": "altseason-bot/1.2"}
+
+    # Headers plus permissifs (certains fournisseurs exigent Accept)
+    headers = {
+        "User-Agent": "altseason-bot/1.3",
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+    }
 
     def get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
-        r = requests.get(url, headers=headers, timeout=timeout)
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         body_preview = (r.text or "")[:220].replace("\n", " ").replace("\r", " ")
         if r.status_code != 200:
             raise RuntimeError(f"{url} -> HTTP {r.status_code}: {body_preview}")
@@ -760,18 +767,32 @@ def _altseason_fetch() -> Dict[str, Any]:
 
     # === Global market cap & BTC dominance ===
     mcap_usd = btc_dom = None
-    cg_err = cp_err = cc_err = None
+    cg_err = cp_err = cc_err = alt_err = None
 
-    # 1) CoinGecko
+    # 0) Alternative.me (NOUVEAU fallback prioritaire car très permissif)
     try:
-        g = get_json("https://api.coingecko.com/api/v3/global")
-        data = g.get("data") or {}
-        mcap_usd = float(data["total_market_cap"]["usd"])
-        btc_dom  = float(data["market_cap_percentage"]["btc"])
+        alt = get_json("https://api.alternative.me/v2/global/")
+        d0 = (alt.get("data") or [{}])[0]
+        qusd = (d0.get("quotes") or {}).get("USD") or {}
+        mcap = qusd.get("total_market_cap")
+        dom = d0.get("bitcoin_percentage_of_market_cap")
+        if mcap is not None and dom is not None:
+            mcap_usd = float(mcap)
+            btc_dom = float(dom)
     except Exception as e:
-        cg_err = e
+        alt_err = e
 
-    # 2) CoinPaprika
+    # 1) CoinGecko (peut renvoyer 429)
+    if mcap_usd is None or btc_dom is None:
+        try:
+            g = get_json("https://api.coingecko.com/api/v3/global")
+            data = g.get("data") or {}
+            mcap_usd = float(data["total_market_cap"]["usd"])
+            btc_dom  = float(data["market_cap_percentage"]["btc"])
+        except Exception as e:
+            cg_err = e
+
+    # 2) CoinPaprika (souvent 402 en gratuit)
     if mcap_usd is None or btc_dom is None:
         try:
             pg = get_json("https://api.coinpaprika.com/v1/global")
@@ -780,7 +801,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cp_err = e
 
-    # 3) CoinCap fallback (agrégation locale)
+    # 3) CoinCap (parfois 404 derrière des proxys)
     if mcap_usd is None or btc_dom is None:
         try:
             cc = get_json("https://api.coincap.io/v2/assets?limit=2000")
@@ -808,24 +829,41 @@ def _altseason_fetch() -> Dict[str, Any]:
             cc_err = e
 
     if mcap_usd is None or btc_dom is None:
-        raise HTTPException(status_code=502, detail=f"Global fetch failed (CG: {cg_err}; Paprika: {cp_err}; CoinCap: {cc_err})")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Global fetch failed "
+                f"(Alternative.me: {alt_err}; "
+                f"CG: {cg_err}; "
+                f"Paprika: {cp_err}; "
+                f"CoinCap: {cc_err})"
+            )
+        )
 
     out["total_mcap_usd"] = float(mcap_usd)
     out["btc_dominance"]  = float(btc_dom)
     out["total2_usd"]     = float(mcap_usd * (1.0 - btc_dom / 100.0))
 
-    # === ETH/BTC ===
+    # === ETH/BTC (Binance en premier pour éviter 429) ===
     eth_btc = None
-    cg2_err = cp2_err = cc2_err = bin_err = None
+    bin_err = cg2_err = cp2_err = cc2_err = None
 
-    # 1) CoinGecko simple price
+    # 1) Binance public
     try:
-        sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
-        eth_btc = float(sp["ethereum"]["btc"])
+        j = get_json("https://api.binance.com/api/v3/ticker/price?symbol=ETHBTC")
+        eth_btc = float(j["price"])
     except Exception as e:
-        cg2_err = e
+        bin_err = e
 
-    # 2) CoinPaprika ticker
+    # 2) CoinGecko simple price
+    if eth_btc is None:
+        try:
+            sp = get_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=btc,usd")
+            eth_btc = float(sp["ethereum"]["btc"])
+        except Exception as e:
+            cg2_err = e
+
+    # 3) CoinPaprika
     if eth_btc is None:
         try:
             tkr = get_json("https://api.coinpaprika.com/v1/tickers/eth-ethereum?quotes=BTC")
@@ -833,7 +871,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cp2_err = e
 
-    # 3) CoinCap ratio (USD -> ratio)
+    # 4) CoinCap ratio (ETH/USD / BTC/USD)
     if eth_btc is None:
         try:
             cc_eth = get_json("https://api.coincap.io/v2/assets/ethereum")
@@ -844,25 +882,26 @@ def _altseason_fetch() -> Dict[str, Any]:
         except Exception as e:
             cc2_err = e
 
-    # 4) Binance public (au cas où)
     if eth_btc is None:
-        try:
-            j = get_json("https://api.binance.com/api/v3/ticker/price?symbol=ETHBTC")
-            eth_btc = float(j["price"])
-        except Exception as e:
-            bin_err = e
-
-    if eth_btc is None:
-        raise HTTPException(status_code=502, detail=f"ETH/BTC fetch failed (CG: {cg2_err}; Paprika: {cp2_err}; CoinCap: {cc2_err}; Binance: {bin_err})")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "ETH/BTC fetch failed "
+                f"(Binance: {bin_err}; CG: {cg2_err}; Paprika: {cp2_err}; CoinCap: {cc2_err})"
+            )
+        )
 
     out["eth_btc"] = float(eth_btc)
 
-    # === Altseason Index (best-effort) ===
+    # === Altseason Index (best-effort scraping) ===
     out["altseason_index"] = None
     try:
         from bs4 import BeautifulSoup  # lazy import
-        import requests
-        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=15, headers=headers).text
+        html = requests.get(
+            "https://www.blockchaincenter.net/altcoin-season-index/",
+            timeout=15,
+            headers=headers
+        ).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
