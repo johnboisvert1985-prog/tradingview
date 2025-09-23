@@ -399,7 +399,6 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
             pin_data = urllib.parse.urlencode({
                 "chat_id": TELEGRAM_CHAT_ID,
                 "message_id": mid,
-                # "disable_notification": True,
             }).encode()
             preq = urllib.request.Request(pin_url, data=pin_data)
             try:
@@ -534,7 +533,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 </body></html>
 """)
 
-# ----- PUBLIC trades (sans liens admin) -----
+# ----- PUBLIC trades (avec carte Altseason) -----
 TRADES_PUBLIC_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -553,6 +552,8 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600}
 .btn:hover{background:#0f1525}.spark{width:100%;height:60px}
+.kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed var(--border)}.kv:last-child{border-bottom:none}
+.dot{display:inline-block;width:10px;height:10px;border-radius:10px;margin-left:8px}.ok{background:#10b981}.warn{background:#fb923c}
 </style></head><body>
 <h1>AI Trader PRO - Trades</h1>
 <div class="grid">
@@ -566,6 +567,17 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       <label>Limit rows <input type="number" min="1" max="50000" step="1" name="limit" value="$limit"></label>
       <button class="btn" type="submit">Apply</button>
     </form>
+  </div>
+
+  <!-- ===== ALTSEASON: mini section dédiée ===== -->
+  <div class="card">
+    <div class="title">Altseason — État rapide</div>
+    <div id="alt-asof" class="muted">Loading…</div>
+    <div class="kv"><div>BTC Dominance</div><div><span id="alt-btc">—</span> <span class="muted">&lt; $btc_thr%</span><span id="dot-btc" class="dot"></span></div></div>
+    <div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">—</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
+    <div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
+    <div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">—</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
+    <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
   </div>
 
   <div class="card">
@@ -600,6 +612,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 </div>
 
 <script>
+// ===== sparkline (trades)
 const data = $spark_data;
 const canvas = document.getElementById('spark');
 if (canvas && data && data.length > 0) {
@@ -611,11 +624,59 @@ if (canvas && data && data.length > 0) {
   for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); } ctx.stroke();
   ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
+
+// ===== altseason quick view
+(function(){
+  const url = "/altseason/check";
+  function setText(id, txt){ const el = document.getElementById(id); if (el) el.textContent = txt; }
+  function setDot(id, ok){ const el = document.getElementById(id); if (el) el.className = "dot " + (ok ? "ok" : "warn"); }
+  function num(v){ return typeof v === "number" ? v : Number(v); }
+
+  fetch(url)
+    .then(async (r) => {
+      const txt = await r.text();
+      if (!r.ok) throw new Error(txt.slice(0, 300));
+      let s; try { s = JSON.parse(txt); } catch(e){ throw new Error("Invalid JSON: " + txt.slice(0, 200)); }
+      if (typeof s !== "object" || s === null) throw new Error("Empty payload");
+      const need = ["btc_dominance","eth_btc","total2_usd","triggers"];
+      for (const k of need){ if (!(k in s)) throw new Error("Missing key: " + k); }
+
+      setText("alt-asof", "As of " + (s.asof || "now"));
+
+      const btc = num(s.btc_dominance);
+      const eth = num(s.eth_btc);
+      const t2  = num(s.total2_usd);
+      const asi = s.altseason_index;
+
+      setText("alt-btc",  Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—");
+      setDot ("dot-btc", !!(s.triggers && s.triggers.btc_dominance_ok));
+
+      setText("alt-eth",  Number.isFinite(eth) ? eth.toFixed(5) : "—");
+      setDot ("dot-eth", !!(s.triggers && s.triggers.eth_btc_ok));
+
+      setText("alt-asi",  (asi == null) ? "N/A" : String(asi));
+      setDot ("dot-asi", !!(s.triggers && s.triggers.altseason_index_ok));
+
+      setText("alt-t2",   Number.isFinite(t2)  ? (t2/1e12).toFixed(2) + " T$" : "—");
+      setDot ("dot-t2", !!(s.triggers && s.triggers.total2_ok));
+    })
+    .catch((e) => {
+      setText("alt-asof", "Erreur: " + (e && e.message ? e.message : e));
+      setText("alt-btc", "—");
+      setText("alt-eth", "—");
+      setText("alt-asi", "N/A");
+      setText("alt-t2",  "—");
+      setDot("dot-btc", false);
+      setDot("dot-eth", false);
+      setDot("dot-asi", false);
+      setDot("dot-t2",  false);
+    });
+})();
 </script>
 </body></html>
 """)
 
-# ----- Admin trades (avec liens admin) -----
+# ----- Admin trades (protégé) -----
 TRADES_ADMIN_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1167,7 +1228,7 @@ def trades_csv(secret: Optional[str] = Query(None),
     return Response(content="\n".join(lines), media_type="text/csv")
 
 # -------------------------
-# Trades PUBLIC
+# Trades PUBLIC (avec Altseason)
 # -------------------------
 @app.get("/trades", response_class=HTMLResponse)
 def trades_public(symbol: Optional[str] = Query(None),
@@ -1201,7 +1262,7 @@ def trades_public(symbol: Optional[str] = Query(None),
             "</tr>"
         )
 
-    html = TRADES_PUBLIC_HTML_TPL.substitute(
+    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
         symbol=escape_html(symbol or ""),
         tf=escape_html(tf or ""),
         start=escape_html(start or ""),
@@ -1218,7 +1279,13 @@ def trades_public(symbol: Optional[str] = Query(None),
         best_win_streak=str(summary["best_win_streak"]),
         worst_loss_streak=str(summary["worst_loss_streak"]),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values)
+        spark_data=json.dumps(spark_values),
+
+        # thresholds pour la carte Altseason
+        btc_thr=str(int(ALT_BTC_DOM_THR)),
+        eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
+        asi_thr=str(int(ALT_ASI_THR)),
+        t2_thr=f"{ALT_TOTAL2_THR_T:.2f}"
     )
     return HTMLResponse(html)
 
