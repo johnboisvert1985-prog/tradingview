@@ -5,6 +5,7 @@ import json
 import time
 import sqlite3
 import logging
+import threading
 from typing import Optional, Dict, Any, List, Tuple
 from string import Template
 from collections import defaultdict
@@ -46,8 +47,17 @@ ALT_ASI_THR        = float(os.getenv("ALT_ASI_THR", "75.0"))
 ALT_TOTAL2_THR_T   = float(os.getenv("ALT_TOTAL2_THR_T", "1.78"))  # trillions
 ALT_CACHE_TTL      = int(os.getenv("ALT_CACHE_TTL", "120"))        # seconds
 
-# Epinglage par défaut des alertes altseason
-TELEGRAM_PIN_ALTSEASON = os.getenv("TELEGRAM_PIN_ALTSEASON", "0") in ("1", "true", "True")
+# 3/4 voyants requis
+ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))
+
+# Alerte & épinglage
+TELEGRAM_PIN_ALTSEASON = os.getenv("TELEGRAM_PIN_ALTSEASON", "1") in ("1", "true", "True")
+
+# Auto-notify daemon (facultatif)
+ALTSEASON_AUTONOTIFY        = os.getenv("ALTSEASON_AUTONOTIFY", "1") in ("1", "true", "True")
+ALTSEASON_POLL_SECONDS      = int(os.getenv("ALTSEASON_POLL_SECONDS", "300"))   # 5 min
+ALTSEASON_NOTIFY_MIN_GAP_MIN= int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))  # 60 min
+ALTSEASON_STATE_FILE        = os.getenv("ALTSEASON_STATE_FILE", "/tmp/altseason_state.json")
 
 # --- Altseason file cache helpers (dernier snapshot connu) ---
 def _alt_cache_file_path() -> str:
@@ -360,7 +370,7 @@ def build_trades_filtered(symbol: Optional[str], tf: Optional[str],
 # Telegram
 # -------------------------
 def send_telegram(text: str) -> bool:
-    """Envoi simple (historique) sans pin + cooldown."""
+    """Envoi simple sans pin + cooldown."""
     global _last_tg
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
@@ -411,6 +421,7 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
         payload = _json.loads(raw)
         if not payload.get("ok"):
             result["error"] = f"sendMessage failed: {raw[:200]}"
+            log.warning("Telegram sendMessage error: %s", result["error"])
             return result
 
         msg = payload.get("result") or {}
@@ -434,12 +445,15 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
                     result["pinned"] = True
                 else:
                     result["error"] = f"pinChatMessage failed: {praw[:200]}"
+                    log.warning("Telegram pinChatMessage error: %s", result["error"])
             except Exception as e:
                 result["error"] = f"pinChatMessage exception: {e}"
+                log.warning("Telegram pin exception: %s", e)
 
         return result
     except Exception as e:
         result["error"] = f"send_telegram_ex exception: {e}"
+        log.warning("Telegram send_telegram_ex exception: %s", e)
         return result
 
 # -------------------------
@@ -490,7 +504,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 <div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">—</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
 <div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
 <div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">—</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
-<div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
+<div class="muted" style="margin-top:8px">Passe au vert quand ≥ 3 conditions sont validées.</div>
 </div>
 
 </div>
@@ -572,7 +586,7 @@ h1{margin:0 0 16px 0;font-size:28px;font-weight:700}.grid{display:grid;grid-temp
 .kpi .item{background:#0b1220;border:1px solid var(--border);border-radius:10px;padding:10px}.kpi .label{color:#94a3b8;font-size:12px}.kpi .value{font-size:22px;font-weight:700}
 .kpi .green{color:#10b981}.kpi .red{color:#ef4444}.kpi .blue{color:#3b82f6}.kpi .yellow{color:#f59e0b}table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;color:#94a3b8;font-weight:600}tr:last-child td{border-bottom:none}
-.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}.badge-win{color:#10b981;border-color:#0f5132}
+.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:#0b1220}.badge-win{color:#10b981;border-color:#0f5132}
 .badge-loss{color:#ef4444;border-color:#5c1e1e}.muted{color:#e5e7eb}.row{display:flex;gap:8px;flex-wrap:wrap}
 .filter{display:grid;gap:8px}.filter input{width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#e5e7eb;text-decoration:none;font-weight:600}
@@ -602,7 +616,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
     <div class="kv"><div>ETH/BTC</div><div><span id="alt-eth">—</span> <span class="muted">&gt; $eth_thr</span><span id="dot-eth" class="dot"></span></div></div>
     <div class="kv"><div>Altseason Index</div><div><span id="alt-asi">N/A</span> <span class="muted">&ge; $asi_thr</span><span id="dot-asi" class="dot"></span></div></div>
     <div class="kv"><div>TOTAL2 (ex-BTC)</div><div><span id="alt-t2">—</span> <span class="muted">&gt; $t2_thr T$$</span><span id="dot-t2" class="dot"></span></div></div>
-    <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 2 conditions sont validées.</div>
+    <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 3 conditions sont validées.</div>
   </div>
 
   <div class="card">
@@ -637,7 +651,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
 </div>
 
 <script>
-// ===== sparkline (trades)
+// sparkline
 const data = $spark_data;
 const canvas = document.getElementById('spark');
 if (canvas && data && data.length > 0) {
@@ -650,7 +664,7 @@ if (canvas && data && data.length > 0) {
   ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 
-// ===== altseason quick view
+// altseason quick view
 (function(){
   const url = "/altseason/check";
   function setText(id, txt){ const el = document.getElementById(id); if (el) el.textContent = txt; }
@@ -808,7 +822,7 @@ input{padding:8px;border-radius:8px;border:1px solid var(--border);background:#0
   <input type="hidden" name="secret" value="$secret" />
   <label>Limit <input type="number" name="limit" value="$limit" min="1" max="50000" /></label>
   <button class="btn" type="submit">Apply</button>
-  <a class="btn" href="/trades-admin?secret=$secret">Back to Trades</a>
+  <a class="btn" href="/trides-admin?secret=$secret">Back to Trades</a>
 </form>
 <table>
   <thead><tr><th>Time (server)</th><th>Type</th><th>Symbol</th><th>TF</th><th>Side</th><th>Trade ID</th><th>Payload</th></tr></thead>
@@ -850,6 +864,10 @@ def index():
         ("ALT_ASI_THR", str(ALT_ASI_THR)),
         ("ALT_TOTAL2_THR_T", str(ALT_TOTAL2_THR_T)),
         ("ALT_CACHE_TTL", str(ALT_CACHE_TTL)),
+        ("ALT_GREENS_REQUIRED", str(ALT_GREENS_REQUIRED)),
+        ("ALTSEASON_AUTONOTIFY", str(bool(ALTSEASON_AUTONOTIFY))),
+        ("ALTSEASON_POLL_SECONDS", str(ALTSEASON_POLL_SECONDS)),
+        ("ALTSEASON_NOTIFY_MIN_GAP_MIN", str(ALTSEASON_NOTIFY_MIN_GAP_MIN)),
     ]
     trs = "".join([f"<tr><td>{k}</td><td>{escape_html(v)}</td></tr>" for (k, v) in rows])
     html = INDEX_HTML_TPL.safe_substitute(
@@ -888,6 +906,10 @@ def env_sanity(secret: Optional[str] = Query(None)):
             "ALT_ASI_THR": ALT_ASI_THR,
             "ALT_TOTAL2_THR_T": ALT_TOTAL2_THR_T,
             "ALT_CACHE_TTL": ALT_CACHE_TTL,
+            "ALT_GREENS_REQUIRED": ALT_GREENS_REQUIRED,
+            "AUTONOTIFY": ALTSEASON_AUTONOTIFY,
+            "POLL_SECONDS": ALTSEASON_POLL_SECONDS,
+            "NOTIFY_MIN_GAP_MIN": ALTSEASON_NOTIFY_MIN_GAP_MIN,
         }
     }
 
@@ -936,27 +958,24 @@ def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
         return snap
 
     try:
-        snap = _altseason_fetch()  # peut contenir errors[], mais ne jette plus
+        snap = _altseason_fetch()
         snap["stale"] = False
         _alt_cache["snap"] = snap
         _alt_cache["ts"] = now
         _save_last_snapshot(snap)
         return snap
     except Exception as e:
-        # fallback mémoire
         if _alt_cache["snap"]:
             s = dict(_alt_cache["snap"])
             s["stale"] = True
             s.setdefault("errors", []).append(f"live_fetch_exception: {e!r}")
             return s
-        # fallback disque
         disk = _load_last_snapshot()
         if isinstance(disk, dict):
             disk = dict(disk)
             disk["stale"] = True
             disk.setdefault("errors", []).append(f"live_fetch_exception: {e!r}")
             return disk
-        # rien: snapshot minimal pour éviter 502
         return {
             "asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "btc_dominance": None, "eth_btc": None, "total2_usd": None, "altseason_index": None,
@@ -973,7 +992,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         return out
 
     headers = {
-        "User-Agent": "altseason-bot/1.5",
+        "User-Agent": "altseason-bot/1.6",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Connection": "close",
@@ -1092,9 +1111,9 @@ def _altseason_fetch() -> Dict[str, Any]:
     # ===== Altseason Index (best-effort) =====
     out["altseason_index"] = None
     try:
+        import requests
         from bs4 import BeautifulSoup
-        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/",
-                            timeout=12, headers=headers).text
+        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=12, headers=headers).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
@@ -1123,7 +1142,7 @@ def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
     asi_ok = (asi is not None) and _ok(float(asi), ALT_ASI_THR, "above")
 
     greens = sum([btc_ok, eth_ok, t2_ok, asi_ok])
-    on     = greens >= 2
+    on     = greens >= ALT_GREENS_REQUIRED
 
     return {
         "asof": snap.get("asof"),
@@ -1134,7 +1153,8 @@ def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
         "total2_usd": (None if t2  is None else float(t2)),
         "altseason_index": (None if asi is None else int(asi)),
         "thresholds": {
-            "btc": ALT_BTC_DOM_THR, "eth_btc": ALT_ETH_BTC_THR, "asi": ALT_ASI_THR, "total2_trillions": ALT_TOTAL2_THR_T
+            "btc": ALT_BTC_DOM_THR, "eth_btc": ALT_ETH_BTC_THR, "asi": ALT_ASI_THR,
+            "total2_trillions": ALT_TOTAL2_THR_T, "greens_required": ALT_GREENS_REQUIRED
         },
         "triggers": {
             "btc_dominance_ok": btc_ok, "eth_btc_ok": eth_ok, "total2_ok": t2_ok, "altseason_index_ok": asi_ok
@@ -1165,20 +1185,17 @@ async def altseason_notify(request: Request,
     if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # override via body
     if request.method == "POST":
         force = bool(body.get("force", force))
         message = body.get("message", message)
         pin = bool(body.get("pin", pin))
 
-    # Applique le default via ENV si non précisé
     pin = bool(pin or TELEGRAM_PIN_ALTSEASON)
 
     s = _altseason_summary(_altseason_snapshot(force=bool(force)))
     sent = None
     pin_res = None
     if s["ALTSEASON_ON"] or force:
-        # Message par défaut (modifiable via ?message=... ou body JSON)
         if message:
             msg = message
         else:
@@ -1192,6 +1209,7 @@ async def altseason_notify(request: Request,
         pin_res = {"pinned": pin_result.get("pinned"),
                    "message_id": pin_result.get("message_id"),
                    "error": pin_result.get("error")}
+        log.info("Altseason notify: sent=%s pinned=%s err=%s", sent, pin_res.get("pinned"), pin_res.get("error"))
 
     return {"summary": s, "telegram_sent": sent, "pin_result": pin_res}
 
@@ -1309,7 +1327,6 @@ def trades_public(symbol: Optional[str] = Query(None),
         rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
         spark_data=json.dumps(spark_values),
 
-        # thresholds pour la carte Altseason
         btc_thr=str(int(ALT_BTC_DOM_THR)),
         eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
         asi_thr=str(int(ALT_ASI_THR)),
@@ -1466,6 +1483,89 @@ def selftest(secret: Optional[str] = Query(None)):
     time.sleep(1)
     save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"tp":101.0,"trade_id":tid})
     return {"ok": True, "trade_id": tid}
+
+# -------------------------
+# Altseason Daemon (auto-notify 3/4)
+# -------------------------
+_daemon_stop = threading.Event()
+_daemon_thread: Optional[threading.Thread] = None
+
+def _load_state() -> Dict[str, Any]:
+    try:
+        if os.path.exists(ALTSEASON_STATE_FILE):
+            with open(ALTSEASON_STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+    except Exception:
+        pass
+    return {"last_on": False, "last_sent_ts": 0, "last_tick_ts": 0}
+
+def _save_state(state: Dict[str, Any]) -> None:
+    try:
+        d = os.path.dirname(ALTSEASON_STATE_FILE) or "/tmp"
+        os.makedirs(d, exist_ok=True)
+        with open(ALTSEASON_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def _daemon_loop():
+    state = _load_state()
+    log.info("Altseason daemon started (autonotify=%s, poll=%ss, min_gap=%smin, greens_required=%s)",
+             ALTSEASON_AUTONOTIFY, ALTSEASON_POLL_SECONDS, ALTSEASON_NOTIFY_MIN_GAP_MIN, ALT_GREENS_REQUIRED)
+    while not _daemon_stop.wait(ALTSEASON_POLL_SECONDS):
+        try:
+            state["last_tick_ts"] = int(time.time())
+            s = _altseason_summary(_altseason_snapshot(force=False))
+            now = time.time()
+            need_send = False
+
+            if s["ALTSEASON_ON"] and not state.get("last_on", False):
+                # Transition OFF -> ON
+                need_send = True
+            elif s["ALTSEASON_ON"]:
+                # Toujours ON: respecter min_gap
+                min_gap = ALTSEASON_NOTIFY_MIN_GAP_MIN * 60
+                if now - state.get("last_sent_ts", 0) >= min_gap:
+                    need_send = True
+
+            if need_send:
+                msg = f"[ALERTE ALTSEASON] {s['asof']} — Greens={s['greens']} — ALTSEASON DÉBUTÉ !"
+                res = send_telegram_ex(msg, pin=TELEGRAM_PIN_ALTSEASON)
+                log.info("Altseason auto-notify: sent=%s pinned=%s err=%s",
+                         res.get("ok"), res.get("pinned"), res.get("error"))
+                if res.get("ok"):
+                    state["last_sent_ts"] = int(now)
+
+            state["last_on"] = bool(s["ALTSEASON_ON"])
+            _save_state(state)
+        except Exception as e:
+            log.warning("Altseason daemon tick error: %s", e)
+
+@app.get("/altseason/daemon-status")
+def altseason_daemon_status():
+    st = _load_state()
+    return {
+        "autonotify_enabled": ALTSEASON_AUTONOTIFY,
+        "poll_seconds": ALTSEASON_POLL_SECONDS,
+        "notify_min_gap_min": ALTSEASON_NOTIFY_MIN_GAP_MIN,
+        "greens_required": ALT_GREENS_REQUIRED,
+        "state": st
+    }
+
+@app.on_event("startup")
+def _start_daemon():
+    global _daemon_thread
+    if ALTSEASON_AUTONOTIFY and _daemon_thread is None:
+        _daemon_stop.clear()
+        _daemon_thread = threading.Thread(target=_daemon_loop, daemon=True)
+        _daemon_thread.start()
+
+@app.on_event("shutdown")
+def _stop_daemon():
+    if _daemon_thread is not None:
+        _daemon_stop.set()
 
 # ============ Run local ============
 if __name__ == "__main__":
