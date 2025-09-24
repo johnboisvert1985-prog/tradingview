@@ -1,6 +1,3 @@
-Toujours afficher les détails
-# We'll write the corrected `main.py` to a .txt file for download.
-content = r'''# main.py
 import os
 import re
 import json
@@ -1905,3 +1902,4 @@ path = "/mnt/data/main.py.txt"
 with open(path, "w", encoding="utf-8") as f:
     f.write(content)
 path
+
