@@ -1,3 +1,6 @@
+# We'll write the corrected main.py to a text file the user can download.
+content = r'''# main.py
+
 import os
 import re
 import json
@@ -21,12 +24,11 @@ log = logging.getLogger("aitrader")
 # -------------------------
 # Config / ENV
 # -------------------------
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # if set, protects sensitive endpoints
-
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 LLM_ENABLED = os.getenv("LLM_ENABLED", "0") in ("1", "true", "True")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 FORCE_LLM = os.getenv("FORCE_LLM", "0") in ("1", "true", "True")
@@ -37,10 +39,7 @@ PORT = int(os.getenv("PORT", "8000"))
 RISK_ACCOUNT_BAL = float(os.getenv("RISK_ACCOUNT_BAL", "0") or 0)
 RISK_PCT = float(os.getenv("RISK_PCT", "1.0") or 1.0)
 
-# DB path:
-# - default: data/data.db (works locally)
-# - fallback: /data/data.db (Render persistent disk if mounted)
-# - last resort: /tmp/ai_trader/data.db (always writable in containers)
+# DB path default = data/data.db; fallback auto to /tmp si read-only
 DB_PATH = os.getenv("DB_PATH", "data/data.db")
 
 DEBUG_MODE = os.getenv("DEBUG", "0") in ("1", "true", "True")
@@ -53,7 +52,6 @@ ALT_ETH_BTC_THR = float(os.getenv("ALT_ETH_BTC_THR", "0.045"))
 ALT_ASI_THR = float(os.getenv("ALT_ASI_THR", "75.0"))
 ALT_TOTAL2_THR_T = float(os.getenv("ALT_TOTAL2_THR_T", "1.78"))  # trillions
 ALT_CACHE_TTL = int(os.getenv("ALT_CACHE_TTL", "120"))  # seconds
-
 # 3/4 voyants requis
 ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))
 
@@ -65,6 +63,7 @@ ALTSEASON_AUTONOTIFY = os.getenv("ALTSEASON_AUTONOTIFY", "1") in ("1", "true", "
 ALTSEASON_POLL_SECONDS = int(os.getenv("ALTSEASON_POLL_SECONDS", "300"))  # 5 min
 ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))  # 60 min
 ALTSEASON_STATE_FILE = os.getenv("ALTSEASON_STATE_FILE", "/tmp/altseason_state.json")
+
 
 # --- Altseason file cache helpers (dernier snapshot connu) ---
 def _alt_cache_file_path() -> str:
@@ -103,7 +102,6 @@ _last_tg = 0.0
 # -------------------------
 _openai_client = None
 _llm_reason_down = None
-
 if LLM_ENABLED and OPENAI_API_KEY:
     try:
         from openai import OpenAI  # type: ignore
@@ -113,55 +111,29 @@ if LLM_ENABLED and OPENAI_API_KEY:
 else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
+
 # -------------------------
-# SQLite (persistent) + robust fallback for container platforms
+# SQLite (persistent)
 # -------------------------
-def _dir_is_writable(path: str) -> bool:
-    """Check that directory exists and is writable."""
+def resolve_db_path() -> None:
+    """
+    Try to create directory for DB_PATH; if permission denied,
+    fallback to /tmp/ai_trader/data.db.
+    """
+    global DB_PATH
+    d = os.path.dirname(DB_PATH) or "."
     try:
-        os.makedirs(path, exist_ok=True)
-        probe = os.path.join(path, ".write_test")
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".write_test")
         with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe)
-        return True
-    except Exception:
-        return False
-
-
-def resolve_db_path() -> None:
-    """Ensure DB_PATH points to a writable file. Try in order:
-       1) DB_PATH as provided
-       2) /data/data.db (typical Render persistent disk mount)
-       3) /tmp/ai_trader/data.db (always writable)
-    """
-    global DB_PATH
-
-    def _ok(p: str) -> bool:
-        d = os.path.dirname(p) or "."
-        return _dir_is_writable(d)
-
-    candidates = []
-
-    # 1) explicit env or default path
-    candidates.append(DB_PATH)
-
-    # 2) Render persistent disk recommendation
-    candidates.append("/data/data.db")
-
-    # 3) last resort: tmp
-    candidates.append("/tmp/ai_trader/data.db")
-
-    for cand in candidates:
-        if _ok(cand):
-            if DB_PATH != cand:
-                log.warning("DB path changed -> %s (was %s)", cand, DB_PATH)
-            DB_PATH = cand
-            log.info("Using DB at %s", DB_PATH)
-            return
-
-    # If all failed, raise explicit error
-    raise RuntimeError("No writable location found for SQLite database.")
+        log.info("DB dir OK: %s (using %s)", d, DB_PATH)
+    except Exception as e:
+        fallback_dir = "/tmp/ai_trader"
+        os.makedirs(fallback_dir, exist_ok=True)
+        DB_PATH = os.path.join(fallback_dir, "data.db")
+        log.warning("DB dir '%s' not writable (%s). Falling back to %s", d, e, DB_PATH)
 
 
 def db_conn() -> sqlite3.Connection:
@@ -182,19 +154,19 @@ def db_init() -> None:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              received_at INTEGER NOT NULL,
-              type TEXT,
-              symbol TEXT,
-              tf TEXT,
-              side TEXT,
-              entry REAL,
-              sl REAL,
-              tp1 REAL,
-              tp2 REAL,
-              tp3 REAL,
-              trade_id TEXT,
-              raw_json TEXT
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_at INTEGER NOT NULL,
+                type TEXT,
+                symbol TEXT,
+                tf TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                trade_id TEXT,
+                raw_json TEXT
             )
             """
         )
@@ -206,14 +178,9 @@ def db_init() -> None:
     log.info("DB initialized at %s", DB_PATH)
 
 
-# Ensure DB path is valid at import time (fixes Render deploy crash)
-try:
-    resolve_db_path()
-    db_init()
-except Exception as e:
-    log.error("DB init failed: %s", e)
-    # Don't crash import; routes like /ping still work.
-    # Next DB access will raise if truly unusable.
+# Resolve DB path early, then init
+resolve_db_path()
+db_init()
 
 
 def _to_float(v):
@@ -242,12 +209,8 @@ def save_event(payload: Dict[str, Any]) -> None:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO events (
-                received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json
-            )
-            VALUES (
-                :received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json
-            )
+            INSERT INTO events (received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json)
+            VALUES (:received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json)
             """,
             row,
         )
@@ -259,6 +222,7 @@ def save_event(payload: Dict[str, Any]) -> None:
         row["tf"],
         row["trade_id"],
     )
+
 
 # -------------------------
 # Helpers
@@ -320,6 +284,7 @@ def parse_leverage_x(leverage: Optional[str]) -> Optional[float]:
         return None
     return None
 
+
 # -------------------------
 # Build trades & stats
 # -------------------------
@@ -359,7 +324,11 @@ def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
 
 
 def fetch_events_filtered(
-    symbol: Optional[str], tf: Optional[str], start_ep: Optional[int], end_ep: Optional[int], limit: int = 10000
+    symbol: Optional[str],
+    tf: Optional[str],
+    start_ep: Optional[int],
+    end_ep: Optional[int],
+    limit: int = 10000,
 ) -> List[sqlite3.Row]:
     sql = "SELECT * FROM events WHERE 1=1"
     args: List[Any] = []
@@ -393,7 +362,6 @@ def build_trades_filtered(
     max_rows: int = 20000,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rows = fetch_events_filtered(symbol, tf, start_ep, end_ep, max_rows)
-
     by_tid: Dict[str, List[sqlite3.Row]] = defaultdict(list)
     for r in rows:
         tid = r["trade_id"] or f"noid:{r['symbol']}:{r['received_at']}"
@@ -419,7 +387,6 @@ def build_trades_filtered(
 
         for ev in items:
             etype = ev["type"]
-
             if etype == "ENTRY" and entry is None:
                 entry = ev
                 vsymbol = ev["symbol"]
@@ -440,7 +407,6 @@ def build_trades_filtered(
             total += 1
             if outcome_time and entry_time:
                 times_to_outcome.append(int(outcome_time - entry_time))
-
             is_win = outcome_type in (TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3)
             if is_win:
                 wins += 1
@@ -453,7 +419,8 @@ def build_trades_filtered(
                     hit_tp2 += 1
                 elif outcome_type == TradeOutcome.TP3:
                     hit_tp3 += 1
-            elif outcome_type == TradeOutcome.SL:
+            elif outcome_type == TradeOutcome.SL or outcome_type == TradeOutcome.CLOSE:
+                # CLOSE is counted as a non-win outcome for winrate
                 losses += 1
                 loss_streak += 1
                 worst_loss_streak = max(worst_loss_streak, loss_streak)
@@ -479,7 +446,6 @@ def build_trades_filtered(
 
     winrate = (wins / total * 100.0) if total else 0.0
     avg_sec = int(sum(times_to_outcome) / len(times_to_outcome)) if times_to_outcome else 0
-
     summary = {
         "total_trades": total,
         "wins": wins,
@@ -494,6 +460,7 @@ def build_trades_filtered(
     }
     return trades, summary
 
+
 # -------------------------
 # Telegram
 # -------------------------
@@ -507,7 +474,6 @@ def send_telegram(text: str) -> bool:
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
             return False
         _last_tg = now
-
         import urllib.request, urllib.parse
 
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -550,29 +516,30 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8", "ignore")
             payload = _json.loads(raw)
-            if not payload.get("ok"):
-                result["error"] = f"sendMessage failed: {raw[:200]}"
-                log.warning("Telegram sendMessage error: %s", result["error"])
-                return result
-            msg = payload.get("result") or {}
-            mid = msg.get("message_id")
-            result["ok"] = True
-            result["message_id"] = mid
+        if not payload.get("ok"):
+            result["error"] = f"sendMessage failed: {raw[:200]}"
+            log.warning("Telegram sendMessage error: %s", result["error"])
+            return result
+
+        msg = payload.get("result") or {}
+        mid = msg.get("message_id")
+        result["ok"] = True
+        result["message_id"] = mid
 
         # 2) pinChatMessage
-        if pin and result["message_id"] is not None:
+        if pin and mid is not None:
             pin_url = f"{api_base}/pinChatMessage"
-            pin_data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "message_id": result["message_id"]}).encode()
+            pin_data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "message_id": mid}).encode()
             preq = urllib.request.Request(pin_url, data=pin_data)
             try:
                 with urllib.request.urlopen(preq, timeout=10) as presp:
                     praw = presp.read().decode("utf-8", "ignore")
                     pp = _json.loads(praw)
-                    if pp.get("ok"):
-                        result["pinned"] = True
-                    else:
-                        result["error"] = f"pinChatMessage failed: {praw[:200]}"
-                        log.warning("Telegram pinChatMessage error: %s", result["error"])
+                if pp.get("ok"):
+                    result["pinned"] = True
+                else:
+                    result["error"] = f"pinChatMessage failed: {praw[:200]}"
+                    log.warning("Telegram pinChatMessage error: %s", result["error"])
             except Exception as e:
                 result["error"] = f"pinChatMessage exception: {e}"
                 log.warning("Telegram pin exception: %s", e)
@@ -598,9 +565,9 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
     sym = str(payload.get("symbol") or "?")
     tf_lbl = tf_label_of(payload)
     side = str(payload.get("side") or "")
-
     entry = _to_float(payload.get("entry"))
     sl = _to_float(payload.get("sl"))
+
     tp = _to_float(payload.get("tp"))  # pour TP/SL hits 'tp' = niveau exécuté
     tp1 = _to_float(payload.get("tp1"))
     tp2 = _to_float(payload.get("tp2"))
@@ -634,7 +601,6 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
         label = {"TP1_HIT": "Target #1", "TP2_HIT": "Target #2", "TP3_HIT": "Target #3"}[t]
         spot_pct = pct(tp, entry) if (side and tp is not None and entry is not None) else None
         lev_pct = (spot_pct * lev_x) if (spot_pct is not None and lev_x) else None
-
         lines = []
         lines.append(f"✅ {label} — {sym} {tf_lbl}")
         if tp is not None:
@@ -661,6 +627,7 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
 
     # fallback pour autres types
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
+
 
 # -------------------------
 # HTML templates (ASCII only)
@@ -732,7 +699,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
       setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
       const btc = num(s.btc_dominance);
       const eth = num(s.eth_btc);
-      const t2 = num(s.total2_usd);
+      const t2  = num(s.total2_usd);
       const asi = s.altseason_index;
       setText("alt-btc", Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—");
       setDot ("dot-btc", !!(s.triggers && s.triggers.btc_dominance_ok));
@@ -745,8 +712,14 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--border)}th{text-align:left;
     })
     .catch((e) => {
       setText("alt-asof", "Erreur: " + (e && e.message ? e.message : e));
-      setText("alt-btc", "—"); setText("alt-eth", "—"); setText("alt-asi", "N/A"); setText("alt-t2", "—");
-      setDot("dot-btc", false); setDot("dot-eth", false); setDot("dot-asi", false); setDot("dot-t2", false);
+      setText("alt-btc", "—");
+      setText("alt-eth", "—");
+      setText("alt-asi", "N/A");
+      setText("alt-t2", "—");
+      setDot("dot-btc", false);
+      setDot("dot-eth", false);
+      setDot("dot-asi", false);
+      setDot("dot-t2", false);
     });
 })();
 </script>
@@ -847,8 +820,7 @@ if (canvas && data && data.length > 0) {
   ctx.lineWidth=2; ctx.strokeStyle='#3b82f6'; ctx.beginPath();
   for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); }
   ctx.stroke();
-  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath();
-  ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 
 // altseason quick view
@@ -869,7 +841,7 @@ if (canvas && data && data.length > 0) {
       setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
       const btc = num(s.btc_dominance);
       const eth = num(s.eth_btc);
-      const t2 = num(s.total2_usd);
+      const t2  = num(s.total2_usd);
       const asi = s.altseason_index;
       setText("alt-btc", Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—");
       setDot ("dot-btc", !!(s.triggers && s.triggers.btc_dominance_ok));
@@ -882,8 +854,14 @@ if (canvas && data && data.length > 0) {
     })
     .catch((e) => {
       setText("alt-asof", "Erreur: " + (e && e.message ? e.message : e));
-      setText("alt-btc", "—"); setText("alt-eth", "—"); setText("alt-asi", "N/A"); setText("alt-t2", "—");
-      setDot("dot-btc", false); setDot("dot-eth", false); setDot("dot-asi", false); setDot("dot-t2", false);
+      setText("alt-btc", "—");
+      setText("alt-eth", "—");
+      setText("alt-asi", "N/A");
+      setText("alt-t2", "—");
+      setDot("dot-btc", false);
+      setDot("dot-eth", false);
+      setDot("dot-asi", false);
+      setDot("dot-t2", false);
     });
 })();
 </script>
@@ -963,7 +941,6 @@ th,td{padding:8px 10px;border-bottom:1px solid #1f2937}th{text-align:left;color:
 <div class="muted">Showing up to $limit trades (grouped by trade_id).</div>
 </div>
 </div>
-
 <script>
 const data = $spark_data;
 const canvas = document.getElementById('spark');
@@ -977,8 +954,7 @@ if (canvas && data && data.length > 0) {
   ctx.lineWidth=2; ctx.strokeStyle='#3b82f6'; ctx.beginPath();
   for (let i=0;i<n;i++){ const xp=x(i), yp=y(data[i]); if(i===0)ctx.moveTo(xp,yp); else ctx.lineTo(xp,yp); }
   ctx.stroke();
-  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath();
-  ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad, y(0.5)); ctx.lineTo(W-pad, y(0.5)); ctx.stroke();
 }
 </script>
 </body></html>
@@ -1023,11 +999,6 @@ app = FastAPI(title="AI Trader PRO")
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
-@app.get("/healthz")
-def healthz():
-    # Simple health endpoint for platform checks
-    return {"status": "ok", "db_path": DB_PATH}
 
 # -------- Index (PUBLIC) --------
 @app.get("/", response_class=HTMLResponse)
@@ -1116,15 +1087,12 @@ def openai_health(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     if not (LLM_ENABLED and _openai_client):
-        return {
-            "ok": False,
-            "enabled": bool(LLM_ENABLED),
-            "client_ready": bool(_openai_client),
-            "why": _llm_reason_down,
-        }
+        return {"ok": False, "enabled": bool(LLM_ENABLED), "client_ready": bool(_openai_client), "why": _llm_reason_down}
     try:
         comp = _openai_client.chat.completions.create(
-            model=LLM_MODEL, messages=[{"role": "user", "content": "ping"}], max_tokens=2
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=2,
         )
         sample = comp.choices[0].message.content if comp and comp.choices else ""
         return {"ok": True, "model": LLM_MODEL, "sample": sample}
@@ -1137,22 +1105,20 @@ def openai_health(secret: Optional[str] = Query(None)):
 def _status(val: float, thr: float, direction: str) -> bool:
     return (val < thr) if direction == "below" else (val > thr)
 
-
 # Cache en mémoire pour altseason
 _alt_cache: Dict[str, Any] = {"ts": 0, "snap": None}
 
 
 def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
     """
-    Retourne tjrs un dict. Si toutes les sources échouent, on renvoie le dernier
-    snapshot mémoire ou disque, marqué stale=True.
+    Retourne tjrs un dict. Si toutes les sources échouent, on renvoie le dernier snapshot
+    mémoire ou disque, marqué stale=True.
     """
     now = time.time()
     if (not force) and _alt_cache["snap"] and (now - _alt_cache["ts"] < ALT_CACHE_TTL):
         snap = dict(_alt_cache["snap"])
         snap.setdefault("stale", False)
         return snap
-
     try:
         snap = _altseason_fetch()
         snap["stale"] = False
@@ -1183,7 +1149,7 @@ def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
         }
 
 
-def _altseason_fetch() -> Dict[str, Any]:
+def _altseason_fetch() -> Dict[str, Any]:  # best-effort aggregator
     out = {"asof": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "errors": []}
     try:
         import requests
@@ -1321,11 +1287,7 @@ def _altseason_fetch() -> Dict[str, Any]:
         import requests
         from bs4 import BeautifulSoup
 
-        html = requests.get(
-            "https://www.blockchaincenter.net/altcoin-season-index/",
-            timeout=12,
-            headers=headers,
-        ).text
+        html = requests.get("https://www.blockchaincenter.net/altcoin-season-index/", timeout=12, headers=headers).text
         soup = BeautifulSoup(html, "html.parser")
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"Altcoin Season Index[^0-9]*([0-9]{2,3})", txt)
@@ -1383,11 +1345,13 @@ def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
         "ALTSEASON_ON": on,
     }
 
+
 # PUBLIC: lecture (avec cache)
 @app.get("/altseason/check")
 def altseason_check_public():
     snap = _altseason_snapshot(force=False)
     return _altseason_summary(snap)
+
 
 # GET+POST: notify (PROTÉGÉ) avec pin
 @app.api_route("/altseason/notify", methods=["GET", "POST"])
@@ -1414,6 +1378,7 @@ async def altseason_notify(
         pin = bool(body.get("pin", pin))
 
     pin = bool(pin or TELEGRAM_PIN_ALTSEASON)
+
     s = _altseason_summary(_altseason_snapshot(force=bool(force)))
     sent = None
     pin_res = None
@@ -1432,13 +1397,10 @@ async def altseason_notify(
             "message_id": pin_result.get("message_id"),
             "error": pin_result.get("error"),
         }
-        log.info(
-            "Altseason notify: sent=%s pinned=%s err=%s",
-            sent,
-            pin_res.get("pinned"),
-            pin_res.get("error"),
-        )
+        log.info("Altseason notify: sent=%s pinned=%s err=%s", sent, pin_res.get("pinned"), pin_res.get("error"))
+
     return {"summary": s, "telegram_sent": sent, "pin_result": pin_res}
+
 
 # -------------------------
 # Webhook TradingView (PROTÉGÉ)
@@ -1476,6 +1438,7 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
 
     return {"ok": True}
 
+
 # -------------------------
 # Trades JSON (PROTÉGÉ)
 # -------------------------
@@ -1495,6 +1458,7 @@ def trades_json(
     trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit * 10))
     return JSONResponse({"summary": summary, "trades": trades[-limit:] if limit else trades})
 
+
 # -------------------------
 # Trades CSV (PROTÉGÉ)
 # -------------------------
@@ -1509,7 +1473,6 @@ def trades_csv(
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-
     start_ep = parse_date_to_epoch(start)
     end_ep = parse_date_end_to_epoch(end)
     trades, _ = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10))
@@ -1538,6 +1501,7 @@ def trades_csv(
 
     return Response(content="\n".join(lines), media_type="text/csv")
 
+
 # -------------------------
 # Trades PUBLIC (avec Altseason)
 # -------------------------
@@ -1559,10 +1523,9 @@ def trades_public(
     data = trades[-limit:] if limit else trades
     for tr in data:
         outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        spark_values.append(1.0 if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
+        badge_class = "badge-win" if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else ("badge-loss" if outcome in ("SL_HIT","CLOSE") else "")
+        spark_values.append(1.0 if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else (0.0 if outcome in ("SL_HIT","CLOSE") else 0.5))
         outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
-
         rows_html += (
             "<tr>"
             f"<td>{escape_html(str(tr['trade_id']))}</td>"
@@ -1605,6 +1568,7 @@ def trades_public(
     )
     return HTMLResponse(html)
 
+
 # -------------------------
 # Trades ADMIN (protégé)
 # -------------------------
@@ -1630,8 +1594,8 @@ def trades_admin(
     data = trades[-limit:] if limit else trades
     for tr in data:
         outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        spark_values.append(1.0 if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
+        badge_class = "badge-win" if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else ("badge-loss" if outcome in ("SL_HIT","CLOSE") else "")
+        spark_values.append(1.0 if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT") else (0.0 if outcome in ("SL_HIT","CLOSE") else 0.5))
         outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
         rows_html += (
             "<tr>"
@@ -1672,6 +1636,7 @@ def trades_admin(
     )
     return HTMLResponse(html)
 
+
 # -------------------------
 # Events (PROTÉGÉ)
 # -------------------------
@@ -1679,7 +1644,6 @@ def trades_admin(
 def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM events ORDER BY received_at DESC LIMIT ?", (limit,))
@@ -1714,6 +1678,7 @@ def events(secret: Optional[str] = Query(None), limit: int = Query(200)):
     )
     return HTMLResponse(html)
 
+
 # -------------------------
 # Events JSON (PROTÉGÉ)
 # -------------------------
@@ -1727,6 +1692,7 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
         rows = [dict(r) for r in cur.fetchall()]
     return JSONResponse({"events": rows})
 
+
 # -------------------------
 # Alias admin
 # -------------------------
@@ -1734,28 +1700,24 @@ def events_json(secret: Optional[str] = Query(None), limit: int = Query(200)):
 def trades_alias(secret: str):
     return RedirectResponse(url=f"/trades-admin?secret={secret}", status_code=307)
 
+
 # -------------------------
 # Reset (PROTÉGÉ)
 # -------------------------
 @app.get("/reset")
-def reset_all(
-    secret: Optional[str] = Query(None),
-    confirm: Optional[str] = Query(None),
-    redirect: Optional[str] = Query(None),
-):
+def reset_all(secret: Optional[str] = Query(None), confirm: Optional[str] = Query(None), redirect: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
     if confirm not in ("yes", "true", "1", "YES", "True"):
         return {"ok": False, "error": "Confirmation required: add &confirm=yes"}
-
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM events")
         conn.commit()
-
     if redirect:
         return RedirectResponse(url=redirect, status_code=303)
     return {"ok": True, "deleted": "all"}
+
 
 # -------------------------
 # Self test (PROTÉGÉ)
@@ -1764,7 +1726,6 @@ def reset_all(
 def selftest(secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-
     tid = f"SELFTEST_{int(time.time())}"
     save_event(
         {
@@ -1784,6 +1745,7 @@ def selftest(secret: Optional[str] = Query(None)):
     save_event({"type": "TP1_HIT", "symbol": "TESTUSD", "tf": "15", "side": "LONG", "entry": 100.0, "tp": 101.0, "trade_id": tid})
     return {"ok": True, "trade_id": tid}
 
+
 # -------------------------
 # Altseason Daemon (auto-notify 3/4)
 # -------------------------
@@ -1796,8 +1758,8 @@ def _load_state() -> Dict[str, Any]:
         if os.path.exists(ALTSEASON_STATE_FILE):
             with open(ALTSEASON_STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                if isinstance(d, dict):
-                    return d
+            if isinstance(d, dict):
+                return d
     except Exception:
         pass
     return {"last_on": False, "last_sent_ts": 0, "last_tick_ts": 0}
@@ -1828,7 +1790,6 @@ def _daemon_loop():
             s = _altseason_summary(_altseason_snapshot(force=False))
             now = time.time()
             need_send = False
-
             if s["ALTSEASON_ON"] and not state.get("last_on", False):
                 # Transition OFF -> ON
                 need_send = True
@@ -1870,13 +1831,6 @@ def altseason_daemon_status():
 @app.on_event("startup")
 def _start_daemon():
     global _daemon_thread
-    # Make sure DB path is still valid on dyno start
-    try:
-        resolve_db_path()
-        db_init()
-    except Exception as e:
-        log.error("startup DB check failed: %s", e)
-
     if ALTSEASON_AUTONOTIFY and _daemon_thread is None:
         _daemon_stop.clear()
         _daemon_thread = threading.Thread(target=_daemon_loop, daemon=True)
@@ -1888,18 +1842,14 @@ def _stop_daemon():
     if _daemon_thread is not None:
         _daemon_stop.set()
 
+
 # ============ Run local ============
 if __name__ == "__main__":
     import uvicorn
 
-    # Ensure DB is resolvable when running locally
-    resolve_db_path()
-    db_init()
-
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 '''
-path = "/mnt/data/main.py.txt"
-with open(path, "w", encoding="utf-8") as f:
+with open('/mnt/data/main.py.txt', 'w', encoding='utf-8') as f:
     f.write(content)
-path
 
+print("Created /mnt/data/main.py.txt")
