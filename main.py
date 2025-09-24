@@ -99,6 +99,59 @@ else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
 
 # -------------------------
+# LLM: scorer de confiance (facultatif)
+# -------------------------
+def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
+    """Retourne (confidence_pct, rationale) ou None si LLM inactif/indispo."""
+    if not (LLM_ENABLED and _openai_client):
+        return None
+    try:
+        sym = str(payload.get("symbol") or "?")
+        side = str(payload.get("side") or "?").upper()
+        tf   = tf_label_of(payload)
+        entry = _to_float(payload.get("entry"))
+        sl    = _to_float(payload.get("sl"))
+        tp1   = _to_float(payload.get("tp1"))
+        tp2   = _to_float(payload.get("tp2"))
+        tp3   = _to_float(payload.get("tp3"))
+
+        sys_prompt = (
+            "Tu es un assistant de trading. Donne une estimation de confiance entre 0 et 100 pour la probabilité "
+            "que le trade atteigne au moins TP1 avant SL, basée uniquement sur les niveaux fournis (aucune donnée externe). "
+            "Réponds STRICTEMENT en JSON: {\"confidence_pct\": <0-100>, \"rationale\": \"<raison courte>\"}."
+        )
+        user_prompt = (
+            f"Trade: {sym} | TF={tf} | Side={side}\n"
+            f"Entry={entry} | SL={sl} | TP1={tp1} | TP2={tp2} | TP3={tp3}\n"
+            "Contraintes: pas d'accès marché. Utilise des heuristiques simples (distance SL/TP1, R:R, etc.)."
+        )
+
+        resp = _openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=120,
+            temperature=0.2,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+
+        import re, json as _json
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        obj = _json.loads(m.group(0)) if m else _json.loads(content)
+
+        conf = float(obj.get("confidence_pct"))
+        rat  = str(obj.get("rationale") or "").strip()
+        conf = max(0.0, min(100.0, conf))
+        if len(rat) > 140:
+            rat = rat[:137] + "..."
+        return conf, rat
+    except Exception as e:
+        log.warning("LLM confidence failed: %s", e)
+        return None
+
+# -------------------------
 # SQLite (persistent)
 # -------------------------
 def resolve_db_path() -> None:
@@ -477,7 +530,12 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
         return result
 
 def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Construit un message Telegram lisible pour les événements TradingView.
+    Retourne None pour ignorer certains types (ex: AOE_*).
+    """
     t = str(payload.get("type") or "EVENT").upper()
+    # On ignore les signaux AOE_* pour ne pas spammer
     if t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
         return None
 
@@ -486,11 +544,12 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
     side = str(payload.get("side") or "")
     entry = _to_float(payload.get("entry"))
     sl = _to_float(payload.get("sl"))
-    tp = _to_float(payload.get("tp"))
+    tp = _to_float(payload.get("tp"))  # pour TP/SL hits 'tp' = niveau exécuté
     tp1 = _to_float(payload.get("tp1"))
     tp2 = _to_float(payload.get("tp2"))
     tp3 = _to_float(payload.get("tp3"))
     leverage = payload.get("leverage") or payload.get("lev") or payload.get("lev_reco")
+    lev_x = parse_leverage_x(str(leverage) if leverage is not None else None)
 
     def num(v): return fmt_num(v) if v is not None else "—"
 
@@ -505,14 +564,36 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
         if tp2: lines.append(f"🎯 TP2: {num(tp2)}")
         if tp3: lines.append(f"🎯 TP3: {num(tp3)}")
         if sl:  lines.append(f"❌ SL: {num(sl)}")
+
+        # 🔎 Confiance LLM (si activé et dispo)
+        try:
+            if LLM_ENABLED and _openai_client and (FORCE_LLM or True):
+                res = llm_confidence_for_entry(payload)
+                if res:
+                    conf_pct, rationale = res
+                    if conf_pct >= CONFIDENCE_MIN:
+                        lines.append(f"🧠 Confiance LLM: {conf_pct:.0f}% — {rationale or 'estimation heuristique'}")
+                    else:
+                        lines.append(f"🧠 Confiance LLM: {conf_pct:.0f}%")
+        except Exception as e:
+            log.warning("LLM confidence render failed: %s", e)
+
         lines.append("🤖 Astuce: après TP1, placez SL au BE.")
         return "\n".join(lines)
 
     if t in {"TP1_HIT","TP2_HIT","TP3_HIT"}:
         label = {"TP1_HIT":"Target #1","TP2_HIT":"Target #2","TP3_HIT":"Target #3"}[t]
-        lines = [f"✅ {label} — {sym} {tf_lbl}"]
+        spot_pct = pct(tp, entry) if (side and tp is not None and entry is not None) else None
+        lev_pct = (spot_pct * lev_x) if (spot_pct is not None and lev_x) else None
+        lines = []
+        lines.append(f"✅ {label} — {sym} {tf_lbl}")
         if tp is not None:
             lines.append(f"Mark price : {num(tp)}")
+        if spot_pct is not None:
+            base = f"Profit (spot) : {spot_pct:.2f}%"
+            if lev_pct is not None:
+                base += f" | avec {int(lev_x)}x : {lev_pct:.2f}%"
+            lines.append(base)
         return "\n".join(lines)
 
     if t == "SL_HIT":
@@ -528,7 +609,9 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
             lines.append(f"Raison: {reason}")
         return "\n".join(lines)
 
+    # fallback pour autres types
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
+
 
 # -------------------------
 # HTML templates (minimal valid)
@@ -1633,3 +1716,4 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
