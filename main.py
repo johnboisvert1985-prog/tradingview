@@ -42,7 +42,7 @@ DB_PATH = os.getenv("DB_PATH", "data/data.db")
 DEBUG_MODE = os.getenv("DEBUG", "0") in ("1", "true", "True")
 
 # -------------------------
-# ALTSEASON thresholds (ENV override possible)
+# ALTSEASON thresholds
 # -------------------------
 ALT_BTC_DOM_THR = float(os.getenv("ALT_BTC_DOM_THR", "55.0"))
 ALT_ETH_BTC_THR = float(os.getenv("ALT_ETH_BTC_THR", "0.045"))
@@ -57,7 +57,7 @@ ALTSEASON_POLL_SECONDS = int(os.getenv("ALTSEASON_POLL_SECONDS", "300"))
 ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))
 ALTSEASON_STATE_FILE = os.getenv("ALTSEASON_STATE_FILE", "/tmp/altseason_state.json")
 
-# --- Altseason file cache helpers (dernier snapshot connu) ---
+# --- Altseason file cache helpers (snapshot disque) ---
 def _alt_cache_file_path() -> str:
     return os.getenv("ALT_CACHE_FILE", "/tmp/altseason_last.json")
 
@@ -82,7 +82,6 @@ def _save_last_snapshot(snap: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# Telegram rate limit helper
 TELEGRAM_COOLDOWN_SECONDS = float(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "1.5") or 1.5)
 _last_tg = 0.0
 
@@ -99,6 +98,59 @@ if LLM_ENABLED and OPENAI_API_KEY:
         _llm_reason_down = f"OpenAI client init failed: {e}"
 else:
     _llm_reason_down = "LLM disabled or OPENAI_API_KEY missing"
+
+# -------------------------
+# LLM confidence scorer (facultatif)
+# -------------------------
+def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
+    """Retourne (confidence_pct, rationale) ou None si LLM inactif/indispo."""
+    if not (LLM_ENABLED and _openai_client):
+        return None
+    try:
+        sym = str(payload.get("symbol") or "?")
+        side = str(payload.get("side") or "?").upper()
+        tf   = tf_label_of(payload)
+        entry = _to_float(payload.get("entry"))
+        sl    = _to_float(payload.get("sl"))
+        tp1   = _to_float(payload.get("tp1"))
+        tp2   = _to_float(payload.get("tp2"))
+        tp3   = _to_float(payload.get("tp3"))
+
+        sys_prompt = (
+            "Tu es un assistant de trading. Donne une estimation de confiance entre 0 et 100 pour la probabilité "
+            "que le trade atteigne au moins TP1 avant SL, basée uniquement sur les niveaux fournis (aucune donnée externe). "
+            "Réponds STRICTEMENT en JSON: {\"confidence_pct\": <0-100>, \"rationale\": \"<raison courte>\"}."
+        )
+        user_prompt = (
+            f"Trade: {sym} | TF={tf} | Side={side}\n"
+            f"Entry={entry} | SL={sl} | TP1={tp1} | TP2={tp2} | TP3={tp3}\n"
+            "Contraintes: pas d'accès marché. Utilise des heuristiques simples (distance SL/TP1, R:R, etc.)."
+        )
+
+        resp = _openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=120,
+            temperature=0.2,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+
+        import re as _re, json as _json
+        m = _re.search(r"\{.*\}", content, _re.DOTALL)
+        obj = _json.loads(m.group(0)) if m else _json.loads(content)
+
+        conf = float(obj.get("confidence_pct"))
+        rat  = str(obj.get("rationale") or "").strip()
+        conf = max(0.0, min(100.0, conf))
+        if len(rat) > 140:
+            rat = rat[:137] + "..."
+        return conf, rat
+    except Exception as e:
+        log.warning("LLM confidence failed: %s", e)
+        return None
 
 # -------------------------
 # SQLite (persistent)
@@ -161,13 +213,9 @@ def db_init() -> None:
         conn.commit()
     log.info("DB initialized at %s", DB_PATH)
 
-# ✅ Patch: s'assurer que le chemin DB est prêt AVANT l'init
 resolve_db_path()
 db_init()
 
-# -------------------------
-# Helpers
-# -------------------------
 def _to_float(v):
     try:
         return float(v) if v is not None else None
@@ -201,6 +249,9 @@ def save_event(payload: Dict[str, Any]) -> None:
         conn.commit()
     log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s", row["type"], row["symbol"], row["tf"], row["trade_id"])
 
+# -------------------------
+# Helpers
+# -------------------------
 def escape_html(s: str) -> str:
     return (
         s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -399,63 +450,9 @@ def build_trades_filtered(
     return trades, summary
 
 # -------------------------
-# LLM: scorer de confiance (facultatif)
-# -------------------------
-def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
-    """Retourne (confidence_pct, rationale) ou None si LLM inactif/indispo."""
-    if not (LLM_ENABLED and _openai_client):
-        return None
-    try:
-        sym = str(payload.get("symbol") or "?")
-        side = str(payload.get("side") or "?").upper()
-        tf   = tf_label_of(payload)
-        entry = _to_float(payload.get("entry"))
-        sl    = _to_float(payload.get("sl"))
-        tp1   = _to_float(payload.get("tp1"))
-        tp2   = _to_float(payload.get("tp2"))
-        tp3   = _to_float(payload.get("tp3"))
-
-        sys_prompt = (
-            "Tu es un assistant de trading. Donne une estimation de confiance entre 0 et 100 pour la probabilité "
-            "que le trade atteigne au moins TP1 avant SL, basée uniquement sur les niveaux fournis (aucune donnée externe). "
-            "Réponds STRICTEMENT en JSON: {\"confidence_pct\": <0-100>, \"rationale\": \"<raison courte>\"}."
-        )
-        user_prompt = (
-            f"Trade: {sym} | TF={tf} | Side={side}\n"
-            f"Entry={entry} | SL={sl} | TP1={tp1} | TP2={tp2} | TP3={tp3}\n"
-            "Contraintes: pas d'accès marché. Utilise des heuristiques simples (distance SL/TP1, R:R, etc.)."
-        )
-
-        resp = _openai_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=120,
-            temperature=0.2,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-
-        import re as _re, json as _json
-        m = _re.search(r"\{.*\}", content, _re.DOTALL)
-        obj = _json.loads(m.group(0)) if m else _json.loads(content)
-
-        conf = float(obj.get("confidence_pct"))
-        rat  = str(obj.get("rationale") or "").strip()
-        conf = max(0.0, min(100.0, conf))
-        if len(rat) > 140:
-            rat = rat[:137] + "..."
-        return conf, rat
-    except Exception as e:
-        log.warning("LLM confidence failed: %s", e)
-        return None
-
-# -------------------------
 # Telegram
 # -------------------------
 def send_telegram(text: str) -> bool:
-    """Envoi simple sans pin + cooldown."""
     global _last_tg
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
@@ -476,10 +473,6 @@ def send_telegram(text: str) -> bool:
         return False
 
 def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
-    """
-    Envoie un message Telegram et, si pin=True, l'épingle.
-    Retour: {"ok": bool, "message_id": int|None, "pinned": bool, "error": str|None}
-    """
     result = {"ok": False, "message_id": None, "pinned": False, "error": None}
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         result["error"] = "Missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"
@@ -496,7 +489,7 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
 
         api_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-        # 1) sendMessage
+        # sendMessage
         send_url = f"{api_base}/sendMessage"
         data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
         req = urllib.request.Request(send_url, data=data)
@@ -512,7 +505,7 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
             result["ok"] = True
             result["message_id"] = mid
 
-        # 2) pinChatMessage
+        # pinChatMessage
         if pin and result["message_id"] is not None:
             pin_url = f"{api_base}/pinChatMessage"
             pin_data = urllib.parse.urlencode({
@@ -544,7 +537,6 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
     Retourne None pour ignorer certains types (ex: AOE_*).
     """
     t = str(payload.get("type") or "EVENT").upper()
-    # On ignore les signaux AOE_* pour ne pas spammer
     if t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
         return None
 
@@ -618,8 +610,8 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
             lines.append(f"Raison: {reason}")
         return "\n".join(lines)
 
-    # fallback pour autres types
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
+
 # -------------------------
 # HTML templates
 # -------------------------
@@ -663,6 +655,12 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px 10px;
   <div>ETH/BTC: <span id="alt-eth">—</span> (thr &gt; $eth_thr) <span id="dot-eth" class="dot"></span></div>
   <div>Altseason Index: <span id="alt-asi">N/A</span> (thr ≥ $asi_thr) <span id="dot-asi" class="dot"></span></div>
   <div>TOTAL2: <span id="alt-t2">—</span> (thr &gt; $t2_thr T$) <span id="dot-t2" class="dot"></span></div>
+  <div style="margin-top:10px">
+    <strong>Badges:</strong>
+    <span id="alt3" class="chip">Prep 3/4: —</span>
+    <span id="alt4" class="chip">Confirm 4/4: —</span>
+  </div>
+  <div class="muted" style="margin-top:6px">Séries (jours consécutifs): <span id="d3">0</span>d @3/4, <span id="d4">0</span>d @4/4</div>
 </div>
 
 <script>
@@ -670,6 +668,7 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px 10px;
   function setText(id, txt){ const el = document.getElementById(id); if (el) el.textContent = txt; }
   function setDot(id, ok){ const el = document.getElementById(id); if (el) el.className = "dot " + (ok ? "ok" : "warn"); }
   function num(v){ return typeof v === "number" ? v : Number(v); }
+  // 1) Valeurs instantanées
   fetch("/altseason/check")
   .then(async r => { const t = await r.text(); if(!r.ok) throw new Error(t); return JSON.parse(t); })
   .then(s => {
@@ -684,242 +683,101 @@ table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:8px 10px;
     setText("alt-asof", "Erreur: " + (e && e.message ? e.message : e));
     setDot("dot-btc", false); setDot("dot-eth", false); setDot("dot-asi", false); setDot("dot-t2", false);
   });
+  // 2) Streaks / badges
+  fetch("/altseason/streaks")
+    .then(r => r.json())
+    .then(s => {
+      const b3 = document.getElementById("alt3");
+      const b4 = document.getElementById("alt4");
+      if (b3) b3.textContent = (s.ALT3_ON ? "Prep 3/4: ON" : "Prep 3/4: OFF");
+      if (b4) b4.textContent = (s.ALT4_ON ? "Confirm 4/4: ON" : "Confirm 4/4: OFF");
+      const d3 = document.getElementById("d3");
+      const d4 = document.getElementById("d4");
+      if (d3) d3.textContent = String(s.consec_3of4_days || 0);
+      if (d4) d4.textContent = String(s.consec_4of4_days || 0);
+    })
+    .catch(()=>{});
 })();
 </script>
 </body></html>
 """)
 
-# ----- PUBLIC trades (dashboard moderne avec Altseason & bannière) -----
 TRADES_PUBLIC_HTML_TPL = Template(r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Trader PRO — Trades</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trades (Public)</title>
 <style>
-:root{--bg:#0f172a;--card:#111827;--text:#e5e7eb;--muted:#94a3b8;--green:#10b981;--red:#ef4444;--blue:#3b82f6;--yellow:#f59e0b;--border:#1f2937;--chip-bg:#0b1220}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-.container{max-width:1200px;margin:0 auto;padding:20px}
-h1{margin:0 0 14px 0;font-size:26px;font-weight:800;letter-spacing:.2px}
-.subtitle{color:var(--muted);margin-bottom:18px}
-.grid{display:grid;grid-template-columns:1fr;gap:16px}
-@media(min-width:1000px){.grid{grid-template-columns:2fr 1fr}}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
-.section-title{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-.banner{display:none;background:linear-gradient(90deg,rgba(16,185,129,.15),rgba(59,130,246,.15));border:1px solid var(--border);border-radius:12px;padding:12px 14px;margin-bottom:16px}
-.banner .dot{width:10px;height:10px;border-radius:10px;background:var(--green);display:inline-block;margin-right:8px}
-.banner strong{color:var(--text)}
-.filters{display:grid;grid-template-columns:1fr;gap:10px}
-@media(min-width:800px){.filters{grid-template-columns:repeat(5,1fr)}}
-.filters input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:var(--text)}
-.btn{display:inline-block;padding:10px 12px;border:1px solid var(--border);background:#0b1220;color:var(--text);text-decoration:none;font-weight:700;border-radius:10px}
-.btn:hover{background:#111a2b}
-.btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
-.kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-@media(min-width:700px){.kpis{grid-template-columns:repeat(4,1fr)}}
-.kpi{background:#0b1220;border:1px dashed var(--border);border-radius:12px;padding:12px}
-.kpi .kv{font-size:13px;color:var(--muted)}
-.kpi .val{font-size:20px;font-weight:800}
-.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:12px}
-table{width:100%;border-collapse:collapse;font-size:14px;min-width:900px}
-th,td{padding:10px 10px;border-bottom:1px solid var(--border)}
-th{text-align:left;color:var(--muted);font-weight:700;position:sticky;top:0;background:var(--card)}
-tr:last-child td{border-bottom:none}
-.muted{color:var(--muted)}
-.chip{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;background:var(--chip-bg)}
-.badge-win{border-color:rgba(16,185,129,.35);background:rgba(16,185,129,.12);color:#a7f3d0}
-.badge-loss{border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12);color:#fecaca}
-.alt-grid{display:grid;grid-template-columns:1fr;gap:10px}
-@media(min-width:520px){.alt-grid{grid-template-columns:repeat(2,1fr)}}
-.alt-kv{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border:1px dashed var(--border);border-radius:10px;background:#0b1220}
-.alt-right{display:flex;align-items:center;gap:8px}
-.dot{display:inline-block;width:10px;height:10px;border-radius:10px}
-.ok{background:var(--green)} .warn{background:#fb923c}
-.spark{height:54px}
-small.code{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
-</style>
-</head>
-<body>
-<div class="container">
-  <h1>AI Trader PRO — Trades</h1>
-  <div class="subtitle">Historique des signaux + état Altseason en direct</div>
+body{margin:0;padding:24px;background:#0f172a;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+h1{margin:0 0 16px 0}.muted{color:#94a3b8}
+table{width:100%;border-collapse:collapse}th,td{padding:8px 10px;border-bottom:1px solid #1f2937}th{color:#94a3b8}
+.chip{display:inline-block;padding:2px 8px;border:1px solid #1f2937;border-radius:999px}
+.badge-win{background:#052e1f;border-color:#065f46}.badge-loss{background:#3f1d1d}
+label{display:block;margin:6px 0 2px}.row{display:flex;gap:10px;flex-wrap:wrap}
+input{background:#111827;color:#e5e7eb;border:1px solid #1f2937;border-radius:6px;padding:6px}
+a.btn{display:inline-block;padding:8px 12px;border:1px solid #1f2937;color:#e5e7eb;text-decoration:none;border-radius:8px}
+.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;margin-bottom:16px}
+</style></head><body>
+<h1>Trades (Public)</h1>
+<div class="card">
+  <form method="get">
+    <div class="row">
+      <div><label>Symbol</label><input name="symbol" value="$symbol"></div>
+      <div><label>TF</label><input name="tf" value="$tf"></div>
+      <div><label>Start (YYYY-MM-DD)</label><input name="start" value="$start"></div>
+      <div><label>End (YYYY-MM-DD)</label><input name="end" value="$end"></div>
+      <div><label>Limit</label><input name="limit" value="$limit" type="number" min="1" max="10000"></div>
+    </div>
+    <div style="margin-top:8px">
+      <button class="btn" type="submit">Apply</button>
+      <a class="btn" href="/">Home</a>
+    </div>
+  </form>
+</div>
 
-  <!-- ALTSEASON ALERT BANNER (visible si 3/4 verts) -->
-  <div id="alt-banner" class="banner">
-    <span class="dot"></span>
-    <strong>ALTSEASON ACTIVÉE</strong> — <span id="alt-banner-text" class="muted"></span>
+<div class="card" id="altseason-card">
+  <div class="row">
+    <div><strong>Altseason:</strong></div>
+    <div id="alt-badges" class="muted">Chargement…</div>
   </div>
+  <div class="muted" style="margin-top:6px">Séries: <span id="alt-d3">0</span>d @3/4, <span id="alt-d4">0</span>d @4/4</div>
+</div>
+<script>
+(function(){
+  function set(t, id){ const el=document.getElementById(id); if(el) el.textContent=t; }
+  fetch("/altseason/streaks")
+    .then(r=>r.json())
+    .then(s=>{
+      const badge = (s.ALT4_ON ? "✅ Confirm 4/4"
+                   : s.ALT3_ON ? "🟢 Prep 3/4"
+                   : "⚪ Veille");
+      set(badge, "alt-badges");
+      set(String(s.consec_3of4_days||0), "alt-d3");
+      set(String(s.consec_4of4_days||0), "alt-d4");
+    })
+    .catch(()=>{ set("—", "alt-badges"); });
+})();
+</script>
 
-  <div class="grid">
-    <!-- LEFT: Trades -->
-    <div class="card">
-      <div class="section-title">Filtres</div>
-      <form class="filters" method="get" action="/trades">
-        <input type="text" name="symbol" placeholder="Symbol (ex. BTCUSDT)" value="$symbol"/>
-        <input type="text" name="tf" placeholder="TF (ex. 15 / 1D)" value="$tf"/>
-        <input type="text" name="start" placeholder="Start YYYY-MM-DD" value="$start"/>
-        <input type="text" name="end" placeholder="End YYYY-MM-DD" value="$end"/>
-        <input type="number" name="limit" placeholder="Limit" min="10" max="5000" value="$limit"/>
-        <div class="btn-row" style="grid-column:1/-1">
-          <button class="btn" type="submit">Appliquer</button>
-          <a class="btn" href="/trades">Réinitialiser</a>
-          <a class="btn" href="/trades.csv?symbol=$symbol&tf=$tf&start=$start&end=$end&limit=$limit">Exporter CSV</a>
-        </div>
-      </form>
-
-      <div class="section-title" style="margin-top:14px">Résumé</div>
-      <div class="kpis">
-        <div class="kpi"><div class="kv">Total trades</div><div class="val">$total_trades</div></div>
-        <div class="kpi"><div class="kv">Winrate</div><div class="val">$winrate_pct%</div></div>
-        <div class="kpi"><div class="kv">Wins / Losses</div><div class="val">$wins / $losses</div></div>
-        <div class="kpi"><div class="kv">Avg. time to outcome</div><div class="val">$avg_time_to_outcome_sec s</div></div>
-        <div class="kpi"><div class="kv">TP1 / TP2 / TP3 hits</div><div class="val">$tp1_hits / $tp2_hits / $tp3_hits</div></div>
-        <div class="kpi"><div class="kv">Best win streak</div><div class="val">$best_win_streak</div></div>
-        <div class="kpi"><div class="kv">Worst loss streak</div><div class="val">$worst_loss_streak</div></div>
-        <div class="kpi"><div class="kv">Sparkline wins/losses</div><canvas id="spark" class="spark"></canvas></div>
-      </div>
-
-      <div class="section-title" style="margin-top:16px">Trades</div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Trade ID</th><th>Symbol</th><th>TF</th><th>Side</th>
-              <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
-              <th>Outcome</th><th>Duration (s)</th>
-            </tr>
-          </thead>
-          <tbody>
-            $rows_html
-          </tbody>
-        </table>
-      </div>
-      <div class="muted" style="margin-top:8px">
-        Astuce: utilisez <small class="code">/trades.csv</small> pour exporter.
-      </div>
-    </div>
-
-    <!-- RIGHT: Altseason live -->
-    <div class="card">
-      <div class="section-title">Altseason — État en direct</div>
-      <div id="alt-asof" class="muted">Chargement…</div>
-      <div class="alt-grid" style="margin-top:10px">
-        <div class="alt-kv">
-          <div>BTC Dominance</div>
-          <div class="alt-right">
-            <span id="alt-btc" class="muted">—</span>
-            <span class="muted">(< $btc_thr%)</span>
-            <span id="dot-btc" class="dot"></span>
-          </div>
-        </div>
-        <div class="alt-kv">
-          <div>ETH/BTC</div>
-          <div class="alt-right">
-            <span id="alt-eth" class="muted">—</span>
-            <span class="muted">(> $eth_thr)</span>
-            <span id="dot-eth" class="dot"></span>
-          </div>
-        </div>
-        <div class="alt-kv">
-          <div>Altseason Index</div>
-          <div class="alt-right">
-            <span id="alt-asi" class="muted">N/A</span>
-            <span class="muted">(&ge; $asi_thr)</span>
-            <span id="dot-asi" class="dot"></span>
-          </div>
-        </div>
-        <div class="alt-kv">
-          <div>TOTAL2 (ex-BTC)</div>
-          <div class="alt-right">
-            <span id="alt-t2" class="muted">—</span>
-            <span class="muted">(> $t2_thr T$)</span>
-            <span id="dot-t2" class="dot"></span>
-          </div>
-        </div>
-      </div>
-      <div class="muted" style="margin-top:8px">Passe au vert quand ≥ 3 conditions sont validées.</div>
-    </div>
+<div class="card">
+  <div class="row">
+    <div>Total trades: <strong>$total_trades</strong></div>
+    <div>Winrate: <strong>$winrate_pct%</strong></div>
+    <div>W/L: <strong>$wins</strong>/<strong>$losses</strong></div>
+    <div>TP1/2/3: <strong>$tp1_hits</strong>/<strong>$tp2_hits</strong>/<strong>$tp3_hits</strong></div>
+    <div>Avg time (s): <strong>$avg_time_to_outcome_sec</strong></div>
+    <div>Best/Worst streak: <strong>$best_win_streak</strong>/<strong>$worst_loss_streak</strong></div>
   </div>
 </div>
 
-<script>
-(function(){
-  // --- Sparkline ---
-  try{
-    const data = JSON.parse('$spark_data'.replaceAll("&quot;","\""));
-    const canvas = document.getElementById("spark");
-    if (canvas && Array.isArray(data) && data.length){
-      const w = canvas.clientWidth || 260, h = canvas.clientHeight || 54;
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      const pad = 6; const L = data.length;
-      const x = (i)=> pad + (w-2*pad)*(i/(L-1||1));
-      const y = (v)=> pad + (h-2*pad)*(1 - (v-0)/(1-0||1));
-      ctx.globalAlpha = 0.25; ctx.strokeStyle = "#334155"; ctx.lineWidth = 1;
-      [0,0.5,1].forEach((g)=>{ ctx.beginPath(); ctx.moveTo(pad, y(g)); ctx.lineTo(w-pad, y(g)); ctx.stroke(); });
-      ctx.globalAlpha = 1; ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 2;
-      ctx.beginPath();
-      data.forEach((v,i)=>{ const X=x(i), Y=y(v); if(i===0) ctx.moveTo(X,Y); else ctx.lineTo(X,Y); });
-      ctx.stroke();
-    }
-  }catch(e){}
-
-  // --- Altseason live + banner ---
-  const url = "/altseason/check";
-  const banner = document.getElementById("alt-banner");
-  const btxt = document.getElementById("alt-banner-text");
-
-  function setText(id, txt){ const el = document.getElementById(id); if (el) el.textContent = txt; }
-  function dot(id, ok){ const el = document.getElementById(id); if (el) el.className = "dot " + (ok?"ok":"warn"); }
-  function num(v){ return typeof v === "number" ? v : Number(v); }
-
-  function renderAltseason(s){
-    setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
-    const btc = num(s.btc_dominance), eth = num(s.eth_btc), t2 = num(s.total2_usd), asi = s.altseason_index;
-
-    setText("alt-btc", Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—");
-    dot("dot-btc", !!(s.triggers && s.triggers.btc_dominance_ok));
-
-    setText("alt-eth", Number.isFinite(eth) ? eth.toFixed(5) : "—");
-    dot("dot-eth", !!(s.triggers && s.triggers.eth_btc_ok));
-
-    setText("alt-asi", (asi == null) ? "N/A" : String(asi));
-    dot("dot-asi", !!(s.triggers && s.triggers.altseason_index_ok));
-
-    setText("alt-t2", Number.isFinite(t2) ? (t2/1e12).toFixed(2) + " T$" : "—");
-    dot("dot-t2", !!(s.triggers && s.triggers.total2_ok));
-
-    if (s.ALTSEASON_ON){
-      banner.style.display = "block";
-      btxt.textContent = "conditions validées: " + (s.greens || 0) + "/4 — tenez-vous prêt";
-    } else {
-      banner.style.display = "none";
-    }
-  }
-
-  function fetchAlt(){
-    fetch(url).then(async (r)=>{
-      const txt = await r.text();
-      if (!r.ok) throw new Error(txt.slice(0,300));
-      let s; try{ s = JSON.parse(txt); }catch(e){ throw new Error("Invalid JSON"); }
-      renderAltseason(s);
-    }).catch((e)=>{
-      setText("alt-asof","Erreur: " + (e && e.message ? e.message : e));
-      ["btc","eth","asi","t2"].forEach(k=> setText("alt-"+k,"—"));
-      ["btc","eth","asi","t2"].forEach(k=> dot("dot-"+k,false));
-      banner.style.display = "none";
-    });
-  }
-
-  fetchAlt();
-  setInterval(fetchAlt, 90000);
-})();
-</script>
-</body>
-</html>
+<div class="card">
+  <table><thead>
+    <tr><th>ID</th><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Outcome</th><th>Duration (s)</th></tr>
+  </thead><tbody>
+    $rows_html
+  </tbody></table>
+</div>
+</body></html>
 """)
 
-# ----- Admin trades (protégé) -----
 TRADES_ADMIN_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trades (Admin)</title>
@@ -928,7 +786,7 @@ body{margin:0;padding:24px;background:#0f172a;color:#e5e7eb;font-family:system-u
 h1{margin:0 0 16px 0}.muted{color:#94a3b8}
 table{width:100%;border-collapse:collapse}th,td{padding:8px 10px;border-bottom:1px solid #1f2937}th{color:#94a3b8}
 .chip{display:inline-block;padding:2px 8px;border:1px solid #1f2937;border-radius:999px}
-.badge-win{background:#052e1f;border-color:#065f46}.badge-loss{background:#3f1d1d;border-color:#7f1d1d}
+.badge-win{background:#052e1f;border-color:#065f46}.badge-loss{background:#3f1d1d}
 label{display:block;margin:6px 0 2px}.row{display:flex;gap:10px;flex-wrap:wrap}
 input{background:#111827;color:#e5e7eb;border:1px solid #1f2937;border-radius:6px;padding:6px}
 a.btn{display:inline-block;padding:8px 12px;border:1px solid #1f2937;color:#e5e7eb;text-decoration:none;border-radius:8px}
@@ -1000,6 +858,7 @@ pre{white-space:pre-wrap;margin:0}
 </div>
 </body></html>
 """)
+
 # -------------------------
 # FastAPI app
 # -------------------------
@@ -1110,7 +969,7 @@ def openai_health(secret: Optional[str] = Query(None)):
         return {"ok": False, "error": str(e)}
 
 # -------------------------
-# ALTSEASON: fetchers + cache + summary + endpoints
+# ALTSEASON helpers + endpoints
 # -------------------------
 _alt_cache: Dict[str, Any] = {"ts": 0, "snap": None}
 
@@ -1256,11 +1115,52 @@ def _altseason_fetch() -> Dict[str, Any]:
 
     return out
 
+def _ok_cmp(val: Optional[float], thr: float, direction: str) -> bool:
+    if val is None:
+        return False
+    return (val < thr) if direction == "below" else (val > thr)
+
+def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
+    btc = snap.get("btc_dominance")
+    eth = snap.get("eth_btc")
+    t2 = snap.get("total2_usd")
+    asi = snap.get("altseason_index")
+
+    btc_ok = _ok_cmp(btc, ALT_BTC_DOM_THR, "below")
+    eth_ok = _ok_cmp(eth, ALT_ETH_BTC_THR, "above")
+    t2_ok = _ok_cmp(t2, ALT_TOTAL2_THR_T * 1e12, "above")
+    asi_ok = (asi is not None) and _ok_cmp(float(asi), ALT_ASI_THR, "above")
+
+    greens = sum([btc_ok, eth_ok, t2_ok, asi_ok])
+    on = greens >= ALT_GREENS_REQUIRED
+
+    return {
+        "asof": snap.get("asof"),
+        "stale": bool(snap.get("stale", False)),
+        "errors": snap.get("errors", []),
+        "btc_dominance": (None if btc is None else float(btc)),
+        "eth_btc": (None if eth is None else float(eth)),
+        "total2_usd": (None if t2 is None else float(t2)),
+        "altseason_index": (None if asi is None else int(asi)),
+        "thresholds": {
+            "btc": ALT_BTC_DOM_THR,
+            "eth_btc": ALT_ETH_BTC_THR,
+            "asi": ALT_ASI_THR,
+            "total2_trillions": ALT_TOTAL2_THR_T,
+            "greens_required": ALT_GREENS_REQUIRED
+        },
+        "triggers": {
+            "btc_dominance_ok": btc_ok,
+            "eth_btc_ok": eth_ok,
+            "total2_ok": t2_ok,
+            "altseason_index_ok": asi_ok
+        },
+        "greens": greens,
+        "ALTSEASON_ON": on
+    }
+
+# cache + snapshot loader
 def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
-    """
-    Retourne toujours un dict. Si les sources live échouent,
-    renvoie le dernier snapshot (mémoire ou disque) marqué stale=True.
-    """
     now = time.time()
     if (not force) and _alt_cache["snap"] and (now - _alt_cache["ts"] < ALT_CACHE_TTL):
         snap = dict(_alt_cache["snap"])
@@ -1295,56 +1195,11 @@ def _altseason_snapshot(force: bool = False) -> Dict[str, Any]:
             "stale": True,
         }
 
-def _altseason_summary(snap: Dict[str, Any]) -> Dict[str, Any]:
-    def _ok(val: Optional[float], thr: float, direction: str) -> bool:
-        if val is None:
-            return False
-        return (val < thr) if direction == "below" else (val > thr)
-
-    btc = snap.get("btc_dominance")
-    eth = snap.get("eth_btc")
-    t2 = snap.get("total2_usd")
-    asi = snap.get("altseason_index")
-
-    btc_ok = _ok(btc, ALT_BTC_DOM_THR, "below")
-    eth_ok = _ok(eth, ALT_ETH_BTC_THR, "above")
-    t2_ok = _ok(t2, ALT_TOTAL2_THR_T * 1e12, "above")
-    asi_ok = (asi is not None) and _ok(float(asi), ALT_ASI_THR, "above")
-
-    greens = sum([btc_ok, eth_ok, t2_ok, asi_ok])
-    on = greens >= ALT_GREENS_REQUIRED
-
-    return {
-        "asof": snap.get("asof"),
-        "stale": bool(snap.get("stale", False)),
-        "errors": snap.get("errors", []),
-        "btc_dominance": (None if btc is None else float(btc)),
-        "eth_btc": (None if eth is None else float(eth)),
-        "total2_usd": (None if t2 is None else float(t2)),
-        "altseason_index": (None if asi is None else int(asi)),
-        "thresholds": {
-            "btc": ALT_BTC_DOM_THR,
-            "eth_btc": ALT_ETH_BTC_THR,
-            "asi": ALT_ASI_THR,
-            "total2_trillions": ALT_TOTAL2_THR_T,
-            "greens_required": ALT_GREENS_REQUIRED
-        },
-        "triggers": {
-            "btc_dominance_ok": btc_ok,
-            "eth_btc_ok": eth_ok,
-            "total2_ok": t2_ok,
-            "altseason_index_ok": asi_ok
-        },
-        "greens": greens,
-        "ALTSEASON_ON": on
-    }
-
 # PUBLIC: lecture (avec cache)
 @app.get("/altseason/check")
 def altseason_check_public():
     snap = _altseason_snapshot(force=False)
     return _altseason_summary(snap)
-
 # GET+POST: notify (PROTÉGÉ) avec pin
 @app.api_route("/altseason/notify", methods=["GET", "POST"])
 async def altseason_notify(
@@ -1387,6 +1242,98 @@ async def altseason_notify(
         log.info("Altseason notify: sent=%s pinned=%s err=%s", sent, pin_res.get("pinned"), pin_res.get("error"))
 
     return {"summary": s, "telegram_sent": sent, "pin_result": pin_res}
+
+# ----- Streaks (3/4 et 4/4) -----
+def _load_state() -> Dict[str, Any]:
+    try:
+        if os.path.exists(ALTSEASON_STATE_FILE):
+            with open(ALTSEASON_STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+    except Exception:
+        pass
+    # valeurs par défaut
+    return {
+        "last_on": False, "last_sent_ts": 0, "last_tick_ts": 0,
+        "consec_3of4_days": 0, "consec_4of4_days": 0,
+        "last_streak_date": None  # "YYYY-MM-DD" UTC
+    }
+
+def _save_state(state: Dict[str, Any]) -> None:
+    try:
+        d = os.path.dirname(ALTSEASON_STATE_FILE) or "/tmp"
+        os.makedirs(d, exist_ok=True)
+        with open(ALTSEASON_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def _today_utc_str() -> str:
+    import datetime as dt
+    return dt.datetime.utcnow().strftime("%Y-%m-%d")
+
+def _update_daily_streaks(state: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    """Met à jour les compteurs journaliers 3/4 et 4/4 au changement de date UTC."""
+    import datetime as dt
+    today = _today_utc_str()
+    last_date = state.get("last_streak_date")
+    if last_date == today:
+        return  # déjà compté pour aujourd'hui
+
+    greens = int(summary.get("greens") or 0)
+    is3 = greens >= 3
+    is4 = greens >= 4
+
+    # Si on change de jour, on incrémente/raz
+    if last_date is None:
+        state["consec_3of4_days"] = 1 if is3 else 0
+        state["consec_4of4_days"] = 1 if is4 else 0
+    else:
+        # Vérifier si jour consécutif
+        try:
+            d_last = dt.datetime.strptime(last_date, "%Y-%m-%d")
+            d_today = dt.datetime.strptime(today, "%Y-%m-%d")
+            consecutive = (d_today - d_last).days == 1
+        except Exception:
+            consecutive = False
+
+        if consecutive:
+            state["consec_3of4_days"] = (state.get("consec_3of4_days", 0) + 1) if is3 else 0
+            state["consec_4of4_days"] = (state.get("consec_4of4_days", 0) + 1) if is4 else 0
+        else:
+            state["consec_3of4_days"] = 1 if is3 else 0
+            state["consec_4of4_days"] = 1 if is4 else 0
+
+    state["last_streak_date"] = today
+
+@app.get("/altseason/streaks")
+def altseason_streaks():
+    """Expose l'état 3/4 et 4/4 + compteurs de jours consécutifs (basé sur UTC)."""
+    st = _load_state()
+    s = _altseason_summary(_altseason_snapshot(force=False))
+    # Mettre à jour si nouveau jour
+    _update_daily_streaks(st, s)
+    _save_state(st)
+    return {
+        "asof": s.get("asof"),
+        "greens": s.get("greens"),
+        "ALT3_ON": bool(int(s.get("greens") or 0) >= 3),
+        "ALT4_ON": bool(int(s.get("greens") or 0) >= 4),
+        "consec_3of4_days": int(st.get("consec_3of4_days") or 0),
+        "consec_4of4_days": int(st.get("consec_4of4_days") or 0),
+    }
+
+@app.get("/altseason/daemon-status")
+def altseason_daemon_status():
+    st = _load_state()
+    return {
+        "autonotify_enabled": ALTSEASON_AUTONOTIFY,
+        "poll_seconds": ALTSEASON_POLL_SECONDS,
+        "notify_min_gap_min": ALTSEASON_NOTIFY_MIN_GAP_MIN,
+        "greens_required": ALT_GREENS_REQUIRED,
+        "state": st
+    }
 # -------------------------
 # Webhook TradingView (PROTÉGÉ)
 # -------------------------
@@ -1407,7 +1354,7 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     log.info("Webhook payload: %s", json.dumps(payload)[:300])
     save_event(payload)
 
-    # 👉 Envoi Telegram pour les signaux de trade (non épinglés)
+    # Envoi Telegram pour les signaux de trade (non épinglés)
     try:
         msg = telegram_rich_message(payload)
         if msg:
@@ -1432,8 +1379,9 @@ def trades_json(
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    start_ep = parse_date_to_epoch(start); end_ep = parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit*10))
+    start_ep = parse_date_to_epoch(start)
+    end_ep = parse_date_end_to_epoch(end)
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(1000, limit * 10))
     return JSONResponse({"summary": summary, "trades": trades[-limit:] if limit else trades})
 
 # -------------------------
@@ -1450,140 +1398,17 @@ def trades_csv(
 ):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    start_ep = parse_date_to_epoch(start); end_ep = parse_date_end_to_epoch(end)
-    trades, _ = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
+    start_ep = parse_date_to_epoch(start)
+    end_ep = parse_date_end_to_epoch(end)
+    trades, _ = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10))
     data = trades[-limit:] if limit else trades
     headers = ["trade_id","symbol","tf","side","entry","sl","tp1","tp2","tp3","entry_time","outcome","outcome_time","duration_sec"]
     lines = [",".join(headers)]
     for tr in data:
-        row = [str(tr.get(h,"")) for h in headers]
+        row = [str(tr.get(h, "")) for h in headers]
         row = [("\"%s\"" % x) if ("," in x) else x for x in row]
         lines.append(",".join(row))
     return Response(content="\n".join(lines), media_type="text/csv")
-
-# -------------------------
-# Trades PUBLIC (avec Altseason)
-# -------------------------
-@app.get("/trades", response_class=HTMLResponse)
-def trades_public(
-    symbol: Optional[str] = Query(None),
-    tf: Optional[str] = Query(None),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    limit: int = Query(100)
-):
-    start_ep = parse_date_to_epoch(start); end_ep = parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
-
-    rows_html = ""; spark_values = []
-    data = trades[-limit:] if limit else trades
-    for tr in data:
-        outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        spark_values.append(1.0 if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
-        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
-        rows_html += (
-            "<tr>"
-            f"<td>{escape_html(str(tr['trade_id']))}</td>"
-            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
-            f"<td>{fmt_num(tr.get('entry'))}</td>"
-            f"<td>{fmt_num(tr.get('sl'))}</td>"
-            f"<td>{fmt_num(tr.get('tp1'))}</td>"
-            f"<td>{fmt_num(tr.get('tp2'))}</td>"
-            f"<td>{fmt_num(tr.get('tp3'))}</td>"
-            f"<td>{outcome_html}</td>"
-            f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
-            "</tr>"
-        )
-
-    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
-        symbol=escape_html(symbol or ""),
-        tf=escape_html(tf or ""),
-        start=escape_html(start or ""),
-        end=escape_html(end or ""),
-        limit=str(limit),
-        total_trades=str(summary["total_trades"]),
-        winrate_pct=str(summary["winrate_pct"]),
-        wins=str(summary["wins"]),
-        losses=str(summary["losses"]),
-        tp1_hits=str(summary["tp1_hits"]),
-        tp2_hits=str(summary["tp2_hits"]),
-        tp3_hits=str(summary["tp3_hits"]),
-        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
-        best_win_streak=str(summary["best_win_streak"]),
-        worst_loss_streak=str(summary["worst_loss_streak"]),
-        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values),
-        btc_thr=str(int(ALT_BTC_DOM_THR)),
-        eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
-        asi_thr=str(int(ALT_ASI_THR)),
-        t2_thr=f"{ALT_TOTAL2_THR_T:.2f}"
-    )
-    return HTMLResponse(html)
-
-# -------------------------
-# Trades ADMIN (protégé)
-# -------------------------
-@app.get("/trades-admin", response_class=HTMLResponse)
-def trades_admin(
-    secret: Optional[str] = Query(None),
-    symbol: Optional[str] = Query(None),
-    tf: Optional[str] = Query(None),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    limit: int = Query(100)
-):
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid secret")
-    start_ep = parse_date_to_epoch(start); end_ep = parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
-
-    rows_html = ""; spark_values = []
-    data = trades[-limit:] if limit else trades
-    for tr in data:
-        outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        spark_values.append(1.0 if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
-        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
-        rows_html += (
-            "<tr>"
-            f"<td>{escape_html(str(tr['trade_id']))}</td>"
-            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
-            f"<td>{fmt_num(tr.get('entry'))}</td>"
-            f"<td>{fmt_num(tr.get('sl'))}</td>"
-            f"<td>{fmt_num(tr.get('tp1'))}</td>"
-            f"<td>{fmt_num(tr.get('tp2'))}</td>"
-            f"<td>{fmt_num(tr.get('tp3'))}</td>"
-            f"<td>{outcome_html}</td>"
-            f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
-            "</tr>"
-        )
-
-    html = TRADES_ADMIN_HTML_TPL.safe_substitute(
-        secret=escape_html(secret or ""),
-        symbol=escape_html(symbol or ""),
-        tf=escape_html(tf or ""),
-        start=escape_html(start or ""),
-        end=escape_html(end or ""),
-        limit=str(limit),
-        total_trades=str(summary["total_trades"]),
-        winrate_pct=str(summary["winrate_pct"]),
-        wins=str(summary["wins"]),
-        losses=str(summary["losses"]),
-        tp1_hits=str(summary["tp1_hits"]),
-        tp2_hits=str(summary["tp2_hits"]),
-        tp3_hits=str(summary["tp3_hits"]),
-        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
-        best_win_streak=str(summary["best_win_streak"]),
-        worst_loss_streak=str(summary["worst_loss_streak"]),
-        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
-        spark_data=json.dumps(spark_values)
-    )
-    return HTMLResponse(html)
 
 # -------------------------
 # Events (PROTÉGÉ)
@@ -1667,45 +1492,147 @@ def reset_all(
     if redirect:
         return RedirectResponse(url=redirect, status_code=303)
     return {"ok": True, "deleted": "all"}
+# -------------------------
+# Trades PUBLIC (avec Altseason mini-card)
+# -------------------------
+@app.get("/trades", response_class=HTMLResponse)
+def trades_public(
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100)
+):
+    start_ep = parse_date_to_epoch(start)
+    end_ep = parse_date_end_to_epoch(end)
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10))
+
+    rows_html = ""
+    spark_values: List[float] = []
+    data = trades[-limit:] if limit else trades
+    for tr in data:
+        outcome = tr["outcome"] or "NONE"
+        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
+        spark_values.append(1.0 if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
+        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
+        rows_html += (
+            "<tr>"
+            f"<td>{escape_html(str(tr['trade_id']))}</td>"
+            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
+            f"<td>{fmt_num(tr.get('entry'))}</td>"
+            f"<td>{fmt_num(tr.get('sl'))}</td>"
+            f"<td>{fmt_num(tr.get('tp1'))}</td>"
+            f"<td>{fmt_num(tr.get('tp2'))}</td>"
+            f"<td>{fmt_num(tr.get('tp3'))}</td>"
+            f"<td>{outcome_html}</td>"
+            f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
+            "</tr>"
+        )
+
+    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
+        symbol=escape_html(symbol or ""),
+        tf=escape_html(tf or ""),
+        start=escape_html(start or ""),
+        end=escape_html(end or ""),
+        limit=str(limit),
+        total_trades=str(summary["total_trades"]),
+        winrate_pct=str(summary["winrate_pct"]),
+        wins=str(summary["wins"]),
+        losses=str(summary["losses"]),
+        tp1_hits=str(summary["tp1_hits"]),
+        tp2_hits=str(summary["tp2_hits"]),
+        tp3_hits=str(summary["tp3_hits"]),
+        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
+        best_win_streak=str(summary["best_win_streak"]),
+        worst_loss_streak=str(summary["worst_loss_streak"]),
+        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>'
+    )
+    return HTMLResponse(html)
 
 # -------------------------
-# Self test (PROTÉGÉ)
+# Trades ADMIN (protégé)
 # -------------------------
-@app.get("/selftest")
-def selftest(secret: Optional[str] = Query(None)):
+@app.get("/trades-admin", response_class=HTMLResponse)
+def trades_admin(
+    secret: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100)
+):
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
-    tid = f"SELFTEST_{int(time.time())}"
-    save_event({"type":"ENTRY","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"sl":95.0,"tp1":101.0,"tp2":102.0,"tp3":105.0,"trade_id":tid})
-    time.sleep(1)
-    save_event({"type":"TP1_HIT","symbol":"TESTUSD","tf":"15","side":"LONG","entry":100.0,"tp":101.0,"trade_id":tid})
-    return {"ok": True, "trade_id": tid}
+
+    start_ep = parse_date_to_epoch(start)
+    end_ep = parse_date_end_to_epoch(end)
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10))
+
+    rows_html = ""
+    spark_values: List[float] = []
+    data = trades[-limit:] if limit else trades
+    for tr in data:
+        outcome = tr["outcome"] or "NONE"
+        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
+        spark_values.append(1.0 if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else (0.0 if outcome == "SL_HIT" else 0.5))
+        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
+        rows_html += (
+            "<tr>"
+            f"<td>{escape_html(str(tr['trade_id']))}</td>"
+            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
+            f"<td>{fmt_num(tr.get('entry'))}</td>"
+            f"<td>{fmt_num(tr.get('sl'))}</td>"
+            f"<td>{fmt_num(tr.get('tp1'))}</td>"
+            f"<td>{fmt_num(tr.get('tp2'))}</td>"
+            f"<td>{fmt_num(tr.get('tp3'))}</td>"
+            f"<td>{outcome_html}</td>"
+            f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
+            "</tr>"
+        )
+
+    html = TRADES_ADMIN_HTML_TPL.safe_substitute(
+        secret=escape_html(secret or ""),
+        symbol=escape_html(symbol or ""),
+        tf=escape_html(tf or ""),
+        start=escape_html(start or ""),
+        end=escape_html(end or ""),
+        limit=str(limit),
+        total_trades=str(summary["total_trades"]),
+        winrate_pct=str(summary["winrate_pct"]),
+        wins=str(summary["wins"]),
+        losses=str(summary["losses"]),
+        tp1_hits=str(summary["tp1_hits"]),
+        tp2_hits=str(summary["tp2_hits"]),
+        tp3_hits=str(summary["tp3_hits"]),
+        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
+        best_win_streak=str(summary["best_win_streak"]),
+        worst_loss_streak=str(summary["worst_loss_streak"]),
+        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>'
+    )
+    return HTMLResponse(html)
 
 # -------------------------
-# Altseason Daemon (auto-notify 3/4)
+# Altseason Daemon (auto-notify)
 # -------------------------
 _daemon_stop = threading.Event()
 _daemon_thread: Optional[threading.Thread] = None
 
-def _load_state() -> Dict[str, Any]:
-    try:
-        if os.path.exists(ALTSEASON_STATE_FILE):
-            with open(ALTSEASON_STATE_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                if isinstance(d, dict):
-                    return d
-    except Exception:
-        pass
-    return {"last_on": False, "last_sent_ts": 0, "last_tick_ts": 0}
+@app.on_event("startup")
+def _start_daemon():
+    global _daemon_thread
+    if ALTSEASON_AUTONOTIFY and _daemon_thread is None:
+        _daemon_stop.clear()
+        _daemon_thread = threading.Thread(target=_daemon_loop, daemon=True)
+        _daemon_thread.start()
 
-def _save_state(state: Dict[str, Any]) -> None:
-    try:
-        d = os.path.dirname(ALTSEASON_STATE_FILE) or "/tmp"
-        os.makedirs(d, exist_ok=True)
-        with open(ALTSEASON_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+@app.on_event("shutdown")
+def _stop_daemon():
+    if _daemon_thread is not None:
+        _daemon_stop.set()
 
 def _daemon_loop():
     state = _load_state()
@@ -1720,9 +1647,12 @@ def _daemon_loop():
             now = time.time()
             need_send = False
 
-            if s["ALTSEASON_ON"] and not state.get("last_on", False):  # Transition OFF -> ON
+            # MAJ des streaks (1 fois par jour max)
+            _update_daily_streaks(state, s)
+
+            if s["ALTSEASON_ON"] and not state.get("last_on", False):  # OFF -> ON
                 need_send = True
-            elif s["ALTSEASON_ON"]:  # Toujours ON: respecter min_gap
+            elif s["ALTSEASON_ON"]:
                 min_gap = ALTSEASON_NOTIFY_MIN_GAP_MIN * 60
                 if now - state.get("last_sent_ts", 0) >= min_gap:
                     need_send = True
@@ -1737,30 +1667,6 @@ def _daemon_loop():
             _save_state(state)
         except Exception as e:
             log.warning("Altseason daemon tick error: %s", e)
-
-@app.get("/altseason/daemon-status")
-def altseason_daemon_status():
-    st = _load_state()
-    return {
-        "autonotify_enabled": ALTSEASON_AUTONOTIFY,
-        "poll_seconds": ALTSEASON_POLL_SECONDS,
-        "notify_min_gap_min": ALTSEASON_NOTIFY_MIN_GAP_MIN,
-        "greens_required": ALT_GREENS_REQUIRED,
-        "state": st
-    }
-
-@app.on_event("startup")
-def _start_daemon():
-    global _daemon_thread
-    if ALTSEASON_AUTONOTIFY and _daemon_thread is None:
-        _daemon_stop.clear()
-        _daemon_thread = threading.Thread(target=_daemon_loop, daemon=True)
-        _daemon_thread.start()
-
-@app.on_event("shutdown")
-def _stop_daemon():
-    if _daemon_thread is not None:
-        _daemon_stop.set()
 
 # ============ Run local ============
 if __name__ == "__main__":
