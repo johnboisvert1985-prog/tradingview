@@ -904,126 +904,229 @@ async def tv_webhook(request: Request, secret: Optional[str]=Query(None)):
     return {"ok": True}
 
 TRADES_PUBLIC_HTML_TPL = Template(r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trades (Public)</title>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trades — AI Trader PRO</title>
 <style>
-body{margin:0;padding:24px;background:#0f172a;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
-h1{margin:0 0 16px;font-size:30px;font-weight:700;color:#f3f4f6}
-h3{margin:0 0 10px;font-size:18px;color:#e5e7eb}
-.muted{color:#94a3b8}
-.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:20px;margin-bottom:20px;box-shadow:0 2px 8px rgba(0,0,0,0.35)}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{padding:10px 12px;border-bottom:1px solid #1f2937}
-th{color:#9ca3af;text-align:left}
-tr:hover{background:#1f2937}
-.chip{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;background:#0b1220;border:1px solid #1f2937}
-.badge-win{background:#065f46;color:#ecfdf5;border-color:#065f46}
-.badge-loss{background:#7f1d1d;color:#fee2e2;border-color:#7f1d1d}
-.row{display:flex;flex-wrap:wrap;gap:12px}
-.stat{flex:1;min-width:140px;background:#1f2937;padding:14px;border-radius:10px;text-align:center;border:1px solid #263246}
-.stat span{display:block;font-size:12px;color:#9ca3af;margin-bottom:6px}
-.stat strong{display:block;font-size:18px;color:#f9fafb}
-.btn{display:inline-block;padding:8px 12px;border:1px solid #1f2937;color:#e5e7eb;text-decoration:none;border-radius:8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
-.kv{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border:1px solid #1f2937;border-radius:8px;background:#0b1220}
-.kv .k{color:#9ca3af}
-.kv .v{font-weight:700}
-hr.sep{border:none;height:1px;background:#1f2937;margin:12px 0}
-label{display:block;margin:6px 0 2px}
-input{background:#111827;color:#e5e7eb;border:1px solid #1f2937;border-radius:6px;padding:6px}
-</style></head><body>
-<h1>Trades (Public)</h1>
+:root{
+  --bg:#0f172a; --card:#111827; --muted:#94a3b8; --line:#1f2937; --txt:#e5e7eb;
+  --chip:#0b1220; --ok:#10b981; --warn:#fb923c; --bad:#ef4444; --good:#22c55e;
+}
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;padding:20px;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+h1{margin:0 0 14px 0;font-size:28px;font-weight:800}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:16px}
+.card h3{margin:0 0 10px 0;color:var(--muted);font-weight:700}
+label{display:block;margin:4px 0 4px 0;color:var(--muted);font-size:13px}
+input,select{background:#0b1220;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:8px 10px;min-width:120px}
+input::placeholder{color:#64748b}
+.btn{display:inline-block;padding:9px 12px;border:1px solid var(--line);color:var(--txt);text-decoration:none;border-radius:10px}
+.btn.primary{background:#0b1220}
+.btn.ghost{background:transparent}
+.btn.small{padding:6px 10px;font-size:13px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;background:var(--chip);cursor:pointer;user-select:none}
+.chip.active{outline:2px solid #2563eb}
+.kpi{display:flex;flex-direction:column;gap:4px;min-width:120px}
+.kpi .v{font-size:18px;font-weight:800}
+.kpi .l{font-size:12px;color:var(--muted)}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);font-size:12px}
+.badge-win{background:#052e1f;border-color:#065f46}
+.badge-loss{background:#3f1d1d;border-color:#7f1d1d}
+.badge-none{background:#111827;border-color:#374151}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px;border-bottom:1px solid var(--line);font-size:14px}
+th{color:var(--muted);position:sticky;top:0;background:var(--card);z-index:1}
+tr:hover{background:#0b1325}
+.hr{height:1px;background:var(--line);margin:10px 0}
+.muted{color:var(--muted)}
+.dot{display:inline-block;width:10px;height:10px;border-radius:10px;margin-left:8px}
+.ok{background:var(--ok)} .warn{background:var(--warn)}
+.tag{padding:2px 8px;border:1px solid var(--line);border-radius:8px;background:#0b1220}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap}
+#alt-bx .row{align-items:center}
+#filters .chips .chip{transition:transform .06s}
+#filters .chips .chip:active{transform:scale(.98)}
+footer{display:flex;justify-content:space-between;align-items:center;margin-top:10px}
+.pager a{color:var(--txt);text-decoration:none;border:1px solid var(--line);padding:6px 10px;border-radius:8px;margin-right:6px}
+.pager .muted{margin:0 6px}
+@media (max-width:780px){ .hide-sm{display:none}}
+</style>
+</head><body>
+<h1>Trades</h1>
 
-<div class="card" id="altseason-card">
-  <h3 class="muted">Altseason — État rapide</h3>
-  <div class="grid">
-    <div class="kv"><div class="k">As of</div><div class="v" id="alt-asof">—</div></div>
-    <div class="kv"><div class="k">BTC Dominance</div><div class="v"><span id="alt-btc">—</span> <span class="muted" id="alt-btc-thr"></span></div></div>
-    <div class="kv"><div class="k">ETH/BTC</div><div class="v"><span id="alt-eth">—</span> <span class="muted" id="alt-eth-thr"></span></div></div>
-    <div class="kv"><div class="k">Altseason Index</div><div class="v"><span id="alt-asi">—</span> <span class="muted" id="alt-asi-thr"></span></div></div>
-    <div class="kv"><div class="k">TOTAL2</div><div class="v"><span id="alt-t2">—</span> <span class="muted" id="alt-t2-thr"></span></div></div>
-  </div>
-  <hr class="sep">
-  <div class="row">
-    <span id="alt3" class="chip">Prep 3/4: —</span>
-    <span id="alt4" class="chip">Confirm 4/4: —</span>
-  </div>
-  <div class="muted" style="margin-top:6px">Séries (jours consécutifs): <span id="d3">0</span>d @3/4, <span id="d4">0</span>d @4/4</div>
-</div>
-
-<div class="card">
-  <div class="row">
-    <div class="stat"><span>Total trades</span><strong>$total_trades</strong></div>
-    <div class="stat"><span>Winrate</span><strong>$winrate_pct%</strong></div>
-    <div class="stat"><span>W/L</span><strong>$wins/$losses</strong></div>
-    <div class="stat"><span>TP1/2/3</span><strong>$tp1_hits/$tp2_hits/$tp3_hits</strong></div>
-    <div class="stat"><span>Avg time (s)</span><strong>$avg_time_to_outcome_sec</strong></div>
-    <div class="stat"><span>Best streak</span><strong>$best_win_streak</strong></div>
-    <div class="stat"><span>Worst streak</span><strong>$worst_loss_streak</strong></div>
-  </div>
-</div>
-
-<div class="card">
-  <form method="get">
-    <div class="row">
-      <div><label>Symbol</label><input name="symbol" value="$symbol"></div>
-      <div><label>TF</label><input name="tf" value="$tf"></div>
-      <div><label>Start (YYYY-MM-DD)</label><input name="start" value="$start"></div>
-      <div><label>End (YYYY-MM-DD)</label><input name="end" value="$end"></div>
-      <div><label>Limit</label><input name="limit" value="$limit" type="number" min="1" max="10000"></div>
+<!-- FILTRES -->
+<div class="card" id="filters">
+  <form method="get" class="row" id="qform">
+    <div>
+      <label>Symbol</label>
+      <input name="symbol" placeholder="e.g. BTCUSDT" value="$symbol">
     </div>
-    <div style="margin-top:8px">
-      <button class="btn" type="submit">Apply</button>
-      <a class="btn" href="/">Home</a>
+    <div>
+      <label>TF</label>
+      <input name="tf" placeholder="e.g. 15, 60, 1D" value="$tf">
+    </div>
+    <div class="hide-sm">
+      <label>Start (YYYY-MM-DD)</label>
+      <input name="start" value="$start">
+    </div>
+    <div class="hide-sm">
+      <label>End (YYYY-MM-DD)</label>
+      <input name="end" value="$end">
+    </div>
+    <div>
+      <label>Page</label>
+      <input name="page" value="$page" style="width:80px">
+    </div>
+    <div>
+      <label>Page size</label>
+      <input name="page_size" value="$page_size" style="width:100px">
+    </div>
+    <div class="toolbar">
+      <button class="btn primary" type="submit">Apply</button>
+      <a class="btn ghost" href="/trades">Reset</a>
+      <button class="btn ghost" id="btn-csv" type="button">Export CSV</button>
+      <a class="btn ghost" href="/" title="Home">Home</a>
+    </div>
+    <div class="row chips" style="margin-top:8px">
+      <div class="chip" data-filter="all">All</div>
+      <div class="chip" data-filter="long">Long</div>
+      <div class="chip" data-filter="short">Short</div>
+      <div class="chip" data-filter="wins">Wins</div>
+      <div class="chip" data-filter="losses">Losses</div>
     </div>
   </form>
 </div>
 
+<!-- ALTSEASON -->
+<div class="card" id="alt-bx">
+  <h3 class="muted">Altseason — État rapide</h3>
+  <div id="alt-asof" class="muted">Loading…</div>
+  <div class="row" style="margin-top:6px">
+    <div>BTC Dominance: <span id="alt-btc">—</span> (thr &lt; $btc_thr) <span id="dot-btc" class="dot"></span></div>
+    <div>ETH/BTC: <span id="alt-eth">—</span> (thr &gt; $eth_thr) <span id="dot-eth" class="dot"></span></div>
+    <div>Altseason Index: <span id="alt-asi">N/A</span> (thr ≥ $asi_thr) <span id="dot-asi" class="dot"></span></div>
+    <div>TOTAL2: <span id="alt-t2">—</span> (thr &gt; $t2_thr T$) <span id="dot-t2" class="dot"></span></div>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span id="alt3" class="tag">Prep 3/4: —</span>
+    <span id="alt4" class="tag">Confirm 4/4: —</span>
+    <span class="muted">Séries: <span id="d3">0</span>d @3/4, <span id="d4">0</span>d @4/4</span>
+  </div>
+</div>
+
+<!-- KPIs -->
 <div class="card">
-  <table><thead>
-    <tr><th>ID</th><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Outcome</th><th>Duration (s)</th></tr>
-  </thead><tbody>
-    $rows_html
-  </tbody></table>
+  <div class="row">
+    <div class="kpi"><div class="v">$total_trades</div><div class="l">Total trades</div></div>
+    <div class="kpi"><div class="v">$winrate_pct%</div><div class="l">Winrate</div></div>
+    <div class="kpi"><div class="v">$wins / $losses</div><div class="l">W / L</div></div>
+    <div class="kpi"><div class="v">$tp1_hits / $tp2_hits / $tp3_hits</div><div class="l">TP1 / TP2 / TP3</div></div>
+    <div class="kpi"><div class="v">$avg_time_to_outcome_sec s</div><div class="l">Avg time to outcome</div></div>
+    <div class="kpi"><div class="v">$best_win_streak / $worst_loss_streak</div><div class="l">Best / Worst streak</div></div>
+  </div>
+</div>
+
+<!-- TABLE -->
+<div class="card">
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>ID</th><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Outcome</th><th class="hide-sm">Duration (s)</th>
+      </tr>
+    </thead>
+    <tbody>
+      $rows_html
+    </tbody>
+  </table>
+  <footer>
+    <div class="muted">Showing <strong>$showing</strong> of <strong>$total_trades</strong></div>
+    <div class="pager">
+      $pager_html
+    </div>
+  </footer>
 </div>
 
 <script>
 (function(){
-  function setText(id, txt){ const el=document.getElementById(id); if(el) el.textContent=txt; }
-  function num(v){ return (typeof v === "number") ? v : Number(v); }
-  function fmtT2(v){ return Number.isFinite(v) ? (v/1e12).toFixed(2)+" T$" : "—"; }
+  // Altseason widgets
+  function setText(id, txt){ const el = document.getElementById(id); if (el) el.textContent = txt; }
+  function setDot(id, ok){ const el = document.getElementById(id); if (el) el.className = "dot " + (ok ? "ok" : "warn"); }
+  function num(v){ return typeof v === "number" ? v : Number(v); }
+
   fetch("/altseason/check")
     .then(r=>r.json())
     .then(s=>{
-      setText("alt-asof", s.asof || "now");
-      const btc = num(s.btc_dominance), eth=num(s.eth_btc), t2=num(s.total2_usd), asi=s.altseason_index;
-      setText("alt-btc", Number.isFinite(btc) ? btc.toFixed(2)+" %" : "—");
-      setText("alt-eth", Number.isFinite(eth) ? eth.toFixed(5) : "—");
-      setText("alt-asi", (asi==null) ? "N/A" : String(asi));
-      setText("alt-t2", fmtT2(t2));
-      const thr = s.thresholds || {};
-      setText("alt-btc-thr", thr.btc ? `(thr < ${parseFloat(thr.btc).toFixed(0)})` : "");
-      setText("alt-eth-thr", (thr.eth_btc!=null) ? `(thr > ${parseFloat(thr.eth_btc).toFixed(3)})` : "");
-      setText("alt-asi-thr", (thr.asi!=null) ? `(thr ≥ ${parseFloat(thr.asi).toFixed(0)})` : "");
-      setText("alt-t2-thr", (thr.total2_trillions!=null) ? `(thr > ${parseFloat(thr.total2_trillions).toFixed(2)} T$)` : "");
+      setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
+      const btc = num(s.btc_dominance), eth = num(s.eth_btc), t2 = num(s.total2_usd), asi=s.altseason_index;
+      setText("alt-btc", Number.isFinite(btc) ? btc.toFixed(2) + " %" : "—"); setDot("dot-btc", s.triggers && s.triggers.btc_dominance_ok);
+      setText("alt-eth", Number.isFinite(eth) ? eth.toFixed(5) : "—"); setDot("dot-eth", s.triggers && s.triggers.eth_btc_ok);
+      setText("alt-asi", (asi == null) ? "N/A" : String(asi)); setDot("dot-asi", s.triggers && s.triggers.altseason_index_ok);
+      setText("alt-t2", Number.isFinite(t2) ? (t2/1e12).toFixed(2) + " T$" : "—"); setDot("dot-t2", s.triggers && s.triggers.total2_ok);
     })
-    .catch(()=>{ setText("alt-asof","—"); });
+    .catch(()=>{ setText("alt-asof","Altseason: error"); });
 
   fetch("/altseason/streaks")
     .then(r=>r.json())
     .then(s=>{
-      const el3=document.getElementById("alt3"), el4=document.getElementById("alt4");
-      if (el3) el3.textContent = s.ALT3_ON ? "Prep 3/4: ON" : "Prep 3/4: OFF";
-      if (el4) el4.textContent = s.ALT4_ON ? "Confirm 4/4: ON" : "Confirm 4/4: OFF";
-      setText("d3", String(s.consec_3of4_days || 0));
-      setText("d4", String(s.consec_4of4_days || 0));
+      const badge = (s.ALT4_ON ? "Confirm 4/4: ON" : (s.ALT3_ON ? "Prep 3/4: ON" : "OFF"));
+      const b3 = document.getElementById("alt3"), b4 = document.getElementById("alt4");
+      if (b3) b3.textContent = "Prep 3/4: " + (s.ALT3_ON ? "ON" : "OFF");
+      if (b4) b4.textContent = "Confirm 4/4: " + (s.ALT4_ON ? "ON" : "OFF");
+      setText("d3", String(s.consec_3of4_days||0));
+      setText("d4", String(s.consec_4of4_days||0));
     })
     .catch(()=>{});
+
+  // Table quick filters
+  const chips = document.querySelectorAll('[data-filter]');
+  let cur = 'all';
+  function applyFilter(){
+    const rows = document.querySelectorAll('#tbl tbody tr');
+    rows.forEach(tr=>{
+      const side = tr.getAttribute('data-side');
+      const out  = tr.getAttribute('data-outcome');
+      let show = true;
+      if (cur === 'long')   show = (side === 'LONG');
+      if (cur === 'short')  show = (side === 'SHORT');
+      if (cur === 'wins')   show = (out === 'TP1_HIT' || out === 'TP2_HIT' || out === 'TP3_HIT');
+      if (cur === 'losses') show = (out === 'SL_HIT');
+      tr.style.display = show ? '' : 'none';
+    });
+    chips.forEach(c=>c.classList.toggle('active', c.getAttribute('data-filter')===cur));
+  }
+  chips.forEach(c=>c.addEventListener('click', ()=>{ cur = c.getAttribute('data-filter'); applyFilter(); }));
+  applyFilter();
+
+  // Export CSV (client-side)
+  function tableToCSV(){
+    const rows = Array.from(document.querySelectorAll('#tbl tr'));
+    return rows.map(row => Array.from(row.querySelectorAll('th,td')).map(td=>{
+      let t = td.innerText.replace(/\n/g,' ').trim();
+      if (t.indexOf(',') !== -1) t = '"' + t.replace(/"/g,'""') + '"';
+      return t;
+    }).join(',')).join('\n');
+  }
+  document.getElementById('btn-csv')?.addEventListener('click', ()=>{
+    const csv = tableToCSV();
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'trades.csv'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+  });
+
+  // Keep page value sane
+  document.getElementById('qform')?.addEventListener('submit', (e)=>{
+    const p = e.target.querySelector('input[name="page"]');
+    const s = e.target.querySelector('input[name="page_size"]');
+    if (p && (!p.value || Number(p.value) < 1)) p.value = "1";
+    if (s && (!s.value || Number(s.value) < 5)) s.value = "100";
+  });
 })();
 </script>
-
 </body></html>
 """)
+
 # =========================
 # Section 6/6 — Trades/Events endpoints, Admin, Daemon, __main__
 # =========================
@@ -1183,31 +1286,93 @@ def reset_all(secret: Optional[str]=Query(None),
     return {"ok": True, "deleted": "all"}
 
 @app.get("/trades", response_class=HTMLResponse)
-def trades_public(symbol: Optional[str]=Query(None),
-                  tf: Optional[str]=Query(None),
-                  start: Optional[str]=Query(None),
-                  end: Optional[str]=Query(None),
-                  limit: int=Query(100)):
-    start_ep=parse_date_to_epoch(start); end_ep=parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit*10))
-    rows_html=""; data = trades[-limit:] if limit else trades
+def trades_public(
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=5, le=2000)
+):
+    start_ep = parse_date_to_epoch(start)
+    end_ep = parse_date_end_to_epoch(end)
+    # Récup (grosse marge) puis pagination côté serveur
+    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=100000)
+
+    total_trades = len(trades)
+    total_pages = max(1, (total_trades + page_size - 1) // page_size)
+    page = min(max(1, page), total_pages)
+    i0 = (page - 1) * page_size
+    i1 = min(total_trades, i0 + page_size)
+    data = trades[i0:i1]
+
+    # Lignes HTML (ajout data-attrs pour filtres rapides)
+    rows_html = ""
     for tr in data:
-        outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome=="SL_HIT" else "")
-        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
-        rows_html += ("<tr>"
-                      f"<td>{escape_html(str(tr['trade_id']))}</td>"
-                      f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-                      f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
-                      f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
-                      f"<td>{fmt_num(tr.get('entry'))}</td>"
-                      f"<td>{fmt_num(tr.get('sl'))}</td>"
-                      f"<td>{fmt_num(tr.get('tp1'))}</td>"
-                      f"<td>{fmt_num(tr.get('tp2'))}</td>"
-                      f"<td>{fmt_num(tr.get('tp3'))}</td>"
-                      f"<td>{outcome_html}</td>"
-                      f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
-                      "</tr>")
+        outcome = tr.get("outcome") or "NONE"
+        side    = (tr.get("side") or "").upper()
+        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "badge-none")
+        outcome_html = f'<span class="badge {badge_class}">{escape_html(outcome)}</span>'
+        rows_html += (
+            f"<tr data-side=\"{escape_html(side)}\" data-outcome=\"{escape_html(outcome)}\">"
+            f"<td>{escape_html(str(tr.get('trade_id')))}</td>"
+            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
+            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
+            f"<td>{escape_html(side)}</td>"
+            f"<td>{fmt_num(tr.get('entry'))}</td>"
+            f"<td>{fmt_num(tr.get('sl'))}</td>"
+            f"<td>{fmt_num(tr.get('tp1'))}</td>"
+            f"<td>{fmt_num(tr.get('tp2'))}</td>"
+            f"<td>{fmt_num(tr.get('tp3'))}</td>"
+            f"<td>{outcome_html}</td>"
+            f"<td class=\"hide-sm\">{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
+            "</tr>"
+        )
+
+    showing = f"{i0+1}-{i1}" if total_trades else "0-0"
+
+    # Pagination HTML
+    def q(query_overrides: Dict[str, Any]) -> str:
+        from urllib.parse import urlencode
+        base = dict(symbol=symbol or "", tf=tf or "", start=start or "", end=end or "", page=page, page_size=page_size)
+        base.update({k:v for k,v in query_overrides.items() if v is not None})
+        return "/trades?" + urlencode(base)
+
+    prev_link = q({"page": page-1}) if page > 1 else None
+    next_link = q({"page": page+1}) if page < total_pages else None
+    pager = []
+    if prev_link: pager.append(f'<a href="{escape_html(prev_link)}">« Prev</a>')
+    pager.append(f'<span class="muted">Page {page}/{total_pages}</span>')
+    if next_link: pager.append(f'<a href="{escape_html(next_link)}">Next »</a>')
+    pager_html = " ".join(pager)
+
+    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
+        symbol=escape_html(symbol or ""),
+        tf=escape_html(tf or ""),
+        start=escape_html(start or ""),
+        end=escape_html(end or ""),
+        page=str(page),
+        page_size=str(page_size),
+        total_trades=str(summary["total_trades"]),
+        winrate_pct=str(summary["winrate_pct"]),
+        wins=str(summary["wins"]),
+        losses=str(summary["losses"]),
+        tp1_hits=str(summary["tp1_hits"]),
+        tp2_hits=str(summary["tp2_hits"]),
+        tp3_hits=str(summary["tp3_hits"]),
+        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
+        best_win_streak=str(summary["best_win_streak"]),
+        worst_loss_streak=str(summary["worst_loss_streak"]),
+        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
+        showing=showing,
+        pager_html=pager_html,
+        btc_thr=str(int(ALT_BTC_DOM_THR)),
+        eth_thr=f"{ALT_ETH_BTC_THR:.3f}",
+        asi_thr=str(int(ALT_ASI_THR)),
+        t2_thr=f"{ALT_TOTAL2_THR_T:.2f}"
+    )
+    return HTMLResponse(html)
+
     html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
         symbol=escape_html(symbol or ""), tf=escape_html(tf or ""),
         start=escape_html(start or ""), end=escape_html(end or ""),
@@ -1268,3 +1433,4 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
