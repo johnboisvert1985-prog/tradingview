@@ -98,7 +98,7 @@ def _to_float(v):
     except Exception:
         return None
 
-def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]]:
+def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
     """Retourne (confidence_pct, rationale) ou None si LLM inactif/indispo."""
     if not (LLM_ENABLED and _openai_client):
         return None
@@ -1836,3 +1836,4 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
