@@ -901,47 +901,63 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
 
 <script>
 (function(){
-  // Altseason fetch
+  // Helpers
   function setText(id, t){ const el=document.getElementById(id); if(el) el.textContent=t; }
   function setDot(id, cls){ const el=document.getElementById(id); if(el){ el.classList.remove('ok','warn','bad'); if(cls) el.classList.add(cls);} }
   function status(ok){ return ok ? "OK" : "—"; }
+  function num(v){ return (v==null)? null : Number(v); }
 
+  // Altseason snapshot
   fetch("/altseason/check")
     .then(r=>r.json())
     .then(s=>{
       setText("alt-asof", "As of " + (s.asof || "now") + (s.stale ? " (cache)" : ""));
-      setText("alt-btc",  (s.btc_dominance!=null)? Number(s.btc_dominance).toFixed(2)+" %" : "—");
-      setText("alt-eth",  (s.eth_btc!=null)? Number(s.eth_btc).toFixed(5) : "—");
-      setText("alt-asi",  (s.altseason_index!=null)? String(s.altseason_index) : "N/A");
-      setText("alt-t2",   (s.total2_usd!=null)? (Number(s.total2_usd)/1e12).toFixed(2)+" T$" : "—");
+
+      // Values
+      const btc = num(s.btc_dominance), eth = num(s.eth_btc), t2 = num(s.total2_usd), asi = s.altseason_index;
+      setText("alt-btc", (btc!=null && isFinite(btc)) ? btc.toFixed(2)+" %" : "—");
+      setText("alt-eth", (eth!=null && isFinite(eth)) ? eth.toFixed(5) : "—");
+      setText("alt-asi", (asi!=null) ? String(asi) : "N/A");
+      setText("alt-t2",  (t2!=null && isFinite(t2)) ? (t2/1e12).toFixed(2)+" T$" : "—");
+
+      // Triggers
       const tr = s.triggers || {};
       setDot("dot-btc", tr.btc_dominance_ok ? "ok" : "bad"); setText("lab-btc", status(tr.btc_dominance_ok));
-      setDot("dot-eth", tr.eth_btc_ok ? "ok" : "bad"); setText("lab-eth", status(tr.eth_btc_ok));
+      setDot("dot-eth", tr.eth_btc_ok ? "ok" : "bad");       setText("lab-eth", status(tr.eth_btc_ok));
       setDot("dot-asi", tr.altseason_index_ok ? "ok":"bad"); setText("lab-asi", status(tr.altseason_index_ok));
-      setDot("dot-t2",  tr.total2_ok ? "ok" : "bad"); setText("lab-t2", status(tr.total2_ok));
+      setDot("dot-t2",  tr.total2_ok ? "ok" : "bad");        setText("lab-t2", status(tr.total2_ok));
+
+      // Thresholds (fallback auto si non injectés côté serveur)
       const thr = s.thresholds || {};
-      setText("greens-needed", String(thr.greens_required || 3));
+      if (thr.greens_required != null) setText("greens-needed", String(thr.greens_required));
+      if (thr.btc_dominance_max != null) setText("alt-btc-thr", Number(thr.btc_dominance_max).toFixed(2));
+      if (thr.eth_btc_min != null)       setText("alt-eth-thr", Number(thr.eth_btc_min).toFixed(5));
+      if (thr.total2_min_trillions != null) setText("alt-t2-thr", Number(thr.total2_min_trillions).toFixed(2));
+      if (thr.altseason_index_min != null)  setText("alt-asi-thr", String(thr.altseason_index_min));
     })
     .catch(()=>{ setText("alt-asof","Erreur chargement"); });
 
+  // Streaks / badges
   fetch("/altseason/streaks")
     .then(r=>r.json())
     .then(s=>{
-      document.getElementById("alt3").textContent = (s.ALT3_ON ? "Prep 3/4: ON" : "Prep 3/4: OFF");
-      document.getElementById("alt4").textContent = (s.ALT4_ON ? "Confirm 4/4: ON" : "Confirm 4/4: OFF");
+      setText("alt3", (s.ALT3_ON ? "Prep 3/4: ON" : "Prep 3/4: OFF"));
+      setText("alt4", (s.ALT4_ON ? "Confirm 4/4: ON" : "Confirm 4/4: OFF"));
       setText("d3", String(s.consec_3of4_days||0));
       setText("d4", String(s.consec_4of4_days||0));
     })
     .catch(()=>{});
 
-  // Sparklines pills from server — we just parse inline dataset rendered via $pill_values
+  // Sparklines pills from server — dataset inline via $pill_values
   try{
-    const vals = JSON.parse(document.getElementById("pill-data").textContent || "[]");
+    const holder = document.getElementById("pill-data");
+    const raw = holder ? holder.textContent : "[]";
+    const vals = JSON.parse(raw || "[]");
     const wrap = document.getElementById("spark-pills");
     vals.forEach(v=>{
       const d=document.createElement("div");
       d.className = "pill " + (v===1?"win":(v===0?"loss":"none"));
-      wrap.appendChild(d);
+      wrap && wrap.appendChild(d);
     });
   }catch(_){}
 })();
@@ -1887,6 +1903,7 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
 
 
 
