@@ -698,6 +698,9 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
 # -------------------------
 # HTML templates
 # -------------------------
+# -------------------------
+# HTML templates
+# -------------------------
 INDEX_HTML_TPL = Template(r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1983,6 +1986,7 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
 
 
 
