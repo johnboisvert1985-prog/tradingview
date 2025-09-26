@@ -793,7 +793,7 @@ TRADES_PUBLIC_HTML_TPL = Template(r"""<!doctype html>
 <style>
 :root{
   --bg:#0b1020; --card:#0f172a; --muted:#94a3b8; --border:#1e293b; --text:#e5e7eb;
-  --grad1:#0ea5e9; --grad2:#8b5cf6; --ok:#22c55e; --warn:#f97316; --bad:#ef4444;
+  --grad1:#0ea5e9; --grad2:#8b5cf6; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
   --chip:#0b1220; --chipb:#1f2937; --glass: rgba(255,255,255,.04);
 }
 *{box-sizing:border-box}
@@ -826,6 +826,8 @@ td small{color:var(--muted)}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;border:1px solid var(--chipb);background:var(--chip);font-weight:700}
 .chip.win{color:#10b981;border-color:#164e3f;background:rgba(16,185,129,.08)}
 .chip.loss{color:#ef4444;border-color:#4c1d1d;background:rgba(239,68,68,.08)}
+.chip.close{color:#f59e0b;border-color:#4b3a16;background:rgba(245,158,11,.10)}
+.chip.open {color:#38bdf8;border-color:#1f3a4b;background:rgba(56,189,248,.10)}
 .tag{padding:.24rem .5rem;border:1px solid var(--chipb);border-radius:8px;background:#0b1426;color:var(--muted);font-size:12px}
 .hr{height:1px;background:linear-gradient(90deg,transparent, #334155, transparent);margin:10px 0}
 .table-wrap{overflow:auto;border-radius:12px;border:1px solid var(--border)}
@@ -903,6 +905,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
               <tr>
                 <th>ID</th><th>Symbol</th><th>TF</th><th>Side</th>
                 <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
+                <th>Heure entrée</th>
                 <th>Outcome</th><th>Duration (s)</th>
               </tr>
             </thead>
@@ -967,6 +970,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
         <div class="row">
           <span class="badge"><span class="dot ok"></span>TP1/TP2/TP3</span>
           <span class="badge"><span class="dot bad"></span>SL</span>
+          <span class="badge"><span class="dot warn"></span>Close</span>
           <span class="badge"><span class="dot"></span>En attente</span>
         </div>
         <a class="btn" href="/trades-admin">🔐 Admin</a>
@@ -1979,6 +1983,7 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
 
 
 
