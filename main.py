@@ -1231,61 +1231,34 @@ def reset_all(
     return {"ok": True, "deleted": "all"}
 
 # -------------------------
-# Trades PUBLIC (avec Altseason mini-card)
+# Trades PUBLIC Dashboard
 # -------------------------
+
+# Back-compat alias (corrige NameError)
+TRADES_PUBLIC_HTML_TPL = TRADES_PRO_HTML_TPL
+
 @app.get("/trades", response_class=HTMLResponse)
-def trades_public(
-    symbol: Optional[str] = Query(None),
-    tf: Optional[str] = Query(None),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    limit: int = Query(100)
-):
-    start_ep = parse_date_to_epoch(start)
-    end_ep = parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10))
-
+def trades_public():
+    rows = db_get_last_trades(100)
     rows_html = ""
-    data = trades[-limit:] if limit else trades
-    for tr in data:
-        outcome = tr["outcome"] or "NONE"
-        badge_class = "badge-win" if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT") else ("badge-loss" if outcome == "SL_HIT" else "")
-        outcome_html = f'<span class="chip {badge_class}">{escape_html(outcome)}</span>'
-        rows_html += (
-            "<tr>"
-            f"<td>{escape_html(str(tr['trade_id']))}</td>"
-            f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
-            f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
-            f"<td>{fmt_num(tr.get('entry'))}</td>"
-            f"<td>{fmt_num(tr.get('sl'))}</td>"
-            f"<td>{fmt_num(tr.get('tp1'))}</td>"
-            f"<td>{fmt_num(tr.get('tp2'))}</td>"
-            f"<td>{fmt_num(tr.get('tp3'))}</td>"
-            f"<td>{outcome_html}</td>"
-            f"<td>{tr.get('duration_sec') if tr.get('duration_sec') is not None else ''}</td>"
-            "</tr>"
-        )
-
-    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
-        symbol=escape_html(symbol or ""),
-        tf=escape_html(tf or ""),
-        start=escape_html(start or ""),
-        end=escape_html(end or ""),
-        limit=str(limit),
-        total_trades=str(summary["total_trades"]),
-        winrate_pct=str(summary["winrate_pct"]),
-        wins=str(summary["wins"]),
-        losses=str(summary["losses"]),
-        tp1_hits=str(summary["tp1_hits"]),
-        tp2_hits=str(summary["tp2_hits"]),
-        tp3_hits=str(summary["tp3_hits"]),
-        avg_time_to_outcome_sec=str(summary["avg_time_to_outcome_sec"]),
-        best_win_streak=str(summary["best_win_streak"]),
-        worst_loss_streak=str(summary["worst_loss_streak"]),
-        rows_html=rows_html or '<tr><td colspan="11" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>'
-    )
+    for r in rows:
+        rows_html += f"""
+        <tr>
+            <td>{escape_html(r.get("time", ""))}</td>
+            <td>{escape_html(r.get("symbol", ""))}</td>
+            <td>{escape_html(r.get("tf_label", ""))}</td>
+            <td>{escape_html(r.get("side", ""))}</td>
+            <td>{escape_html(r.get("type", ""))}</td>
+            <td>{escape_html(str(r.get("entry") or ""))}</td>
+            <td>{escape_html(str(r.get("sl") or ""))}</td>
+            <td>{escape_html(str(r.get("tp1") or ""))}</td>
+            <td>{escape_html(str(r.get("tp2") or ""))}</td>
+            <td>{escape_html(str(r.get("tp3") or ""))}</td>
+        </tr>
+        """
+    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(rows_html=rows_html)
     return HTMLResponse(html)
+
 
 # -------------------------
 # Trades ADMIN (protégé)
@@ -1473,3 +1446,4 @@ def favicon():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
