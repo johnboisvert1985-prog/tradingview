@@ -148,11 +148,17 @@ def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, s
         log.warning("LLM confidence failed: %s", e)
         return None
 
-# -------------------------
-# SQLite (persistent)
-# -------------------------
+# =========================
+# SQLite (persistent) — HOTFIX BLOCK
+# =========================
+import sqlite3, json, os, time, logging
+log = logging.getLogger("aitrader")
+
+# DB path (reprend la même env var que le reste du code)
+DB_PATH = os.getenv("DB_PATH", "data/data.db")
+
 def resolve_db_path() -> None:
-    """Try to create directory for DB_PATH; if permission denied, fallback to /tmp/ai_trader/data.db."""
+    """Assure un chemin DB writable; fallback /tmp/ai_trader/data.db si besoin."""
     global DB_PATH
     d = os.path.dirname(DB_PATH) or "."
     try:
@@ -167,9 +173,9 @@ def resolve_db_path() -> None:
         os.makedirs(fallback_dir, exist_ok=True)
         DB_PATH = os.path.join(fallback_dir, "data.db")
         log.warning("DB dir '%s' not writable (%s). Falling back to %s", d, e, DB_PATH)
-        resolve_db_path()
 
 def db_conn() -> sqlite3.Connection:
+    """Connexion SQLite avec options sensées."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
@@ -181,6 +187,7 @@ def db_conn() -> sqlite3.Connection:
     return conn
 
 def db_init() -> None:
+    """Crée la table events si absente."""
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -209,8 +216,51 @@ def db_init() -> None:
         conn.commit()
     log.info("DB initialized at %s", DB_PATH)
 
-resolve_db_path()
-db_init()
+# Initialisation DB si pas déjà fait
+try:
+    # si une autre section l'a déjà appelé, pas grave
+    resolve_db_path()
+    db_init()
+except Exception as _e:
+    log.warning("DB init hotfix skipped: %s", _e)
+
+def _to_float(v):
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+def save_event(payload: dict) -> None:
+    """Insère un event dans la table events (webhook TradingView)."""
+    try:
+        row = {
+            "received_at": int(time.time()),
+            "type": payload.get("type"),
+            "symbol": payload.get("symbol"),
+            "tf": str(payload.get("tf")) if payload.get("tf") is not None else None,
+            "side": payload.get("side"),
+            "entry": _to_float(payload.get("entry")),
+            "sl": _to_float(payload.get("sl")),
+            "tp1": _to_float(payload.get("tp1")),
+            "tp2": _to_float(payload.get("tp2")),
+            "tp3": _to_float(payload.get("tp3")),
+            "trade_id": payload.get("trade_id"),
+            "raw_json": json.dumps(payload, ensure_ascii=False),
+        }
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO events (received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json)
+                VALUES (:received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json)
+                """,
+                row,
+            )
+            conn.commit()
+        log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s", row["type"], row["symbol"], row["tf"], row["trade_id"])
+    except Exception as e:
+        log.error("save_event failed: %s", e)
+        raise
 
 # -------------------------
 # Helpers
@@ -1836,4 +1886,5 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
 
