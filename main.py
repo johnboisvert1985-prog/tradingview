@@ -301,37 +301,35 @@ def parse_leverage_x(leverage: Optional[str]) -> Optional[float]:
     return None
 
 # -------------------------
-# Build trades & stats
+# Build trades & stats (robuste: rattache CLOSE/TP/SL même sans trade_id)
 # -------------------------
 class TradeOutcome:
-    NONE  = "NONE"
-    TP1   = "TP1_HIT"
-    TP2   = "TP2_HIT"
-    TP3   = "TP3_HIT"
-    SL    = "SL_HIT"
+    NONE = "NONE"
+    TP1 = "TP1_HIT"
+    TP2 = "TP2_HIT"
+    TP3 = "TP3_HIT"
+    SL = "SL_HIT"
     CLOSE = "CLOSE"
 
+FINAL_EVENTS = {TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3, TradeOutcome.SL, TradeOutcome.CLOSE}
+
 def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    """Parse YYYY-MM-DD -> epoch seconds (00:00:00)."""
     if not date_str:
         return None
     try:
         import datetime as dt
         y, m, d = map(int, date_str.split("-"))
-        dtobj = dt.datetime(y, m, d, 0, 0, 0)
-        return int(dtobj.timestamp())
+        return int(dt.datetime(y, m, d, 0, 0, 0).timestamp())
     except Exception:
         return None
 
 def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    """Parse YYYY-MM-DD -> epoch seconds (23:59:59)."""
     if not date_str:
         return None
     try:
         import datetime as dt
         y, m, d = map(int, date_str.split("-"))
-        dtobj = dt.datetime(y, m, d, 23, 59, 59)
-        return int(dtobj.timestamp())
+        return int(dt.datetime(y, m, d, 23, 59, 59).timestamp())
     except Exception:
         return None
 
@@ -342,10 +340,6 @@ def fetch_events_filtered(
     end_ep: Optional[int],
     limit: int = 10000
 ) -> List[sqlite3.Row]:
-    """
-    Récupère les events filtrés. On filtre sur 'received_at' (epoch seconds).
-    Tri ASC pour que la logique de reconstruction suive l'ordre temporel.
-    """
     sql = "SELECT * FROM events WHERE 1=1"
     args: List[Any] = []
     if symbol:
@@ -353,22 +347,16 @@ def fetch_events_filtered(
     if tf:
         sql += " AND tf = ?"; args.append(tf)
     if start_ep is not None:
-        sql += " AND received_at >= ?"; args.append(int(start_ep))
+        sql += " AND received_at >= ?"; args.append(start_ep)
     if end_ep is not None:
-        sql += " AND received_at <= ?"; args.append(int(end_ep))
-    sql += " ORDER BY received_at ASC, rowid ASC"
+        sql += " AND received_at <= ?"; args.append(end_ep)
+    sql += " ORDER BY received_at ASC"
     if limit:
-        sql += " LIMIT ?"; args.append(int(limit))
+        sql += " LIMIT ?"; args.append(limit)
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, tuple(args))
         return cur.fetchall()
-
-def _first_truthy(*vals):
-    for v in vals:
-        if v not in (None, "", "null"):
-            return v
-    return None
 
 def build_trades_filtered(
     symbol: Optional[str],
@@ -377,23 +365,13 @@ def build_trades_filtered(
     end_ep: Optional[int],
     max_rows: int = 20000
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Reconstruit les trades à partir des events :
-      - ENTRY démarre un trade (on prend le 1er ENTRY par trade_id)
-      - outcome = premier event parmi {TP3, TP2, TP1, SL, CLOSE} après l'ENTRY
-      - duration = outcome_time - entry_time (en secondes)
-    Renvoie (liste_trades, résumé_stats)
-    """
     rows = fetch_events_filtered(symbol, tf, start_ep, end_ep, max_rows)
 
-    # groupement par trade_id (fallback si absent)
-    by_tid: Dict[str, List[sqlite3.Row]] = defaultdict(list)
-    for r in rows:
-        tid = r["trade_id"] or f"noid:{r['symbol']}:{r['tf']}:{r['received_at']}"
-        by_tid[tid].append(r)
-
     trades: List[Dict[str, Any]] = []
+    open_by_tid: Dict[str, Dict[str, Any]] = {}  # trades encore ouverts par trade_id
+    open_stack_by_key: Dict[Tuple[str, str], List[int]] = defaultdict(list)  # index de trades ouverts par (symbol, tf)
 
+    # Stats
     total = wins = losses = 0
     hit_tp1 = hit_tp2 = hit_tp3 = 0
     times_to_outcome: List[int] = []
@@ -401,109 +379,90 @@ def build_trades_filtered(
     best_win_streak = 0
     worst_loss_streak = 0
 
-    # Priorité d'issue (si plusieurs signaux arrivent la même seconde)
-    outcome_rank = {
-        TradeOutcome.TP3: 1,
-        TradeOutcome.TP2: 2,
-        TradeOutcome.TP1: 3,
-        TradeOutcome.SL:  4,
-        TradeOutcome.CLOSE: 5,
-    }
+    def synth_tid(ev: sqlite3.Row) -> str:
+        # trade_id synthétique si manquant
+        return ev["trade_id"] or f"{ev['symbol']}_{ev['tf']}_{ev['received_at']}"
 
-    for tid, items in by_tid.items():
-        # items déjà triés globalement, on garde l’ordre
-        entry_ev: Optional[sqlite3.Row] = None
-        vsymbol = vtf = side = None
-        e_entry = e_sl = e_tp1 = e_tp2 = e_tp3 = None
-        entry_time: Optional[int] = None
+    for ev in rows:
+        etype = ev["type"]
+        sym = ev["symbol"]
+        tfv = ev["tf"]
+        key = (sym, tfv)
 
-        # on stocke candidats d'issue après ENTRY avec leur rank
-        candidates: List[Tuple[int, int, str]] = []  # (received_at, rank, etype)
-
-        for ev in items:
-            etype = ev["type"]
-
-            if etype == "ENTRY" and entry_ev is None:
-                entry_ev = ev
-                vsymbol = ev["symbol"]
-                vtf     = ev["tf"]
-                side    = ev.get("side") if hasattr(ev, "get") else ev["side"]
-
-                # cast num safely
-                e_entry = _first_truthy(ev.get("entry") if hasattr(ev, "get") else ev["entry"], None)
-                e_sl    = _first_truthy(ev.get("sl")    if hasattr(ev, "get") else ev["sl"], None)
-                e_tp1   = _first_truthy(ev.get("tp1")   if hasattr(ev, "get") else ev["tp1"], None)
-                e_tp2   = _first_truthy(ev.get("tp2")   if hasattr(ev, "get") else ev["tp2"], None)
-                e_tp3   = _first_truthy(ev.get("tp3")   if hasattr(ev, "get") else ev["tp3"], None)
-
-                # Heure d'entrée : on préfère l'horodatage TradingView s'il est stocké,
-                # sinon on prend received_at (seconds).
-                # Ici on part de 'received_at' (seconds) dans la table.
-                entry_time = int(ev["received_at"]) if ev["received_at"] is not None else None
-
-            elif entry_ev is not None:
-                # candidats outcome après entry
-                if etype in (TradeOutcome.TP3, TradeOutcome.TP2, TradeOutcome.TP1,
-                             TradeOutcome.SL, TradeOutcome.CLOSE):
-                    ra = int(ev["received_at"]) if ev["received_at"] is not None else 0
-                    rk = outcome_rank.get(etype, 999)
-                    candidates.append((ra, rk, etype))
-
-        # choisir le meilleur outcome après ENTRY
-        outcome_type = TradeOutcome.NONE
-        outcome_time: Optional[int] = None
-
-        if entry_ev is not None:
-            # ne garder que ceux strictement après l'heure d'entrée
-            if entry_time is not None:
-                candidates = [c for c in candidates if c[0] >= entry_time]
-            # tri par time puis rank
-            candidates.sort(key=lambda x: (x[0], x[1]))
-            if candidates:
-                outcome_time, _, outcome_type = candidates[0]
-
-            # stats + assemble trade
-            total += 1
-            if outcome_time and entry_time:
-                try:
-                    times_to_outcome.append(int(outcome_time - entry_time))
-                except Exception:
-                    pass
-
-            is_win = outcome_type in (TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3)
-            if is_win:
-                wins += 1
-                win_streak += 1
-                best_win_streak = max(best_win_streak, win_streak)
-                loss_streak = 0
-                if outcome_type == TradeOutcome.TP1: hit_tp1 += 1
-                elif outcome_type == TradeOutcome.TP2: hit_tp2 += 1
-                elif outcome_type == TradeOutcome.TP3: hit_tp3 += 1
-            elif outcome_type == TradeOutcome.SL:
-                losses += 1
-                loss_streak += 1
-                worst_loss_streak = max(worst_loss_streak, loss_streak)
-                win_streak = 0
-            elif outcome_type in (TradeOutcome.CLOSE, TradeOutcome.NONE):
-                # Close sans TP ni SL : on coupe les séries
-                win_streak = 0
-                loss_streak = 0
-
-            trades.append({
+        if etype == "ENTRY":
+            tid = synth_tid(ev)
+            t = {
                 "trade_id": tid,
-                "symbol": vsymbol or "—",
-                "tf": vtf or "—",
-                "side": side or "—",
-                "entry": e_entry,
-                "sl": e_sl,
-                "tp1": e_tp1,
-                "tp2": e_tp2,
-                "tp3": e_tp3,
-                "entry_time": entry_time,               # seconds (UTC)
-                "outcome": outcome_type,
-                "outcome_time": outcome_time,           # seconds (UTC) ou None
-                "duration_sec": int(outcome_time - entry_time) if (outcome_time and entry_time) else None,
-            })
+                "symbol": sym,
+                "tf": tfv,
+                "side": ev.get("side"),
+                "entry": ev.get("entry"),
+                "sl": ev.get("sl"),
+                "tp1": ev.get("tp1"),
+                "tp2": ev.get("tp2"),
+                "tp3": ev.get("tp3"),
+                "entry_time": ev["received_at"],
+                "outcome": TradeOutcome.NONE,
+                "outcome_time": None,
+                "duration_sec": None,
+            }
+            trades.append(t)
+            open_by_tid[tid] = t
+            open_stack_by_key[key].append(len(trades) - 1)
+            continue
+
+        if etype in FINAL_EVENTS:
+            # 1) Essayer par trade_id si présent et ouvert
+            targ: Optional[Dict[str, Any]] = None
+            tid = ev.get("trade_id")
+            if tid and tid in open_by_tid:
+                targ = open_by_tid[tid]
+            else:
+                # 2) Sinon, rattacher au dernier trade encore ouvert du même (symbol, tf)
+                stack = open_stack_by_key.get(key) or []
+                while stack:
+                    idx = stack[-1]
+                    cand = trades[idx]
+                    if cand["outcome"] == TradeOutcome.NONE:
+                        targ = cand
+                        break
+                    else:
+                        stack.pop()  # nettoyage si déjà clôturé
+
+            if targ is not None and targ["outcome"] == TradeOutcome.NONE:
+                targ["outcome"] = etype
+                targ["outcome_time"] = ev["received_at"]
+                if targ["entry_time"]:
+                    targ["duration_sec"] = int(targ["outcome_time"] - targ["entry_time"])
+                # fermer dans les index d'ouvert
+                open_by_tid.pop(targ["trade_id"], None)
+                if key in open_stack_by_key and open_stack_by_key[key]:
+                    if open_stack_by_key[key][-1] == trades.index(targ):
+                        open_stack_by_key[key].pop()
+
+    # Calcul des stats (ne comptabilise pas CLOSE comme win/loss)
+    for t in trades:
+        if t["entry_time"] is not None:
+            total += 1
+        if t["outcome_time"] and t["entry_time"]:
+            times_to_outcome.append(int(t["outcome_time"] - t["entry_time"]))
+
+        if t["outcome"] in (TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3):
+            wins += 1
+            win_streak += 1
+            loss_streak = 0
+            best_win_streak = max(best_win_streak, win_streak)
+            if t["outcome"] == TradeOutcome.TP1: hit_tp1 += 1
+            elif t["outcome"] == TradeOutcome.TP2: hit_tp2 += 1
+            elif t["outcome"] == TradeOutcome.TP3: hit_tp3 += 1
+        elif t["outcome"] == TradeOutcome.SL:
+            losses += 1
+            loss_streak += 1
+            win_streak = 0
+            worst_loss_streak = max(worst_loss_streak, loss_streak)
+        else:
+            # NONE ou CLOSE -> ne modifie pas les streaks
+            pass
 
     winrate = (wins / total * 100.0) if total else 0.0
     avg_sec = int(sum(times_to_outcome) / len(times_to_outcome)) if times_to_outcome else 0
@@ -516,11 +475,12 @@ def build_trades_filtered(
         "tp1_hits": hit_tp1,
         "tp2_hits": hit_tp2,
         "tp3_hits": hit_tp3,
-        "avg_time_to_outcome_sec": int(avg_sec),
-        "best_win_streak": int(best_win_streak),
-        "worst_loss_streak": int(worst_loss_streak),
+        "avg_time_to_outcome_sec": avg_sec,
+        "best_win_streak": best_win_streak,
+        "worst_loss_streak": worst_loss_streak,
     }
     return trades, summary
+
 
 
 # -------------------------
@@ -1986,6 +1946,7 @@ def _daemon_loop():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
 
 
 
