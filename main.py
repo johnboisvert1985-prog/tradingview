@@ -2435,49 +2435,71 @@ def trades_admin(
     )
     return HTMLResponse(html)
 # ============ fin SECTION 7/8 ============
-# -------- Webhook TradingView --------
+# -------- Webhook TradingView (JSON ou form-data), NON-ÉPINGLÉ --------
 @app.api_route("/tv-webhook", methods=["POST"])
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
-    # 1) Parse JSON
-    try:
-        payload = await request.json()
-        if not isinstance(payload, dict):
-            raise ValueError("JSON must be an object")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    # 1) Récup payload (JSON prioritaire, sinon form-data)
+    payload: Dict[str, Any] = {}
+    content_type = (request.headers.get("content-type") or "").lower()
 
-    # 2) Secret (via query ?secret=... OU champ JSON "secret")
-    body_secret = payload.get("secret")
+    try:
+        if "application/json" in content_type:
+            payload = await request.json()
+        else:
+            # TradingView envoie souvent en form-data (application/x-www-form-urlencoded)
+            form = await request.form()
+            payload = {k: (v if isinstance(v, str) else v.filename if hasattr(v, "filename") else str(v))
+                       for k, v in form.items()}
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # 2) Secret: via query ?secret=... ou clé JSON/form "secret"
+    body_secret = str(payload.get("secret") or "")
     if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # 3) Normalisation minimale
-    t = str(payload.get("type") or "").upper().strip()
-    if not t:
-        raise HTTPException(status_code=400, detail="Missing 'type'")
-    payload["type"] = t  # on force en MAJ pour le builder
+    # 3) Normalise quelques champs utiles
+    def _f(x): 
+        try: 
+            return None if x in (None, "", "null") else float(x)
+        except Exception: 
+            return None
 
-    # 4) Sauvegarde brute en DB (pour que /trades et /events s’alimentent)
+    payload["type"]   = str(payload.get("type") or payload.get("event") or "").upper()
+    payload["symbol"] = str(payload.get("symbol") or payload.get("ticker") or "")
+    payload["tf"]     = str(payload.get("tf") or payload.get("timeframe") or payload.get("interval") or "")
+    payload["side"]   = str(payload.get("side") or payload.get("direction") or "")
+    payload["entry"]  = _f(payload.get("entry"))
+    payload["sl"]     = _f(payload.get("sl"))
+    payload["tp"]     = _f(payload.get("tp"))
+    payload["tp1"]    = _f(payload.get("tp1"))
+    payload["tp2"]    = _f(payload.get("tp2"))
+    payload["tp3"]    = _f(payload.get("tp3"))
+    # ID de trade optionnel (facilite le matching des TP/SL/CLOSE)
+    if payload.get("trade_id") is None:
+        payload["trade_id"] = payload.get("id") or payload.get("order_id") or None
+
+    # 4) Enregistre en DB (pour le dashboard)
     try:
         save_event(payload)
     except Exception as e:
-        # on log, mais on renvoie 200 pour ne pas faire échouer TradingView si la DB est OK plus tard
         log.warning("save_event failed: %s", e)
 
-    # 5) Message Telegram (optionnel, selon le type)
-    tg_info = None
+    # 5) Message Telegram lisible (peut être None pour certains types)
     try:
         msg = telegram_rich_message(payload)
-        if msg:  # AOE_* renvoie None => pas d’envoi
-            # on peut épingler seulement les ENTRY, par exemple
-            pin = (t == "ENTRY" and TELEGRAM_PIN_ALTSEASON)
-            r = send_telegram_ex(msg, pin=pin)
-            tg_info = {"ok": bool(r.get("ok")), "pinned": bool(r.get("pinned")), "error": r.get("error")}
+        if msg:
+            # IMPORTANT: ne JAMAIS épingler les webhooks TradingView
+            send_telegram_ex(msg, pin=False)
     except Exception as e:
         log.warning("telegram send failed: %s", e)
-        tg_info = {"ok": False, "error": str(e)}
 
-    return {"ok": True, "stored": True, "type": t, "telegram": tg_info}
+    # 6) Réponse OK
+    return JSONResponse({"ok": True, "stored": True, "received_type": payload.get("type"),
+                         "symbol": payload.get("symbol"), "tf": payload.get("tf")})
 
 # ============ main.py — SECTION 8/8 (Daemon Altseason + __main__) ============
 
@@ -2546,5 +2568,6 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 # ============ fin SECTION 8/8 ============
+
 
 
