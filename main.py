@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+# -------------------------
+# FastAPI app (doit être défini AVANT toute route)
+# -------------------------
+app = FastAPI(title="AI Trader PRO")
 
 # -------------------------
 # Logging
@@ -2498,3 +2502,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 # ============ fin SECTION 8/8 ============
+
