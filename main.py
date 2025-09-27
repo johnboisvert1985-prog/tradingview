@@ -204,6 +204,55 @@ def parse_leverage_x(leverage: Optional[str]) -> Optional[float]:
     except Exception:
         return None
     return None
+def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
+    """
+    Confiance (0..100%) pour un ENTRY, via une heuristique locale (pas d'appel réseau).
+    Retourne (confidence_pct, rationale) ou None si données insuffisantes.
+    - LONG : risk = entry - sl ; reward = tp1 - entry
+    - SHORT: risk = sl - entry ; reward = entry - tp1
+    """
+    t = str(payload.get("type") or "").upper()
+    if t != "ENTRY":
+        return None
+
+    side  = str(payload.get("side") or "").upper()
+    entry = _to_float(payload.get("entry"))
+    sl    = _to_float(payload.get("sl"))
+    tp1   = _to_float(payload.get("tp1")) or _to_float(payload.get("tp"))  # fallback
+
+    if not (side and entry is not None and sl is not None and tp1 is not None):
+        return None
+
+    try:
+        if side == "LONG":
+            risk = entry - sl
+            reward = tp1 - entry
+        else:  # SHORT
+            risk = sl - entry
+            reward = entry - tp1
+
+        # incohérences (risk/reward négatif ou nul)
+        if risk <= 0 or reward <= 0:
+            return (35.0, "R/R défavorable ou incohérent")
+
+        rr = reward / risk
+
+        # mapping simple R/R -> confiance
+        if rr >= 3.0:
+            conf = 85.0
+        elif rr >= 2.0:
+            conf = 75.0
+        elif rr >= 1.5:
+            conf = 65.0
+        elif rr >= 1.2:
+            conf = 55.0
+        else:
+            conf = 45.0
+
+        rationale = f"RR≈{rr:.2f} (reward={fmt_num(reward)}, risk={fmt_num(risk)})"
+        return (conf, rationale)
+    except Exception:
+        return None
 
 # -------------------------
 # Build trades & stats (robuste + CLOSE/OPEN)
@@ -962,17 +1011,17 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
     if t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
         return None
 
-    sym = str(payload.get("symbol") or "?")
+    sym    = str(payload.get("symbol") or "?")
     tf_lbl = tf_label_of(payload)
-    side = str(payload.get("side") or "")
-    entry = _to_float(payload.get("entry"))
-    sl = _to_float(payload.get("sl"))
-    tp = _to_float(payload.get("tp"))   # pour TP/SL hits: niveau exécuté
-    tp1 = _to_float(payload.get("tp1"))
-    tp2 = _to_float(payload.get("tp2"))
-    tp3 = _to_float(payload.get("tp3"))
+    side   = str(payload.get("side") or "")
+    entry  = _to_float(payload.get("entry"))
+    sl     = _to_float(payload.get("sl"))
+    tp     = _to_float(payload.get("tp"))   # niveau exécuté pour TP/SL hits
+    tp1    = _to_float(payload.get("tp1"))
+    tp2    = _to_float(payload.get("tp2"))
+    tp3    = _to_float(payload.get("tp3"))
     leverage = payload.get("leverage") or payload.get("lev") or payload.get("lev_reco")
-    lev_x = parse_leverage_x(str(leverage) if leverage is not None else None)
+    lev_x    = parse_leverage_x(str(leverage) if leverage is not None else None)
 
     def num(v): return fmt_num(v) if v is not None else "—"
 
@@ -988,18 +1037,20 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
         if tp2: lines.append(f"🎯 TP2: {num(tp2)}")
         if tp3: lines.append(f"🎯 TP3: {num(tp3)}")
         if sl:  lines.append(f"❌ SL: {num(sl)}")
-        # Option: Confiance LLM si activé côté env (laisse silencieux si indispo)
+
+        # Confiance (heuristique locale, toujours sûre)
         try:
-            if LLM_ENABLED and _openai_client and (FORCE_LLM or True):
-                res = llm_confidence_for_entry(payload)
-                if res:
-                    conf_pct, rationale = res
-                    if conf_pct >= CONFIDENCE_MIN:
-                        lines.append(f"🧠 Confiance LLM: {conf_pct:.0f}% — {rationale or 'estimation heuristique'}")
-                    else:
-                        lines.append(f"🧠 Confiance LLM: {conf_pct:.0f}%")
+            res = llm_confidence_for_entry(payload)
+            if res:
+                conf_pct, rationale = res
+                # Affiche toujours la confiance ; si tu veux filtrer en dessous d'un seuil,
+                # règle CONFIDENCE_MIN dans l'env (affichage identique, juste l'annotation change).
+                if CONFIDENCE_MIN and conf_pct < CONFIDENCE_MIN:
+                    lines.append(f"🧠 Confiance: {conf_pct:.0f}%")
+                else:
+                    lines.append(f"🧠 Confiance: {conf_pct:.0f}% — {rationale}")
         except Exception as e:
-            log.warning("LLM confidence render failed: %s", e)
+            log.debug("confidence render skipped: %s", e)
 
         lines.append("🤖 Astuce: après TP1, placez SL au BE.")
         return "\n".join(lines)
@@ -1033,11 +1084,11 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
         lines = [f"🔔 Close — {sym} {tf_lbl}"]
         if reason:
             lines.append(f"Raison: {reason}")
-        # Note: côté dashboard, CLOSE est affiché en badge 'close' (neutre).
         return "\n".join(lines)
 
     # Fallback générique
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
+
 # ============ fin SECTION 3/8 ============
 # ============ main.py — SECTION 4/8 (DB + modèles & builder des trades) ============
 
@@ -2568,6 +2619,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 # ============ fin SECTION 8/8 ============
+
 
 
 
