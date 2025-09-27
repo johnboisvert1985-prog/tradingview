@@ -2435,6 +2435,50 @@ def trades_admin(
     )
     return HTMLResponse(html)
 # ============ fin SECTION 7/8 ============
+# -------- Webhook TradingView --------
+@app.api_route("/tv-webhook", methods=["POST"])
+async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
+    # 1) Parse JSON
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("JSON must be an object")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # 2) Secret (via query ?secret=... OU champ JSON "secret")
+    body_secret = payload.get("secret")
+    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    # 3) Normalisation minimale
+    t = str(payload.get("type") or "").upper().strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="Missing 'type'")
+    payload["type"] = t  # on force en MAJ pour le builder
+
+    # 4) Sauvegarde brute en DB (pour que /trades et /events s’alimentent)
+    try:
+        save_event(payload)
+    except Exception as e:
+        # on log, mais on renvoie 200 pour ne pas faire échouer TradingView si la DB est OK plus tard
+        log.warning("save_event failed: %s", e)
+
+    # 5) Message Telegram (optionnel, selon le type)
+    tg_info = None
+    try:
+        msg = telegram_rich_message(payload)
+        if msg:  # AOE_* renvoie None => pas d’envoi
+            # on peut épingler seulement les ENTRY, par exemple
+            pin = (t == "ENTRY" and TELEGRAM_PIN_ALTSEASON)
+            r = send_telegram_ex(msg, pin=pin)
+            tg_info = {"ok": bool(r.get("ok")), "pinned": bool(r.get("pinned")), "error": r.get("error")}
+    except Exception as e:
+        log.warning("telegram send failed: %s", e)
+        tg_info = {"ok": False, "error": str(e)}
+
+    return {"ok": True, "stored": True, "type": t, "telegram": tg_info}
+
 # ============ main.py — SECTION 8/8 (Daemon Altseason + __main__) ============
 
 import threading
@@ -2502,4 +2546,5 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 # ============ fin SECTION 8/8 ============
+
 
