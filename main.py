@@ -245,7 +245,6 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
         global _last_tg
         now = _time.time()
         if now - _last_tg < TELEGRAM_COOLDOWN_SECONDS:
-            # Soft rate-limit: on ne renvoie pas d’erreur dure
             result["ok"] = True
             result["error"] = "rate-limited (cooldown)"
             return result
@@ -305,6 +304,7 @@ def send_telegram_ex(text: str, pin: bool = False) -> Dict[str, Any]:
         log.warning("Telegram send_telegram_ex exception: %s", e)
         return result
 
+
 # ---------- LLM: score de confiance pour ENTRY ----------
 def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
     """
@@ -314,7 +314,6 @@ def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, s
     if not (LLM_ENABLED and _openai_client and OPENAI_API_KEY):
         return None
     try:
-        # Prompt compact et déterministe
         sym = str(payload.get("symbol") or "?")
         tf_lbl = tf_label_of(payload)
         side = str(payload.get("side") or "N/A")
@@ -335,7 +334,6 @@ def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, s
             "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3
         }, ensure_ascii=False)
 
-        # API responses.format=JSON (compat V1 SDK)
         resp = _openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
@@ -353,6 +351,7 @@ def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, s
     except Exception as e:
         log.warning("llm_confidence_for_entry error: %s", e)
         return None
+# ============ main.py — BLOC 3/5 (Telegram message builder + Webhook) ============
 
 # ---------- Mise en forme des messages Telegram ----------
 def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
@@ -430,7 +429,7 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
             lines.append(f"Exécuté : {num(tp)}")
         return "\n".join(lines)
 
-    # CLOSE (fermeture neutre, ex flip de signal)
+    # CLOSE
     if t == "CLOSE":
         reason = payload.get("reason")
         lines = [f"🔔 Close — {sym} {tf_lbl}"]
@@ -438,9 +437,8 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
             lines.append(f"Raison: {reason}")
         return "\n".join(lines)
 
-    # VECTOR_CANDLE (nouveau)
+    # VECTOR_CANDLE
     if t == "VECTOR_CANDLE":
-        # Message sobre pour chandelle vectorielle
         lines = [f"🟪 Vector Candle — {sym} {tf_lbl}"]
         if side:
             lines.append(f"Contexte: {side}")
@@ -451,6 +449,7 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
 
     # Fallback générique
     return f"[TV] {t} | {sym} | TF {tf_lbl}"
+
 
 # ---------- Webhook TradingView ----------
 TELEGRAM_NOTIFY_VECTOR = os.getenv("TELEGRAM_NOTIFY_VECTOR", "1") in ("1","true","True")
@@ -467,14 +466,13 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
       // pour VECTOR_CANDLE optionnel: "level": prix, "price": prix
     }
     """
-    # Secret check (query ou body)
+    # Secret check
     body = {}
     if request.method == "POST":
         try:
             body = await request.json()
         except Exception:
             try:
-                # Certains envoient du form-encoded
                 body = dict(await request.form())
             except Exception:
                 body = {}
@@ -482,7 +480,6 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # GET simple test
     if request.method == "GET":
         return JSONResponse({"ok": True, "hint": "POST JSON to this endpoint"})
 
@@ -490,386 +487,114 @@ async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
     payload = dict(body or {})
     payload["type"] = str(payload.get("type") or "EVENT").upper()
     if "tf" in payload and isinstance(payload["tf"], str) and payload["tf"].isdigit():
-        payload["tf"] = payload["tf"]  # déjà OK (string numérique)
+        payload["tf"] = payload["tf"]
+
     # Sauvegarde brute
     save_event(payload)
 
-    # Message Telegram (ignore AOE_*)
+    # Message Telegram
     msg = telegram_rich_message(payload)
     sent = None
     if msg:
-        # IMPORTANT: on ne PIN PAS les ENTRY. (pin=False)
-        # On peut pin les alertes Altseason ailleurs.
         pin = False
         if payload["type"] == "VECTOR_CANDLE" and not TELEGRAM_NOTIFY_VECTOR:
-            sent = False  # désactivé via env
+            sent = False
         else:
             sent = send_telegram_ex(msg, pin=pin).get("ok")
 
     return JSONResponse({"ok": True, "telegram_sent": bool(sent), "type": payload["type"]})
-# ============ main.py — BLOC 3/5 (SQLite, modèles trades, helpers d’affichage) ============
+# ============ main.py — BLOC 4/5 (Altseason + Template HTML dashboard) ============
 
-# ---------- SQLite : chemin résilient + connexion + init ----------
-def resolve_db_path() -> None:
-    """Assure un chemin DB writable; fallback /tmp/ai_trader/data.db si besoin."""
-    global DB_PATH
-    d = os.path.dirname(DB_PATH) or "."
-    try:
-        os.makedirs(d, exist_ok=True)
-        probe = os.path.join(d, ".write_test")
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("ok")
-        os.remove(probe)
-        log.info("DB dir OK: %s (using %s)", d, DB_PATH)
-    except Exception as e:
-        fallback_dir = "/tmp/ai_trader"
-        os.makedirs(fallback_dir, exist_ok=True)
-        DB_PATH = os.path.join(fallback_dir, "data.db")
-        log.warning("DB dir '%s' not writable (%s). Falling back to %s", d, e, DB_PATH)
+# ---------- Template HTML public pour /trades ----------
+TRADES_PUBLIC_HTML_TPL = Template(r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Trades — Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{
+    --bg:#0f172a; --card:#0b1220; --muted:#94a3b8; --fg:#e5e7eb;
+    --border:#1f2937; --win:#16a34a; --loss:#ef4444; --close:#eab308; --open:#38bdf8;
+  }
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Inter,Arial}
+  a{color:#93c5fd;text-decoration:none}
+  .wrap{max-width:1200px;margin:24px auto;padding:0 12px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+  h1{margin:0 0 8px 0;font-size:22px}
+  .muted{color:var(--muted)}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px}
+  @media(min-width:900px){.grid{grid-template-columns:2fr 1fr}}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .pill{display:inline-block;background:#111827;border:1px solid var(--border);border-radius:999px;padding:6px 10px;margin:4px 6px 0 0;font-size:13px}
+  .table-wrap{overflow:auto;border:1px solid var(--border);border-radius:12px}
+  table{width:100%;border-collapse:collapse;min-width:980px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left;font-size:14px;white-space:nowrap}
+  th{position:sticky;top:0;background:#0f172a;font-weight:600}
+  .chip{display:inline-block;padding:3px 8px;border-radius:10px;border:1px solid var(--border);font-size:12px}
+  .chip.win{background:rgba(22,163,74,.12);border-color:rgba(22,163,74,.4);color:#86efac}
+  .chip.loss{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.4);color:#fca5a5}
+  .chip.close{background:rgba(234,179,8,.12);border-color:rgba(234,179,8,.4);color:#fde68a}
+  .chip.open{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.4);color:#bae6fd}
+  .chip.muted{background:#0b1220;color:var(--muted)}
+  .filters{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px}
+  .filters input{background:#0b1220;border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--fg)}
+  .filters button{background:#1d4ed8;border:0;border-radius:8px;padding:8px 12px;color:white;cursor:pointer}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .hint{font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Trades — Dashboard</h1>
+    <div class="hint muted">Filtrez par symbole / timeframe / date, puis validez.</div>
+    <form method="get" action="/trades" class="filters">
+      <input type="text" name="symbol" placeholder="symbol (ex: BTCUSDT.P)" value="${symbol}" />
+      <input type="text" name="tf" placeholder="tf (ex: 15, 60, 1D)" value="${tf}" />
+      <input type="date" name="start" value="${start}" />
+      <input type="date" name="end" value="${end}" />
+      <input type="number" min="1" max="10000" name="limit" value="${limit}" />
+      <button type="submit">Appliquer</button>
+      <a href="/" class="pill">← Home</a>
+    </form>
 
-def db_conn() -> sqlite3.Connection:
-    """Connexion SQLite avec options sensées."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-    except Exception:
-        pass
-    return conn
+    <div class="grid">
+      <div class="card" style="padding:12px">
+        <div class="row">
+          <span class="pill">Total: <strong>${total_trades}</strong></span>
+          <span class="pill">Winrate: <strong>${winrate_pct}%</strong></span>
+          <span class="pill">Wins: <strong>${wins}</strong></span>
+          <span class="pill">Losses: <strong>${losses}</strong></span>
+          <span class="pill">TP1: <strong>${tp1_hits}</strong></span>
+          <span class="pill">TP2: <strong>${tp2_hits}</strong></span>
+          <span class="pill">TP3: <strong>${tp3_hits}</strong></span>
+          <span class="pill">Avg. time: <strong>${avg_time_to_outcome_sec}s</strong></span>
+          <span class="pill">Best streak: <strong>${best_win_streak}</strong></span>
+          <span class="pill">Worst loss streak: <strong>${worst_loss_streak}</strong></span>
+        </div>
+      </div>
+    </div>
 
-def db_init() -> None:
-    """Crée la table events si absente."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                received_at INTEGER NOT NULL,
-                type TEXT,
-                symbol TEXT,
-                tf TEXT,
-                side TEXT,
-                entry REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                tp3 REAL,
-                trade_id TEXT,
-                raw_json TEXT
-            )
-            """
-        )
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_trade  ON events(trade_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_time   ON events(received_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_tf     ON events(tf)")
-        conn.commit()
-    log.info("DB initialized at %s", DB_PATH)
-
-# Boot DB à l’import
-resolve_db_path()
-db_init()
-
-# ---------- Persistance d’un event (webhook) ----------
-def save_event(payload: dict) -> None:
-    """Insère un event TradingView tel quel dans la table `events`."""
-    row = {
-        "received_at": int(time.time()),
-        "type": payload.get("type"),
-        "symbol": payload.get("symbol"),
-        "tf": str(payload.get("tf")) if payload.get("tf") is not None else None,
-        "side": payload.get("side"),
-        "entry": _to_float(payload.get("entry")),
-        "sl": _to_float(payload.get("sl")),
-        "tp1": _to_float(payload.get("tp1")),
-        "tp2": _to_float(payload.get("tp2")),
-        "tp3": _to_float(payload.get("tp3")),
-        "trade_id": payload.get("trade_id"),
-        "raw_json": json.dumps(payload, ensure_ascii=False),
-    }
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO events (received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json)
-            VALUES (:received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json)
-            """,
-            row,
-        )
-        conn.commit()
-    log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s",
-             row["type"], row["symbol"], row["tf"], row["trade_id"])
-
-# ---------- Reconstruction des trades & stats ----------
-class TradeOutcome:
-    NONE  = "NONE"
-    TP1   = "TP1_HIT"
-    TP2   = "TP2_HIT"
-    TP3   = "TP3_HIT"
-    SL    = "SL_HIT"
-    CLOSE = "CLOSE"
-
-FINAL_EVENTS = {TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3,
-                TradeOutcome.SL, TradeOutcome.CLOSE}
-
-def row_get(row: sqlite3.Row, key: str, default=None):
-    """Accès sûr aux colonnes d'un sqlite3.Row (pas de .get())."""
-    try:
-        return row[key]
-    except Exception:
-        return default
-
-def parse_date_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    if not date_str:
-        return None
-    try:
-        import datetime as dt
-        y, m, d = map(int, date_str.split("-"))
-        return int(dt.datetime(y, m, d, 0, 0, 0).timestamp())
-    except Exception:
-        return None
-
-def parse_date_end_to_epoch(date_str: Optional[str]) -> Optional[int]:
-    if not date_str:
-        return None
-    try:
-        import datetime as dt
-        y, m, d = map(int, date_str.split("-"))
-        return int(dt.datetime(y, m, d, 23, 59, 59).timestamp())
-    except Exception:
-        return None
-
-def fetch_events_filtered(
-    symbol: Optional[str],
-    tf: Optional[str],
-    start_ep: Optional[int],
-    end_ep: Optional[int],
-    limit: int = 10000
-) -> List[sqlite3.Row]:
-    sql = "SELECT * FROM events WHERE 1=1"
-    args: List[Any] = []
-    if symbol:
-        sql += " AND symbol = ?"; args.append(symbol)
-    if tf:
-        sql += " AND tf = ?"; args.append(tf)
-    if start_ep is not None:
-        sql += " AND received_at >= ?"; args.append(start_ep)
-    if end_ep is not None:
-        sql += " AND received_at <= ?"; args.append(end_ep)
-    sql += " ORDER BY received_at ASC"
-    if limit:
-        sql += " LIMIT ?"; args.append(limit)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, tuple(args))
-        return cur.fetchall()
-
-def build_trades_filtered(
-    symbol: Optional[str],
-    tf: Optional[str],
-    start_ep: Optional[int],
-    end_ep: Optional[int],
-    max_rows: int = 20000
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Reconstitue les trades à partir de la séquence d'events.
-    - ENTRY crée un trade ouvert
-    - TPx_HIT / SL_HIT / CLOSE ferment le trade le plus récent correspondant
-      (par trade_id s'il est fourni, sinon par paire (symbol, tf) en LIFO).
-    """
-    rows = fetch_events_filtered(symbol, tf, start_ep, end_ep, max_rows)
-
-    trades: List[Dict[str, Any]] = []
-    open_by_tid: Dict[str, Dict[str, Any]] = {}                       # trades ouverts indexés par trade_id
-    open_stack_by_key: Dict[Tuple[str, str], List[int]] = defaultdict(list)  # pile d'index par (symbol, tf)
-
-    # Statistiques
-    total = wins = losses = 0
-    hit_tp1 = hit_tp2 = hit_tp3 = 0
-    times_to_outcome: List[int] = []
-    win_streak = loss_streak = 0
-    best_win_streak = 0
-    worst_loss_streak = 0
-
-    def synth_tid(ev: sqlite3.Row) -> str:
-        tid = row_get(ev, "trade_id")
-        if tid:
-            return tid
-        return f"{row_get(ev,'symbol')}_{row_get(ev,'tf')}_{row_get(ev,'received_at')}"
-
-    for ev in rows:
-        etype = row_get(ev, "type")
-        sym = row_get(ev, "symbol")
-        tfv = row_get(ev, "tf")
-        key = (sym, tfv)
-
-        # OUVERTURE
-        if etype == "ENTRY":
-            tid = synth_tid(ev)
-            t = {
-                "trade_id": tid,
-                "symbol": sym,
-                "tf": tfv,
-                "side": row_get(ev, "side"),
-                "entry": row_get(ev, "entry"),
-                "sl": row_get(ev, "sl"),
-                "tp1": row_get(ev, "tp1"),
-                "tp2": row_get(ev, "tp2"),
-                "tp3": row_get(ev, "tp3"),
-                "entry_time": row_get(ev, "received_at"),
-                "outcome": TradeOutcome.NONE,
-                "outcome_time": None,
-                "duration_sec": None,
-            }
-            trades.append(t)
-            open_by_tid[tid] = t
-            open_stack_by_key[key].append(len(trades) - 1)
-            continue
-
-        # CLÔTURES
-        if etype in FINAL_EVENTS:
-            targ: Optional[Dict[str, Any]] = None
-            tid = row_get(ev, "trade_id")
-
-            # Essaie par trade_id
-            if tid and tid in open_by_tid:
-                targ = open_by_tid[tid]
-            else:
-                # Sinon, dernier trade ouvert pour (symbol, tf)
-                stack = open_stack_by_key.get(key) or []
-                while stack:
-                    idx = stack[-1]
-                    cand = trades[idx]
-                    if cand["outcome"] == TradeOutcome.NONE:
-                        targ = cand
-                        break
-                    else:
-                        stack.pop()  # nettoie les fermés
-
-            if targ is not None and targ["outcome"] == TradeOutcome.NONE:
-                targ["outcome"] = etype
-                targ["outcome_time"] = row_get(ev, "received_at")
-                if targ["entry_time"] and targ["outcome_time"]:
-                    targ["duration_sec"] = int(targ["outcome_time"] - targ["entry_time"])
-                # fermer l'état ouvert
-                open_by_tid.pop(targ["trade_id"], None)
-                if key in open_stack_by_key and open_stack_by_key[key]:
-                    if open_stack_by_key[key][-1] == trades.index(targ):
-                        open_stack_by_key[key].pop()
-
-    # Agrégation stats (CLOSE = neutre, ne compte pas en win/loss mais ferme le trade)
-    for t in trades:
-        if t["entry_time"] is not None:
-            total += 1
-        if t["outcome_time"] and t["entry_time"]:
-            times_to_outcome.append(int(t["outcome_time"] - t["entry_time"]))
-
-        if t["outcome"] in (TradeOutcome.TP1, TradeOutcome.TP2, TradeOutcome.TP3):
-            wins += 1
-            win_streak += 1
-            loss_streak = 0
-            best_win_streak = max(best_win_streak, win_streak)
-            if t["outcome"] == TradeOutcome.TP1: hit_tp1 += 1
-            elif t["outcome"] == TradeOutcome.TP2: hit_tp2 += 1
-            elif t["outcome"] == TradeOutcome.TP3: hit_tp3 += 1
-        elif t["outcome"] == TradeOutcome.SL:
-            losses += 1
-            loss_streak += 1
-            win_streak = 0
-            worst_loss_streak = max(worst_loss_streak, loss_streak)
-        else:
-            # NONE (toujours ouvert) ou CLOSE (neutre)
-            pass
-
-    winrate = (wins / total * 100.0) if total else 0.0
-    avg_sec = int(sum(times_to_outcome) / len(times_to_outcome)) if times_to_outcome else 0
-
-    summary = {
-        "total_trades": total,
-        "wins": wins,
-        "losses": losses,
-        "winrate_pct": round(winrate, 2),
-        "tp1_hits": hit_tp1,
-        "tp2_hits": hit_tp2,
-        "tp3_hits": hit_tp3,
-        "avg_time_to_outcome_sec": avg_sec,
-        "best_win_streak": best_win_streak,
-        "worst_loss_streak": worst_loss_streak,
-    }
-    return trades, summary
-
-# ---------- Helpers d'affichage pour le dashboard ----------
-def chip_class(outcome: str) -> str:
-    """Classe CSS pour le badge Outcome."""
-    if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
-        return "chip win"
-    if outcome == "SL_HIT":
-        return "chip loss"
-    if outcome == "CLOSE":
-        return "chip close"
-    return "chip open"  # NONE => trade encore ouvert
-
-def outcome_label(outcome: str) -> str:
-    """Texte lisible pour Outcome (NONE -> OPEN)."""
-    if outcome in ("TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"):
-        return outcome.replace("_HIT", "").title()  # TP1/TP2/TP3/Sl/Close
-    return "OPEN"
-
-def fmt_ts(ts: int | None, tz: timezone | None = None) -> str:
-    """Formatte epoch en 'YYYY-MM-DD HH:MM:SS' (UTC par défaut)."""
-    if not ts:
-        return "—"
-    try:
-        dt = datetime.fromtimestamp(int(ts), tz or timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return "—"
-# ============ main.py — BLOC 4/5 (Altseason, Webhook TV, LLM confidence) ============
-
-# ---------- Heuristique LLM locale pour la confiance ENTRY ----------
-def llm_confidence_for_entry(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
-    """
-    Renvoie (confiance_en_% , justification_courte) pour un ENTRY.
-    Implémentation simple/locale pour éviter les NameError si OpenAI est off.
-    """
-    try:
-        t = str(payload.get("type") or "").upper()
-        if t != "ENTRY":
-            return None
-
-        side = (payload.get("side") or "").upper()
-        entry = _to_float(payload.get("entry"))
-        sl    = _to_float(payload.get("sl"))
-        tp1   = _to_float(payload.get("tp1"))
-        tp2   = _to_float(payload.get("tp2"))
-        tp3   = _to_float(payload.get("tp3"))
-
-        # Petits signaux heuristiques
-        score = 50.0
-        if entry and sl:
-            # SL proche sans être trop serré
-            risk = abs((entry - sl) / entry) * 100
-            if 0.2 <= risk <= 1.5:
-                score += 10
-            elif risk < 0.1 or risk > 3.0:
-                score -= 8
-
-        # Plus de TP = un poil plus de structure
-        for tp in (tp1, tp2, tp3):
-            if tp:
-                score += 3
-
-        if side in ("LONG", "SHORT"):
-            score += 4
-
-        score = max(0.0, min(100.0, score))
-        rationale = "score heuristique (SL/TP & structure)"
-        return score, rationale
-    except Exception:
-        return None
+    <div class="table-wrap" style="margin-top:12px">
+      <table>
+        <thead>
+          <tr>
+            <th>Trade ID</th><th>Symbol</th><th>TF</th><th>Side</th>
+            <th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
+            <th>Opened</th><th>Outcome</th><th>Duration(s)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows_html}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+""")
 
 # ========== Altseason: fetch + cache + résumés + endpoints publics ==========
 
@@ -1228,98 +953,35 @@ async def altseason_notify(
                  sent, pin_res.get("pinned"), pin_res.get("error"))
 
     return {"summary": s, "telegram_sent": sent, "pin_result": pin_res}
+# ============ main.py — BLOC 5/5 (Trades Dashboard + Home + Run) ============
 
-# ========== Webhook TradingView (/tv-webhook) avec “VECTOR_CANDLE” ==========
-@app.post("/tv-webhook")
-async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
-    """
-    Webhook générique. Attend un JSON contenant au minimum `type` et `symbol`.
-    Accepte les types: ENTRY, TP1_HIT, TP2_HIT, TP3_HIT, SL_HIT, CLOSE,
-                       AOE_PREMIUM / AOE_DISCOUNT (enregistrés mais non notifiés),
-                       VECTOR_CANDLE (alerte “chandelle vector”).
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Secret: query ?secret=... OU champ JSON "secret"
-    body_secret = payload.get("secret")
-    if WEBHOOK_SECRET and (secret != WEBHOOK_SECRET and body_secret != WEBHOOK_SECRET):
-        raise HTTPException(status_code=401, detail="Invalid secret")
-
-    # Normalise
-    t = str(payload.get("type") or "").upper()
-    payload["type"] = t
-
-    # Crée un trade_id s’il manque
-    if not payload.get("trade_id"):
-        sym = str(payload.get("symbol") or "UNK")
-        tfv = str(payload.get("tf") or payload.get("tf_label") or "?")
-        # on accepte aussi un timestamp TradingView si fourni (payload['ts'])
-        ts = payload.get("ts") or int(time.time())
-        try:
-            ts = int(ts)
-        except Exception:
-            ts = int(time.time())
-        payload["trade_id"] = f"{sym}_{tfv}_{ts}"
-
-    # Sauvegarde en base (on garde tout)
-    save_event(payload)
-
-    # Décide si on notifie Telegram
-    notify = True
-    if t.startswith("AOE_"):   # ces signaux sont enregistrés mais non notifiés
-        notify = False
-
-    # Compose message
-    text = None
-    if t == "ENTRY" or t in {"TP1_HIT","TP2_HIT","TP3_HIT","SL_HIT","CLOSE"}:
-        text = telegram_rich_message(payload)
-    elif t in {"VECTOR_CANDLE", "VEC_CANDLE", "VECTOR"}:
-        sym = str(payload.get("symbol") or "?")
-        tf_lbl = tf_label_of(payload)
-        direction = (payload.get("side") or payload.get("direction") or "").upper()
-        extra = payload.get("note") or payload.get("reason") or ""
-        text = f"⚡️ Chandelle Vector — {sym} {tf_lbl}\n" \
-               f"Direction: {direction or 'N/A'}\n" \
-               f"{extra}".strip() or f"⚡️ Chandelle Vector — {sym} {tf_lbl}"
-
-    # Ajoute la confiance LLM pour ENTRY (si dispo)
-    if t == "ENTRY" and text:
-        try:
-            res = llm_confidence_for_entry(payload) if (FORCE_LLM or True) else None
-            if res:
-                conf_pct, rationale = res
-                if conf_pct >= CONFIDENCE_MIN:
-                    text += f"\n🧠 Confiance LLM: {conf_pct:.0f}% — {rationale or 'estimation heuristique'}"
-                else:
-                    text += f"\n🧠 Confiance LLM: {conf_pct:.0f}%"
-        except Exception as e:
-            log.warning("LLM confidence render failed: %s", e)
-
-    sent = False
-    if notify and text:
-        # IMPORTANT: pas d’épinglage automatique pour les signaux unitaires (ENTRY/TP/etc.)
-        # On force pin=False ici pour ne pas épingler chaque entrée.
-        res = send_telegram_ex(text, pin=False)
-        sent = bool(res.get("ok"))
-        if not sent and res.get("error"):
-            log.warning("Telegram notify error: %s", res.get("error"))
-
-    return {"ok": True, "saved": True, "telegram_sent": sent, "type": t, "trade_id": payload.get("trade_id")}
-# ============ main.py — BLOC 5/5 (Trades Dashboard + Fin) ============
-
-def chip_class(outcome: str) -> str:
-    if outcome in ("TP1_HIT","TP2_HIT","TP3_HIT"):
-        return "chip win"
-    if outcome == "SL_HIT":
-        return "chip loss"
-    if outcome == "CLOSE":
-        return "chip close"
-    if outcome == "NONE":
-        return "chip muted"
-    return "chip"
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse("""
+    <!doctype html><html><head><meta charset="utf-8">
+    <title>AI Trader PRO</title>
+    <style>
+      body{background:#0f172a;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto}
+      .wrap{max-width:860px;margin:48px auto;padding:0 12px}
+      .card{background:#0b1220;border:1px solid #1f2937;border-radius:14px;padding:16px}
+      a{color:#93c5fd;text-decoration:none}
+      .row{display:flex;flex-direction:column;gap:8px}
+      .pill{display:inline-block;background:#111827;border:1px solid #1f2937;border-radius:999px;padding:8px 12px}
+    </style></head><body>
+    <div class="wrap">
+      <div class="card">
+        <h1>AI Trader PRO</h1>
+        <p>Bienvenue. Utilisez le tableau des trades ou les outils Altseason.</p>
+        <div class="row">
+          <a class="pill" href="/trades">📊 Trades — Dashboard</a>
+          <a class="pill" href="/altseason/check">🟢 Altseason — Check</a>
+          <a class="pill" href="/altseason/streaks">📈 Altseason — Streaks</a>
+          <a class="pill" href="/altseason/daemon-status">⚙️ Altseason — Daemon status</a>
+        </div>
+      </div>
+    </div>
+    </body></html>
+    """)
 
 @app.get("/trades", response_class=HTMLResponse)
 def trades_public(
@@ -1365,7 +1027,7 @@ def trades_public(
             )
 
         # Safe numbers for template
-        def s(v): 
+        def s(v):
             try:
                 return str(v if v is not None else "")
             except Exception:
@@ -1412,11 +1074,9 @@ def trades_public(
         </body></html>"""
         return HTMLResponse(fallback, status_code=200)
 
-
 # -------------------------
 # Run local (for debug)
 # -------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
