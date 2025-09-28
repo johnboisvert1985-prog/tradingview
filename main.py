@@ -453,6 +453,39 @@ def telegram_rich_message(payload: Dict[str, Any]) -> Optional[str]:
 
 # ---------- Webhook TradingView ----------
 TELEGRAM_NOTIFY_VECTOR = os.getenv("TELEGRAM_NOTIFY_VECTOR", "1") in ("1","true","True")
+# --- SAFETY GUARD: ensure save_event exists before tv-webhook uses it ---
+if 'save_event' not in globals():
+    def save_event(payload: dict) -> None:
+        """Insert a TradingView event into SQLite (guarded fallback)."""
+        row = {
+            "received_at": int(time.time()),
+            "type": payload.get("type"),
+            "symbol": payload.get("symbol"),
+            "tf": str(payload.get("tf")) if payload.get("tf") is not None else None,
+            "side": payload.get("side"),
+            "entry": _to_float(payload.get("entry")),
+            "sl": _to_float(payload.get("sl")),
+            "tp1": _to_float(payload.get("tp1")),
+            "tp2": _to_float(payload.get("tp2")),
+            "tp3": _to_float(payload.get("tp3")),
+            "trade_id": payload.get("trade_id"),
+            "raw_json": json.dumps(payload, ensure_ascii=False),
+        }
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO events (received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, trade_id, raw_json)
+                    VALUES (:received_at, :type, :symbol, :tf, :side, :entry, :sl, :tp1, :tp2, :tp3, :trade_id, :raw_json)
+                    """,
+                    row,
+                )
+                conn.commit()
+            log.info("Saved event: type=%s symbol=%s tf=%s trade_id=%s",
+                     row["type"], row["symbol"], row["tf"], row["trade_id"])
+        except Exception as e:
+            log.exception("save_event fallback failed: %s", e)
 
 @app.api_route("/tv-webhook", methods=["POST", "GET"])
 async def tv_webhook(request: Request, secret: Optional[str] = Query(None)):
@@ -1080,3 +1113,4 @@ def trades_public(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
