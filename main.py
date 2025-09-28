@@ -1321,80 +1321,97 @@ def chip_class(outcome: str) -> str:
         return "chip muted"
     return "chip"
 
-@app.get("/trades")
+@app.get("/trades", response_class=HTMLResponse)
 def trades_public(
-    symbol: Optional[str] = None,
-    tf: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    limit: int = 2000
+    symbol: Optional[str] = Query(None),
+    tf: Optional[str] = Query(None),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    limit: int = Query(100)
 ):
-    start_ep = parse_date_to_epoch(start)
-    end_ep   = parse_date_end_to_epoch(end)
-    trades, summary = build_trades_filtered(symbol, tf, start_ep, end_ep, max_rows=limit)
+    try:
+        # Normalize/guard inputs
+        limit = max(1, min(int(limit or 100), 10000))
+        start_ep = parse_date_to_epoch(start)
+        end_ep = parse_date_end_to_epoch(end)
 
-    # Construire le tableau HTML
-    rows_html = ""
-    for tr in trades:
-        eid = tr.get("trade_id","?")
-        sym = tr.get("symbol","?")
-        tfv = tr.get("tf","?")
-        side = tr.get("side","?")
-        entry = tr.get("entry","?")
-        sl = tr.get("sl","?")
-        tp1 = tr.get("tp1","?")
-        tp2 = tr.get("tp2","?")
-        tp3 = tr.get("tp3","?")
-        outcome = tr.get("outcome","NONE")
-        duration = tr.get("duration_sec")
-        entry_time = tr.get("entry_time")
-        entry_hr = "-"
-        try:
-            if entry_time:
-                import datetime as dt
-                entry_hr = dt.datetime.utcfromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
+        # Build data
+        trades, summary = build_trades_filtered(
+            symbol, tf, start_ep, end_ep, max_rows=max(5000, limit * 10)
+        )
 
-        cls = chip_class(outcome)
-        rows_html += f"<tr>" \
-                     f"<td>{eid}</td><td>{sym}</td><td>{tfv}</td><td>{side}</td>" \
-                     f"<td>{entry}</td><td>{sl}</td><td>{tp1}</td><td>{tp2}</td><td>{tp3}</td>" \
-                     f"<td><span class='{cls}'>{outcome}</span></td>" \
-                     f"<td>{duration or '-'}<br><small>{entry_hr}</small></td>" \
-                     f"</tr>\n"
+        # Render rows
+        rows_html = ""
+        data = trades[-limit:] if limit else trades
+        for tr in data:
+            outcome = (tr.get("outcome") or "NONE")
+            badge = chip_class(outcome)          # chip win/loss/close/open
+            label = outcome_label(outcome)       # TP1/TP2/TP3/SL/Close/OPEN
+            rows_html += (
+                "<tr>"
+                f"<td>{escape_html(str(tr.get('trade_id') or ''))}</td>"
+                f"<td>{escape_html(str(tr.get('symbol') or ''))}</td>"
+                f"<td>{escape_html(str(tr.get('tf') or ''))}</td>"
+                f"<td>{escape_html(str(tr.get('side') or ''))}</td>"
+                f"<td>{fmt_num(tr.get('entry'))}</td>"
+                f"<td>{fmt_num(tr.get('sl'))}</td>"
+                f"<td>{fmt_num(tr.get('tp1'))}</td>"
+                f"<td>{fmt_num(tr.get('tp2'))}</td>"
+                f"<td>{fmt_num(tr.get('tp3'))}</td>"
+                f"<td>{escape_html(fmt_ts(tr.get('entry_time')))}</td>"
+                f"<td><span class='{badge}'>{escape_html(label)}</span></td>"
+                f"<td>{'' if tr.get('duration_sec') is None else str(tr.get('duration_sec'))}</td>"
+                "</tr>"
+            )
 
-    pill_values = []
-    for tr in trades[-50:]:
-        o = tr.get("outcome")
-        if o in ("TP1_HIT","TP2_HIT","TP3_HIT"): pill_values.append(1)
-        elif o == "SL_HIT": pill_values.append(0)
-        else: pill_values.append(-1)
+        # Safe numbers for template
+        def s(v): 
+            try:
+                return str(v if v is not None else "")
+            except Exception:
+                return ""
 
-    html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
-        symbol = symbol or "",
-        tf = tf or "",
-        start = start or "",
-        end = end or "",
-        limit = limit,
-        rows_html = rows_html,
-        total_trades = summary.get("total_trades",0),
-        wins = summary.get("wins",0),
-        losses = summary.get("losses",0),
-        winrate_pct = summary.get("winrate_pct",0.0),
-        tp1_hits = summary.get("tp1_hits",0),
-        tp2_hits = summary.get("tp2_hits",0),
-        tp3_hits = summary.get("tp3_hits",0),
-        avg_time_to_outcome_sec = summary.get("avg_time_to_outcome_sec",0),
-        best_win_streak = summary.get("best_win_streak",0),
-        worst_loss_streak = summary.get("worst_loss_streak",0),
-        pill_values = json.dumps(pill_values),
-        btc_thr = ALT_BTC_DOM_THR,
-        eth_thr = ALT_ETH_BTC_THR,
-        asi_thr = ALT_ASI_THR,
-        t2_thr = ALT_TOTAL2_THR_T,
-    )
-    return HTMLResponse(html)
+        html = TRADES_PUBLIC_HTML_TPL.safe_substitute(
+            symbol=escape_html(symbol or ""),
+            tf=escape_html(tf or ""),
+            start=escape_html(start or ""),
+            end=escape_html(end or ""),
+            limit=str(limit),
+            total_trades=s(summary.get("total_trades")),
+            winrate_pct=s(summary.get("winrate_pct")),
+            wins=s(summary.get("wins")),
+            losses=s(summary.get("losses")),
+            tp1_hits=s(summary.get("tp1_hits")),
+            tp2_hits=s(summary.get("tp2_hits")),
+            tp3_hits=s(summary.get("tp3_hits")),
+            avg_time_to_outcome_sec=s(summary.get("avg_time_to_outcome_sec")),
+            best_win_streak=s(summary.get("best_win_streak")),
+            worst_loss_streak=s(summary.get("worst_loss_streak")),
+            rows_html=rows_html or '<tr><td colspan="12" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>',
+            pill_values="[]"
+        )
+        return HTMLResponse(html)
+
+    except Exception as e:
+        # Log the real cause for you
+        log.exception("Error in /trades: %s", e)
+        # Return a graceful page so you don't get a 500
+        safe_msg = escape_html(f"{type(e).__name__}: {e}")
+        fallback = f"""
+        <!doctype html><html><head><meta charset="utf-8"><title>Trades — Error</title>
+        <style>body{{background:#0f172a;color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto}}
+        .card{{max-width:840px;margin:32px auto;background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px}}
+        .muted{{color:#94a3b8}}</style></head><body>
+        <div class="card">
+          <h1>Trades — Dashboard</h1>
+          <p class="muted">An error occurred while rendering the page.</p>
+          <pre style="white-space:pre-wrap">{safe_msg}</pre>
+          <p class="muted">Check server logs for the full traceback.</p>
+          <p><a href="/" style="color:#93c5fd">← Back to Home</a></p>
+        </div>
+        </body></html>"""
+        return HTMLResponse(fallback, status_code=200)
+
 
 # -------------------------
 # Run local (for debug)
@@ -1402,3 +1419,4 @@ def trades_public(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
