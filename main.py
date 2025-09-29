@@ -1,1421 +1,1120 @@
-# ============================== main.py — BLOC 1/5 ==============================
-# Imports & Config de base
-import os, time, json, asyncio, sqlite3, textwrap
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+# =========================
+# main.py — Bloc 1/5
+# Imports, Config, Logging, Telegram, DB
+# =========================
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import os
+import re
+import json
+import math
+import time
+import sqlite3
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
+from fastapi import FastAPI, Request, Body
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
+import logging
 
-# ------------------------------------------------------------------------------
-# ENV / Config (garde tes valeurs existantes si tu les as déjà)
-# ------------------------------------------------------------------------------
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("aitrader")
+
+# ---------- Config ----------
 DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
 DB_PATH = os.path.join(DB_DIR, "data.db")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Anti-spam Telegram + Dédoublonnage des VECTOR
-TELEGRAM_COOLDOWN_SECONDS = int(os.getenv("TELEGRAM_COOLDOWN_SECONDS", "6"))
-VECTOR_DEDUP_SECONDS = int(os.getenv("VECTOR_DEDUP_SECONDS", "90"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Intervalle de rafraîchissement Altseason (fix ALT_INTERVAL NameError)
-ALT_INTERVAL = int(os.getenv("ALTSEASON_INTERVAL_SECONDS", "60"))
+ALT_INTERVAL = int(os.getenv("ALT_INTERVAL", "60"))          # secondes entre snapshots
+ALT_LOOKBACK_MIN = int(os.getenv("ALT_LOOKBACK_MIN", "360"))  # fenêtre d'analyse (minutes)
+MAX_ROWS_DASH = int(os.getenv("MAX_ROWS_DASH", "200"))
 
-# ------------------------------------------------------------------------------
-# Utilitaires simples
-# ------------------------------------------------------------------------------
-def now_iso() -> str:
-    """Horodatage ISO en UTC (fixe le NameError now_iso)."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# Cooldown Telegram (éviter flood / 429)
+TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "2"))
+_last_telegram_sent_ts = 0.0
 
-# Snapshot en mémoire (fix _altseason_snapshot not defined)
-_altseason_snapshot: Dict[str, Any] = {
-    "updated_at": None,
-    "dominance": None,
-    "breadth": None,
-    "alts_up": 0,
-    "alts_down": 0,
-    "memo": "init",
-}
-
-# Mémoire pour dédup VECTOR
-_vector_recent: Dict[str, float] = {}
-
-def is_duplicate_vector(payload: dict) -> bool:
-    """Évite le spam de VECTOR identiques pendant VECTOR_DEDUP_SECONDS."""
-    if str(payload.get("type", "")).upper() != "VECTOR_CANDLE":
-        return False
-    key = f"{payload.get('symbol')}_{payload.get('tf')}_{payload.get('direction')}".upper()
-    now = time.time()
-    last = _vector_recent.get(key, 0.0)
-    if now - last < VECTOR_DEDUP_SECONDS:
-        return True
-    _vector_recent[key] = now
-    return False
-
-# ------------------------------------------------------------------------------
-# App FastAPI
-# ------------------------------------------------------------------------------
-app = FastAPI(title="AI Trader Dashboard", version="1.0")
-
+# ---------- FastAPI ----------
+app = FastAPI(title="AI Trader")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ------------------------------------------------------------------------------
-# BDD: init + helpers
-# ------------------------------------------------------------------------------
-os.makedirs(DB_DIR, exist_ok=True)
-
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL,
-          type TEXT NOT NULL,
-          symbol TEXT,
-          tf TEXT,
-          direction TEXT,
-          price REAL,
-          trade_id TEXT,
-          raw TEXT
-        )
-    """)
-    # Index utiles
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def save_event(payload: dict):
-    """Insère l’événement (corrige l’erreur now_iso not defined)."""
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO events(ts, type, symbol, tf, direction, price, trade_id, raw)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        now_iso(),
-        payload.get("type"),
-        payload.get("symbol"),
-        str(payload.get("tf") or ""),
-        payload.get("direction"),
-        payload.get("price") if payload.get("price") is not None else None,
-        payload.get("trade_id"),
-        json.dumps(payload, ensure_ascii=False),
-    ))
-    conn.commit()
-    conn.close()
-
-def compute_outcome_for_trade(trade_id: str) -> Optional[str]:
-    """
-    Retourne 'TP1','TP2','TP3','SL','CLOSE' ou None en scannant les events du trade.
-    Sert à colorer les colonnes TP/SL dans /trades.
-    """
-    if not trade_id:
-        return None
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT type FROM events
-        WHERE trade_id = ?
-        ORDER BY id DESC
-        LIMIT 100
-    """, (trade_id,))
-    types = [row["type"].upper() for row in cur.fetchall()]
-    conn.close()
-    for t in types:
-        if t in {"TP3_HIT", "TP2_HIT", "TP1_HIT", "SL_HIT", "CLOSE"}:
-            return t.replace("_HIT", "")
-    return None
-
-# ------------------------------------------------------------------------------
-# Telegram sender avec cooldown (évite 429 + bruit)
-# ------------------------------------------------------------------------------
-async def send_telegram_ex(text: str, payload: Optional[dict] = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    # throttle surtout les VECTOR
-    t = str((payload or {}).get("type", "")).upper()
-    throttle = (t == "VECTOR_CANDLE")
-
-    # Stockage du dernier envoi dans l'attribut de fonction pour éviter global
-    last = getattr(send_telegram_ex, "_last", 0.0)
-    if throttle and (time.time() - last) < TELEGRAM_COOLDOWN_SECONDS:
-        # Pas une erreur : volontaire pour limiter le spam
-        print("WARNING: Telegram send skipped due to cooldown")
-        return
-
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
-            )
-        send_telegram_ex._last = time.time()
-    except Exception as e:
-        print(f"WARNING: Telegram send_telegram_ex exception: {e}")
-
-# ------------------------------------------------------------------------------
-# Altseason: calcul snapshot + daemon périodique
-# ------------------------------------------------------------------------------
-async def compute_altseason_snapshot() -> dict:
-    """
-    TODO: branche tes vrais calculs ici.
-    Valeurs factices pour éviter l'erreur `_altseason_snapshot is not defined`.
-    """
-    # Exemple: à remplacer par tes métriques réelles
-    return {
-        "updated_at": now_iso(),
-        "dominance": 52.3,   # BTC.D
-        "breadth": +12,      # Nb d'alts > 0% jour - Nb d'alts < 0% jour
-        "alts_up": 145,
-        "alts_down": 87,
-        "memo": "ok"
-    }
-
-async def run_altseason_daemon(interval: int = ALT_INTERVAL):
-    global _altseason_snapshot
-    while True:
-        try:
-            snap = await compute_altseason_snapshot()
-            if snap:
-                _altseason_snapshot = snap
-        except Exception as e:
-            print(f"WARNING: Altseason summary error: {e}")
-        await asyncio.sleep(interval)
-
-@app.on_event("startup")
-async def _startup_tasks():
-    try:
-        asyncio.create_task(run_altseason_daemon())
-    except Exception as e:
-        print(f"WARNING: Altseason daemon not started: {e}")
-
-# ------------------------------------------------------------------------------
-# Root -> redirect vers /trades (corrige 404 Not Found sur '/')
-# ------------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return RedirectResponse(url="/trades")
-# ============================ /main.py — BLOC 1/5 ==============================
-# ============================== main.py — BLOC 2/5 ==============================
-from pydantic import BaseModel
-
-TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "changeme")  # mets ta vraie valeur
-
-class TVPayload(BaseModel):
-    type: str
-    symbol: Optional[str] = None
-    tf: Optional[str] = None
-    tf_label: Optional[str] = None
-    time: Optional[int] = None
-    side: Optional[str] = None
-    direction: Optional[str] = None  # "UP" | "DOWN" pour VECTOR_CANDLE
-    price: Optional[float] = None
-    entry: Optional[float] = None
-    sl: Optional[float] = None
-    tp1: Optional[float] = None
-    tp2: Optional[float] = None
-    tp3: Optional[float] = None
-    r1: Optional[float] = None
-    s1: Optional[float] = None
-    lev_reco: Optional[float] = None
-    qty_reco: Optional[float] = None
-    notional: Optional[float] = None
-    confidence: Optional[int] = None
-    horizon: Optional[str] = None
-    leverage: Optional[str] = None
-    note: Optional[str] = None
-    trade_id: Optional[str] = None
-    secret: Optional[str] = None
-
-def _ensure_trade_id(p: dict) -> str:
-    """Si TradingView n’envoie pas de trade_id, on en forge un stable au milliseconde."""
-    tid = p.get("trade_id")
-    if tid:
-        return tid
-    symbol = (p.get("symbol") or "UNK").upper()
-    tf = str(p.get("tf") or "UNK")
-    # s'il y a un timestamp TV (en ms) on l’utilise, sinon on prend maintenant
-    ts_ms = int(p.get("time") or int(time.time() * 1000))
-    return f"{symbol}_{tf}_{ts_ms}"
-
-def _fmt_num(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    # joli format court
-    return f"{x:.6g}"
-
-def _vector_square(direction: Optional[str]) -> str:
-    """Carré couleur pour VECTOR: UP=vert, DOWN=rouge, sinon violet."""
-    d = (direction or "").upper()
-    if d == "UP":
-        return "🟩"
-    if d == "DOWN":
-        return "🟥"
-    return "🟪"
-
-def _fmt_vector_msg(p: dict) -> str:
-    sym = p.get("symbol") or "?"
-    tf = p.get("tf_label") or p.get("tf") or "?"
-    sq = _vector_square(p.get("direction"))
-    d = (p.get("direction") or "").upper() or "?"
-    pr = _fmt_num(p.get("price"))
-    note = p.get("note") or f"Vector Candle {d}"
-    return f"{sq} Vector Candle — {sym} {tf}\n{note}\nPrix: {pr}"
-
-def _fmt_entry_msg(p: dict) -> str:
-    sym = p.get("symbol") or "?"
-    tf = p.get("tf_label") or p.get("tf") or "?"
-    sd = (p.get("side") or "?").upper()
-    enr, sl, tp1, tp2, tp3 = map(_fmt_num, [p.get("entry"), p.get("sl"), p.get("tp1"), p.get("tp2"), p.get("tp3")])
-    lev = p.get("leverage") or "—"
-    conf = p.get("confidence") or "—"
-    return textwrap.dedent(f"""
-    🚀 Entrée détectée — {sym} {tf}
-    Côté: {sd} | Lev: {lev} | Confiance: {conf}%
-    Entry: {enr}
-    TP1: {tp1} | TP2: {tp2} | TP3: {tp3}
-    SL: {sl}
-    """).strip()
-
-def _fmt_close_msg(p: dict) -> str:
-    sym = p.get("symbol") or "?"
-    tf = p.get("tf_label") or p.get("tf") or "?"
-    reason = p.get("reason") or "Fermeture"
-    sd = (p.get("side") or "—").upper()
-    return f"✅ CLOSE — {sym} {tf}\nRaison: {reason} | Côté précédent: {sd}"
-
-def _fmt_tp_sl_msg(p: dict) -> str:
-    sym = p.get("symbol") or "?"
-    tf = p.get("tf_label") or p.get("tf") or "?"
-    typ = (p.get("type") or "").upper()
-    if typ.endswith("_HIT"):
-        badge = "🎯" if typ.startswith("TP") else "⛔"
-        lvl = p.get("tp") or p.get("price")
-        return f"{badge} {typ.replace('_',' ')} — {sym} {tf}\nNiveau: {_fmt_num(lvl)}"
-    return f"ℹ️ {typ} — {sym} {tf}"
-
-@app.post("/tv-webhook")
-async def tv_webhook(req: Request):
-    try:
-        data = await req.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
-
-    # unifie clés (TradingView peut envoyer str ou dict déjà propre)
-    payload = dict(data)
-    t = (str(payload.get("type") or "")).upper().strip()
-
-    # vérifie le secret si présent
-    if TV_WEBHOOK_SECRET and payload.get("secret") and payload["secret"] != TV_WEBHOOK_SECRET:
-        return JSONResponse({"ok": False, "error": "bad secret"}, status_code=403)
-
-    # génère trade_id s’il manque (corrige les 'trade_id=None' dans tes logs)
-    payload["trade_id"] = _ensure_trade_id(payload)
-
-    # dédup VECTOR pour réduire le bruit
-    if t == "VECTOR_CANDLE" and is_duplicate_vector(payload):
-        return JSONResponse({"ok": True, "dedup": True})
-
-    # enregistre dans la base
-    try:
-        save_event(payload)
-    except Exception as e:
-        print(f"ERROR: save_event failed: {e}")
-        return JSONResponse({"ok": False, "error": "save_event failed"}, status_code=500)
-
-    # Telegram: formate un message propre et court
-    try:
-        msg = None
-        if t == "VECTOR_CANDLE":
-            msg = _fmt_vector_msg(payload)
-        elif t == "ENTRY":
-            msg = _fmt_entry_msg(payload)
-        elif t == "CLOSE":
-            msg = _fmt_close_msg(payload)
-        elif t in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}:
-            msg = _fmt_tp_sl_msg(payload)
-        elif t in {"AOE_PREMIUM", "AOE_DISCOUNT"}:
-            # messages courts pour les signaux AOE
-            sym = payload.get("symbol") or "?"
-            tf = payload.get("tf_label") or payload.get("tf") or "?"
-            flag = "💎 Premium" if t == "AOE_PREMIUM" else "🏷️ Discount"
-            msg = f"{flag} — {sym} {tf}"
-
-        if msg:
-            asyncio.create_task(send_telegram_ex(msg, payload))
-    except Exception as e:
-        print(f"WARNING: Telegram send skipped because: {e}")
-
-    return JSONResponse({"ok": True, "type": t, "trade_id": payload["trade_id"]})
-# ============================ /main.py — BLOC 2/5 ==============================
-# ============================== main.py — BLOC 3/5 ==============================
-from fastapi.responses import HTMLResponse, RedirectResponse
-import sqlite3
-from pathlib import Path
-
-DB_PATH = Path(os.getenv("AI_TRADER_DB", "/tmp/ai_trader/data.db"))
-
-# --- Fallbacks Altseason (corrige l'erreur "_altseason_snapshot is not defined") ---
-_altseason_snapshot: Dict[str, Any] = {
-    "dominance_btc": None,
-    "btc_trend": None,
-    "alts_btc_corr": None,
-    "alts_usdt_momo": None,
-    "alts_btc_momo": None,
-    "market_breadth": None,
-    "stamp": int(time.time()),
-}
-
-def altseason_get_snapshot_safe() -> Dict[str, Any]:
-    global _altseason_snapshot
-    try:
-        # si un autre daemon met à jour un snapshot global ailleurs, on le renvoie
-        snap = _altseason_snapshot or {}
-        # normalise
-        return {
-            "dominance_btc": snap.get("dominance_btc"),
-            "btc_trend": snap.get("btc_trend"),
-            "alts_btc_corr": snap.get("alts_btc_corr"),
-            "alts_usdt_momo": snap.get("alts_usdt_momo"),
-            "alts_btc_momo": snap.get("alts_btc_momo"),
-            "market_breadth": snap.get("market_breadth"),
-            "stamp": snap.get("stamp", int(time.time()))
-        }
-    except Exception:
-        return {
-            "dominance_btc": None,
-            "btc_trend": None,
-            "alts_btc_corr": None,
-            "alts_usdt_momo": None,
-            "alts_btc_momo": None,
-            "market_breadth": None,
-            "stamp": int(time.time())
-        }
-
-# --- Accès DB robuste (quel que soit le schéma d'events) ---
-def _db_connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    return con
-
-def _row_get(row: sqlite3.Row, *keys, default=None):
-    for k in keys:
-        if k in row.keys():
-            return row[k]
-    return default
-
-def _fetch_recent_events(limit: int = 5000) -> List[Dict[str, Any]]:
-    if not DB_PATH.exists():
-        return []
-    try:
-        with _db_connect() as con:
-            # on tente table "events", sinon "logs"
-            for table in ("events", "logs"):
-                try:
-                    cur = con.execute(f"SELECT * FROM {table} ORDER BY ROWID DESC LIMIT ?", (limit,))
-                    rows = [dict(r) for r in cur.fetchall()]
-                    if rows:
-                        return rows
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"WARNING: _fetch_recent_events failed: {e}")
-    return []
-
-def _aggregate_trades_for_ui() -> List[Dict[str, Any]]:
-    """
-    Construit un snapshot UI par trade_id à partir des évènements:
-    - ENTRY crée la “ligne”
-    - TP1_HIT/TP2_HIT/TP3_HIT activent les flags
-    - SL_HIT marque stop touché
-    - CLOSE ferme la ligne
-    - VECTOR_CANDLE ignoré pour le tableau trade (mais visible ailleurs si besoin)
-    """
-    rows = _fetch_recent_events()
-    by_tid: Dict[str, Dict[str, Any]] = {}
-
-    def ensure_tid(d: Dict[str, Any]) -> str:
-        tid = d.get("trade_id")
-        if tid:
-            return tid
-        symbol = (d.get("symbol") or "UNK").upper()
-        tf = str(d.get("tf") or "UNK")
-        ts_ms = int(d.get("time") or int(time.time() * 1000))
-        return f"{symbol}_{tf}_{ts_ms}"
-
-    for r in rows[::-1]:  # remonte dans le temps
-        typ = (str(r.get("type") or "")).upper()
-        if not typ:
-            continue
-        if typ == "VECTOR_CANDLE":
-            continue  # on ne l’intègre pas au tableau des trades
-        tid = ensure_tid(r)
-        sym = r.get("symbol") or "?"
-        tf = r.get("tf_label") or r.get("tf") or "?"
-        if tid not in by_tid:
-            by_tid[tid] = {
-                "trade_id": tid,
-                "symbol": sym,
-                "tf": tf,
-                "side": r.get("side"),
-                "entry": r.get("entry"),
-                "sl": r.get("sl"),
-                "tp1": r.get("tp1"),
-                "tp2": r.get("tp2"),
-                "tp3": r.get("tp3"),
-                "created_at": r.get("time") or r.get("created_at"),
-                "closed": False,
-                "sl_hit": False,
-                "tp1_hit": False,
-                "tp2_hit": False,
-                "tp3_hit": False,
-            }
-        # mise à jour
-        trow = by_tid[tid]
-        if typ == "ENTRY":
-            trow.update({
-                "side": r.get("side"),
-                "entry": r.get("entry"),
-                "sl": r.get("sl"),
-                "tp1": r.get("tp1"),
-                "tp2": r.get("tp2"),
-                "tp3": r.get("tp3"),
-            })
-        elif typ in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
-            if typ == "TP1_HIT": trow["tp1_hit"] = True
-            if typ == "TP2_HIT": trow["tp2_hit"] = True
-            if typ == "TP3_HIT": trow["tp3_hit"] = True
-        elif typ == "SL_HIT":
-            trow["sl_hit"] = True
-        elif typ == "CLOSE":
-            trow["closed"] = True
-
-    # tri: trades les plus récents en haut
-    return sorted(by_tid.values(), key=lambda x: (x.get("created_at") or 0), reverse=True)
-
-# --------- API JSON pour la page (utile si plus tard on veut du live refresh) ----------
-@app.get("/api/altseason")
-def api_altseason():
-    return altseason_get_snapshot_safe()
-
-@app.get("/api/trades")
-def api_trades():
-    try:
-        return {"ok": True, "trades": _aggregate_trades_for_ui()}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "trades": []}
-
-# ---------------------------- ROUTES PAGES -------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    # redirige gentiment vers /trades (corrige les 404 GET /)
-    return RedirectResponse(url="/trades")
-
-@app.get("/trades", response_class=HTMLResponse)
-def trades_page():
-    # on rend côté serveur (SSR) avec un snapshot immédiat
-    trades = _aggregate_trades_for_ui()
-    alt = altseason_get_snapshot_safe()
-
-    def fmt(x):
-        if x is None: return "—"
-        if isinstance(x, (int, float)):
-            return f"{x:.6g}"
-        return str(x)
-
-    # ---- HTML / CSS / JS : design pro + header Altseason + tableau trades ----
-    html = f"""
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Trader — Dashboard</title>
-<style>
-  :root {{
-    --bg:#0b0f17;
-    --panel:#121826;
-    --muted:#8391a6;
-    --text:#d9e1f2;
-    --accent:#6ca8ff;
-    --ok:#2ecc71;
-    --warn:#f1c40f;
-    --err:#e74c3c;
-    --tp:#1db954;
-    --sl:#ff4d4f;
-    --soft:#1a2234;
-    --chip:#23304a;
-  }}
-  * {{ box-sizing:border-box; }}
-  body {{
-    margin:0; background:linear-gradient(180deg,#0b0f17 0%, #0a0e16 100%);
-    color:var(--text); font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial, "Apple Color Emoji","Segoe UI Emoji";
-  }}
-  .wrap {{ max-width:1200px; margin:24px auto; padding:0 16px; }}
-  .grid {{
-    display:grid; gap:16px;
-    grid-template-columns: 1fr;
-  }}
-  @media (min-width: 1080px) {{
-    .grid {{ grid-template-columns: 1fr; }}
-  }}
-
-  /* ===== Altseason header ===== */
-  .alt-card {{
-    background: radial-gradient(1200px 400px at 0% 0%, rgba(108,168,255,0.10), transparent 40%), var(--panel);
-    border:1px solid #1e2a44; border-radius:16px; padding:18px;
-    box-shadow: 0 8px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.02);
-  }}
-  .alt-title {{
-    display:flex; align-items:center; gap:10px; margin-bottom:10px;
-    font-weight:700; letter-spacing:.3px;
-  }}
-  .alt-sub {{ color:var(--muted); font-size:12px; margin-bottom:12px }}
-  .alt-kpis {{
-    display:grid; gap:8px; grid-template-columns: repeat(6, minmax(140px,1fr));
-  }}
-  .kpi {{
-    background: var(--soft); border:1px solid #202c48; border-radius:12px; padding:10px;
-  }}
-  .kpi .lbl {{ color:var(--muted); font-size:12px }}
-  .kpi .val {{ font-size:16px; margin-top:2px; font-weight:600 }}
-  .chip {{
-    display:inline-flex; align-items:center; gap:6px;
-    background:var(--chip); border:1px solid #203152; padding:3px 8px; border-radius:999px; font-size:12px; color:#b9c7e3;
-  }}
-  .chip.ok {{ border-color:#1f6d46; background:#143022; color:#b7f3cf }}
-  .chip.warn {{ border-color:#6d611f; background:#2c2812; color:#ffeaa7 }}
-  .chip.err {{ border-color:#6d1f1f; background:#311818; color:#ffbcbc }}
-
-  /* ===== Table Trades ===== */
-  .card {{
-    background: var(--panel); border:1px solid #1e2a44; border-radius:16px; overflow:hidden;
-    box-shadow: 0 8px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.02);
-  }}
-  .card-header {{
-    display:flex; justify-content:space-between; align-items:center; padding:14px 16px;
-    border-bottom:1px solid #1e2a44; background:linear-gradient(0deg, rgba(108,168,255,0.08), transparent);
-  }}
-  .card-title {{ font-weight:700; letter-spacing:.2px }}
-  .toolbar {{ display:flex; gap:8px; align-items:center; }}
-  .toolbar .badge {{ background:#172136; border:1px solid #263353; padding:4px 8px; border-radius:8px; color:#b9c7e3; font-size:12px }}
-
-  table {{
-    width:100%; border-collapse:collapse; font-size:13px;
-  }}
-  thead th {{
-    text-align:left; padding:10px 12px; color:#9fb1d6; background:#121a2a; position:sticky; top:0; z-index:1;
-    border-bottom:1px solid #1f2b47;
-  }}
-  tbody td {{ padding:10px 12px; border-bottom:1px solid #162138; color:#d9e1f2 }}
-  tbody tr:hover {{ background:#121a2a }}
-  .num {{ text-align:right; font-variant-numeric: tabular-nums; }}
-
-  .pill {{
-    display:inline-block; padding:2px 8px; border-radius:999px; font-weight:700; font-size:12px;
-  }}
-  .pill.long {{ color:#b7f3cf; background:#143022; border:1px solid #1f6d46 }}
-  .pill.short{{ color:#ffbcbc; background:#311818; border:1px solid #6d1f1f }}
-  .pill.closed{{ color:#b9c7e3; background:#1b2438; border:1px solid #314266 }}
-
-  .tpcell {{
-    background:#0f182a; border:1px solid #203152; color:#9fb1d6; padding:4px 8px; border-radius:8px; display:inline-block;
-    min-width:80px; text-align:center;
-  }}
-  .tpcell.hit {{ background:#0f2a1a; border-color:#1f6d46; color:#b7f3cf; font-weight:700; }}
-  .slcell {{ color:#ffbcbc }}
-  .slcell.hit {{ background:#311818; border:1px solid #6d1f1f; color:#ffbcbc; padding:2px 6px; border-radius:6px }}
-
-  .footnote {{ color:var(--muted); font-size:12px; padding:10px 2px }}
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="grid">
-      <!-- ====== ALTSEASON HEADER ====== -->
-      <section class="alt-card">
-        <div class="alt-title">
-          <span style="font-size:18px">📈 Indicateurs Altseason</span>
-          <span class="chip">Mise à jour: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(alt.get('stamp', int(time.time()))))}</span>
-        </div>
-        <div class="alt-sub">Baromètre multi-facteurs pour juger l’environnement (BTC vs Alts, momentum & breadth). Recalcul auto.</div>
-        <div class="alt-kpis">
-          <div class="kpi">
-            <div class="lbl">Dominance BTC</div>
-            <div class="val">{fmt(alt.get('dominance_btc'))}</div>
-          </div>
-          <div class="kpi">
-            <div class="lbl">Trend BTC</div>
-            <div class="val">
-              {"<span class='chip ok'>Haussière</span>" if (alt.get('btc_trend') == "UP") else "<span class='chip err'>Baissière</span>" if (alt.get('btc_trend') == "DOWN") else "<span class='chip warn'>Neutre</span>"}
-            </div>
-          </div>
-          <div class="kpi">
-            <div class="lbl">Corrélation Alts↔BTC</div>
-            <div class="val">{fmt(alt.get('alts_btc_corr'))}</div>
-          </div>
-          <div class="kpi">
-            <div class="lbl">Momentum Alts (USDT)</div>
-            <div class="val">{fmt(alt.get('alts_usdt_momo'))}</div>
-          </div>
-          <div class="kpi">
-            <div class="lbl">Momentum Alts (BTC)</div>
-            <div class="val">{fmt(alt.get('alts_btc_momo'))}</div>
-          </div>
-          <div class="kpi">
-            <div class="lbl">Market Breadth</div>
-            <div class="val">{fmt(alt.get('market_breadth'))}</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ====== TRADES TABLE ====== -->
-      <section class="card">
-        <div class="card-header">
-          <div class="card-title">🧾 Trades en cours & récents</div>
-          <div class="toolbar">
-            <span class="badge">Auto-refresh 30s</span>
-          </div>
-        </div>
-        <div style="overflow:auto;">
-          <table id="tradesTable">
-            <thead>
-              <tr>
-                <th>Symbole</th>
-                <th>TF</th>
-                <th>Côté</th>
-                <th class="num">Entry</th>
-                <th class="num">SL</th>
-                <th>TP1</th>
-                <th>TP2</th>
-                <th>TP3</th>
-                <th>Statut</th>
-              </tr>
-            </thead>
-            <tbody>
-              {"".join([
-                f"<tr data-tp1='{1 if t.get('tp1_hit') else 0}' data-tp2='{1 if t.get('tp2_hit') else 0}' data-tp3='{1 if t.get('tp3_hit') else 0}' data-sl='{1 if t.get('sl_hit') else 0}' data-closed='{1 if t.get('closed') else 0}'>"
-                f"<td><b>{t.get('symbol')}</b></td>"
-                f"<td>{t.get('tf')}</td>"
-                f"<td><span class='pill {'long' if (str(t.get('side') or '').upper()=='LONG') else 'short' if (str(t.get('side') or '').upper()=='SHORT') else 'closed' if t.get('closed') else ''}'>{(t.get('side') or '—').upper()}</span></td>"
-                f"<td class='num'>{fmt(t.get('entry'))}</td>"
-                f"<td class='num slcell {'hit' if t.get('sl_hit') else ''}'>{fmt(t.get('sl'))}</td>"
-                f"<td><span class='tpcell {'hit' if t.get('tp1_hit') else ''}'>{fmt(t.get('tp1'))}</span></td>"
-                f"<td><span class='tpcell {'hit' if t.get('tp2_hit') else ''}'>{fmt(t.get('tp2'))}</span></td>"
-                f"<td><span class='tpcell {'hit' if t.get('tp3_hit') else ''}'>{fmt(t.get('tp3'))}</span></td>"
-                f"<td>{'Fermé' if t.get('closed') else ('SL touché' if t.get('sl_hit') else 'En cours')}</td>"
-                "</tr>"
-              ])}
-            </tbody>
-          </table>
-        </div>
-        <div class="footnote">
-          Astuce: TP en <b>vert</b> = atteint, SL en <b style="color:var(--sl)">rouge</b> = touché. Les lignes “Fermé” sont conservées pour l’historique récent.
-        </div>
-      </section>
-    </div>
-  </div>
-
-<script>
-  // Auto-refresh doux (30s) : recharge seulement le tbody
-  async function refreshTrades() {{
-    try {{
-      const r = await fetch('/api/trades', {{cache:'no-store'}});
-      const j = await r.json();
-      if (!j.ok) return;
-      const rows = j.trades || [];
-      const tbody = document.querySelector('#tradesTable tbody');
-      const fmt = (x) => {{
-        if (x === null || x === undefined) return '—';
-        if (typeof x === 'number') {{
-          // format court
-          return Number.parseFloat(x).toPrecision(6);
-        }}
-        return x;
-      }};
-      tbody.innerHTML = rows.map(t => {{
-        const side = (t.side || '—').toUpperCase();
-        let pill = 'closed';
-        if (side === 'LONG') pill = 'long'; else if (side === 'SHORT') pill='short';
-        const slHit = !!t.sl_hit;
-        const closed = !!t.closed;
-        return `
-        <tr data-tp1="${{t.tp1_hit?1:0}}" data-tp2="${{t.tp2_hit?1:0}}" data-tp3="${{t.tp3_hit?1:0}}" data-sl="${{slHit?1:0}}" data-closed="${{closed?1:0}}">
-          <td><b>${{t.symbol}}</b></td>
-          <td>${{t.tf}}</td>
-          <td><span class="pill ${{pill}}">${{side}}</span></td>
-          <td class="num">${{fmt(t.entry)}}</td>
-          <td class="num slcell ${slHit?'hit':''}">${{fmt(t.sl)}}</td>
-          <td><span class="tpcell ${t.tp1_hit?'hit':''}">${{fmt(t.tp1)}}</span></td>
-          <td><span class="tpcell ${t.tp2_hit?'hit':''}">${{fmt(t.tp2)}}</span></td>
-          <td><span class="tpcell ${t.tp3_hit?'hit':''}">${{fmt(t.tp3)}}</span></td>
-          <td>${{closed?'Fermé':(slHit?'SL touché':'En cours')}}</td>
-        </tr>`;
-      }}).join('');
-    }} catch(e) {{
-      console.warn('refreshTrades error', e);
-    }}
-  }}
-  setInterval(refreshTrades, 30000);
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(html)
-# ============================ /main.py — BLOC 3/5 ==============================
-# ============================== main.py — BLOC 4/5 ==============================
-import os, json, time, threading, sqlite3
-from typing import Dict, Any, List, Optional, Tuple
-from fastapi import Body
-
-# ---------- Constantes & Utils ----------
-ALT_INTERVAL = int(os.getenv("ALT_INTERVAL", "120"))     # secondes pour le daemon altseason (si utilisé)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")     # ex: "8478...:AA..."
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")     # ex: "-1001234567890"
-TELEGRAM_COOLDOWN = int(os.getenv("TELEGRAM_COOLDOWN", "10"))  # anti-spam (secondes)
-
-_last_telegram_send = 0.0
-_telegram_pin_last_message = False  # optionnel
-
-def now_ts_ms() -> int:
-    return int(time.time() * 1000)
-
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-# ---------- Base SQLite ----------
-def _db_connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    return con
-
-def _ensure_tables():
-    with _db_connect() as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT,
-            type TEXT,
-            symbol TEXT,
-            tf TEXT,
-            tf_label TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            price REAL,
-            time INTEGER,
-            trade_id TEXT,
-            note TEXT,
-            direction TEXT,
-            extra TEXT
-        )
-        """)
-        con.commit()
-
-_ensure_tables()
-
-# ---------- Telegram ----------
-def send_telegram_ex(text: str, pin: bool = False) -> Tuple[bool, Optional[str]]:
-    """
-    Envoi Telegram simple avec cooldown. Retourne (ok, err).
-    S'il n'y a pas de TOKEN/CHAT, on considère comme OK (no-op).
-    """
-    global _last_telegram_send
-    try:
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return True, None  # pas configuré → no-op silencieux
-
-        now = time.time()
-        if now - _last_telegram_send < TELEGRAM_COOLDOWN:
-            print("WARNING:aitrader:Telegram send skipped due to cooldown")
-            return True, None
-
-        import urllib.request
-        api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        req = urllib.request.Request(api, data=json.dumps(payload).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            _last_telegram_send = now
-            # Optionnel pin
-            if pin and _telegram_pin_last_message:
-                pass
-        return True, None
-    except Exception as e:
-        print(f"WARNING:aitrader:Telegram send_telegram_ex exception: {e}")
-        return False, str(e)
-
-def _format_telegram(event: Dict[str, Any]) -> Optional[str]:
-    """
-    Compose un message Telegram compact & lisible.
-    - Vector Candle: 🟩 (UP) / 🟥 (DOWN) (remplace l’ancien 🟪)
-    - TP1/2/3 hit en vert dans le texte
-    """
-    t = (event.get("type") or "").upper()
-    sym = event.get("symbol") or "?"
-    tf = event.get("tf_label") or event.get("tf") or "?"
-    side = (event.get("side") or "").upper() or "—"
-    price = event.get("price")
-    entry = event.get("entry")
-    sl = event.get("sl")
-    tp1, tp2, tp3 = event.get("tp1"), event.get("tp2"), event.get("tp3")
-
-    if t == "ENTRY":
-        return (f"🚀 <b>ENTRY</b> — <b>{sym}</b> {tf}\n"
-                f"Côté: <b>{side}</b>\n"
-                f"Entry: <code>{entry}</code>\n"
-                f"SL: <code>{sl}</code>\n"
-                f"TP1: <code>{tp1}</code> • TP2: <code>{tp2}</code> • TP3: <code>{tp3}</code>")
-
-    if t in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
-        tp_txt = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[t]
-        return f"✅ <b>{tp_txt} atteint</b> — <b>{sym}</b> {tf} • Côté <b>{side}</b>"
-
-    if t == "SL_HIT":
-        return f"⛔ <b>SL touché</b> — <b>{sym}</b> {tf} • Côté <b>{side}</b>"
-
-    if t == "CLOSE":
-        reason = event.get("reason")
-        reason_txt = f" — {reason}" if reason else ""
-        return f"📕 <b>Position fermée</b> — <b>{sym}</b> {tf}{reason_txt}"
-
-    if t == "VECTOR_CANDLE":
-        direction = (event.get("direction") or "").upper()
-        mark = "🟩" if direction == "UP" else "🟥" if direction == "DOWN" else "🟪"
-        px = f" @ <code>{price}</code>" if price is not None else ""
-        note = event.get("note") or (f"Vector Candle {direction}" if direction else "Vector Candle")
-        return f"{mark} <b>Vector Candle</b> — <b>{sym}</b> {tf}{px}\n{note}"
-
-    if t == "AOE_PREMIUM":
-        return f"💠 <b>AOE Premium</b> — <b>{sym}</b> {tf}"
-    if t == "AOE_DISCOUNT":
-        return f"🌀 <b>AOE Discount</b> — <b>{sym}</b> {tf}"
-
-    # fallback
-    return f"ℹ️ <b>{t}</b> — <b>{sym}</b> {tf}"
-
-# ---------- Sauvegarde d'évènements ----------
-def _derive_trade_id(ev: Dict[str, Any]) -> str:
-    if ev.get("trade_id"):
-        return ev["trade_id"]
-    symbol = (ev.get("symbol") or "UNK").upper()
-    tf = str(ev.get("tf") or "UNK")
-    # pour éviter 'name now_iso not defined', on s’appuie sur timestamp ms
-    ts_ms = int(ev.get("time") or now_ts_ms())
-    return f"{symbol}_{tf}_{ts_ms}"
-
-def save_event(ev: Dict[str, Any], notify: bool = True) -> bool:
-    """
-    Sauvegarde l’évènement dans SQLite, quel que soit le payload entrant.
-    Gère les champs manquants; crée un trade_id si absent.
-    Envoie Telegram formaté (avec cooldown) si notify=True.
-    """
-    try:
-        _ensure_tables()
-        e = {
-            "created_at": now_iso(),
-            "type": (ev.get("type") or "").upper(),
-            "symbol": ev.get("symbol"),
-            "tf": str(ev.get("tf") or ""),
-            "tf_label": ev.get("tf_label"),
-            "side": ev.get("side"),
-            "entry": ev.get("entry"),
-            "sl": ev.get("sl"),
-            "tp1": ev.get("tp1"),
-            "tp2": ev.get("tp2"),
-            "tp3": ev.get("tp3"),
-            "price": ev.get("price"),
-            "time": int(ev.get("time") or now_ts_ms()),
-            "trade_id": _derive_trade_id(ev),
-            "note": ev.get("note"),
-            "direction": ev.get("direction"),
-            "extra": None
-        }
-        # stocke le reste du payload brut dans extra
-        try:
-            extra = {k: v for k, v in ev.items() if k not in e}
-            e["extra"] = json.dumps(extra) if extra else None
-        except Exception:
-            e["extra"] = None
-
-        with _db_connect() as con:
-            con.execute("""
-                INSERT INTO events (created_at,type,symbol,tf,tf_label,side,entry,sl,tp1,tp2,tp3,price,time,trade_id,note,direction,extra)
-                VALUES (:created_at,:type,:symbol,:tf,:tf_label,:side,:entry,:sl,:tp1,:tp2,:tp3,:price,:time,:trade_id,:note,:direction,:extra)
-            """, e)
-            con.commit()
-
-        # Telegram
-        if notify:
-            msg = _format_telegram(e)
-            if msg:
-                ok, err = send_telegram_ex(msg, pin=False)
-                if not ok and err:
-                    print(f"WARNING:aitrader:Telegram send failed: {err}")
-
-        print(f"INFO:aitrader:Saved event: type={e['type']} symbol={e['symbol']} tf={e['tf']} trade_id={e['trade_id']}")
-        return True
-    except Exception as ex:
-        print(f"ERROR:aitrader:save_event failed: {ex}")
-        return False
-
-# ---------- Webhook (si non défini ailleurs) ----------
-@app.post("/tv-webhook")
-def tv_webhook(payload: Dict[str, Any] = Body(...)):
-    """
-    Accepte les payloads TradingView variés.
-    On ne bloque pas si 'secret' absent (à activer si besoin).
-    """
-    try:
-        # (Optionnel) contrôle secret
-        secret_env = os.getenv("TV_WEBHOOK_SECRET")
-        if secret_env:
-            if (payload.get("secret") or "") != secret_env:
-                return {"ok": False, "error": "forbidden"}
-
-        # Sauvegarde & notify
-        save_event(payload, notify=True)
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ---------- Flux brut pour debug / intégrations ----------
-@app.get("/api/feed")
-def api_feed(limit: int = 200):
-    try:
-        with _db_connect() as con:
-            cur = con.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (int(limit),))
-            rows = [dict(r) for r in cur.fetchall()]
-        return {"ok": True, "events": rows}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "events": []}
-
-# ---------- Altseason Daemon (optionnel) ----------
-def run_altseason_daemon(interval: int = ALT_INTERVAL):
-    """
-    Exemple d’actualisation périodique du snapshot Altseason.
-    Met à jour le _altseason_snapshot sans crash si erreur.
-    """
-    global _altseason_snapshot
-    while True:
-        try:
-            # TODO: brancher vos vraies métriques ici
-            _altseason_snapshot.update({
-                "dominance_btc": _altseason_snapshot.get("dominance_btc"),
-                "btc_trend": _altseason_snapshot.get("btc_trend"),  # "UP"/"DOWN"/None
-                "alts_btc_corr": _altseason_snapshot.get("alts_btc_corr"),
-                "alts_usdt_momo": _altseason_snapshot.get("alts_usdt_momo"),
-                "alts_btc_momo": _altseason_snapshot.get("alts_btc_momo"),
-                "market_breadth": _altseason_snapshot.get("market_breadth"),
-                "stamp": int(time.time())
-            })
-        except Exception as e:
-            print(f"WARNING:aitrader:Altseason daemon error: {e}")
-        time.sleep(max(30, int(interval)))
-
-# Lancement optionnel (désactivé par défaut pour Render)
-if os.getenv("RUN_ALTSEASON_DAEMON", "0") == "1":
-    threading.Thread(target=run_altseason_daemon, args=(ALT_INTERVAL,), daemon=True).start()
-# ============================ /main.py — BLOC 4/5 ==============================
-# ============================== main.py — BLOC 5/5 ==============================
-from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.gzip import GZipMiddleware
-
-# --------------------------------- Middlewares ---------------------------------
-# (sécurisé: n'ouvre qu’aux origines déclarées si variable présente)
-_allow_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=512)
 
-# ----------------------------------- Health ------------------------------------
-@app.get("/health", response_class=PlainTextResponse)
-def health():
+# ---------- Utils ----------
+def now_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(timespec="seconds")
+
+def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        # ping DB
-        with _db_connect() as con:
-            con.execute("SELECT 1")
-        return "ok"
-    except Exception as e:
-        return PlainTextResponse(f"db_error: {e}", status_code=500)
+        if x is None: return default
+        return float(x)
+    except Exception:
+        return default
 
-# ---------------------------------- Metrics ------------------------------------
-@app.get("/metrics", response_class=PlainTextResponse)
-def metrics():
+def col(v: Optional[float], nd=6) -> str:
+    return "" if v is None else f"{v:.{nd}f}"
+
+def rate_limited_send() -> bool:
+    global _last_telegram_sent_ts
+    t = time.time()
+    if t - _last_telegram_sent_ts < TELEGRAM_COOLDOWN_SEC:
+        return False
+    _last_telegram_sent_ts = t
+    return True
+
+# ---------- Telegram ----------
+async def send_telegram(text: str, disable_notification: bool = False) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram non configuré; envoi ignoré")
+        return
+    if not rate_limited_send():
+        log.warning("Telegram send skipped due to cooldown")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_notification": disable_notification,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.post(url, json=payload)
+            r.raise_for_status()
+        log.info("Telegram message sent")
+    except httpx.HTTPError as e:
+        log.warning(f"Telegram send_telegram_ex exception: {e}")
+
+def tg_square(color: str) -> str:
     """
-    Prometheus-like métriques très simples.
+    Petits carrés colorés pour Telegram :
+      - 'green' = Vector UP
+      - 'purple' = Vector DOWN
+      - 'blue'   = Info
+      - 'red'    = SL
+    """
+    colors = {
+        "green": "🟩",
+        "purple": "🟪",
+        "blue": "🟦",
+        "red": "🟥",
+        "yellow": "🟨",
+        "orange": "🟧",
+        "white": "⬜",
+        "black": "⬛",
+        "brown": "🟫",
+    }
+    return colors.get(color, "⬜")
+
+def tg_bold(s: str) -> str:
+    return f"<b>{s}</b>"
+
+def tg_mono(s: str) -> str:
+    return f"<code>{s}</code>"
+
+# ---------- DB ----------
+def ensure_db_dir():
+    if not os.path.isdir(DB_DIR):
+        os.makedirs(DB_DIR, exist_ok=True)
+    log.info(f"DB dir OK: {DB_DIR} (using {DB_PATH})")
+
+def init_db():
+    ensure_db_dir()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Table des évènements (webhooks TradingView)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_at TEXT NOT NULL,
+        type TEXT NOT NULL,
+        symbol TEXT,
+        tf TEXT,
+        side TEXT,
+        entry REAL,
+        sl REAL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL,
+        r1 REAL,
+        s1 REAL,
+        leverage TEXT,
+        note TEXT,
+        trade_id TEXT,
+        price REAL,
+        direction TEXT,
+        status TEXT
+    )""")
+
+    # Index utiles
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_symbol ON events(symbol)")
+
+    conn.commit()
+    conn.close()
+    log.info(f"DB initialized at {DB_PATH}")
+# =========================
+# main.py — Bloc 2/5
+# DB helpers, save_event, Telegram format, base API
+# =========================
+
+# ---------- DB Helpers ----------
+def save_event(event: Dict[str, Any]) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO events (
+        received_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, r1, s1,
+        leverage, note, trade_id, price, direction, status
+    ) VALUES (
+        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    )""", (
+        now_iso(),
+        event.get("type"),
+        event.get("symbol"),
+        event.get("tf"),
+        event.get("side"),
+        safe_float(event.get("entry")),
+        safe_float(event.get("sl")),
+        safe_float(event.get("tp1")),
+        safe_float(event.get("tp2")),
+        safe_float(event.get("tp3")),
+        safe_float(event.get("r1")),
+        safe_float(event.get("s1")),
+        event.get("leverage"),
+        event.get("note"),
+        event.get("trade_id"),
+        safe_float(event.get("price")),
+        event.get("direction"),
+        event.get("status"),
+    ))
+    conn.commit()
+    conn.close()
+    log.info(f"Saved event: type={event.get('type')} symbol={event.get('symbol')} tf={event.get('tf')} trade_id={event.get('trade_id')}")
+
+def load_events(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+# ---------- Telegram Formatting ----------
+def format_event_msg(ev: Dict[str, Any]) -> str:
+    t = ev.get("type", "")
+    s = ev.get("symbol", "")
+    tf = ev.get("tf", "")
+    price = ev.get("price")
+    trade_id = ev.get("trade_id", "")
+    dirn = ev.get("direction")
+    side = ev.get("side")
+    msg = ""
+
+    if t == "ENTRY":
+        msg = f"🔔 {tg_bold('ENTRY')} — {s} {tf}\n" \
+              f"{tg_mono(str(ev))}"
+    elif t in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
+        step = t.replace("_HIT", "")
+        msg = f"{tg_square('green')} {tg_bold(step)} — {s} {tf}"
+    elif t == "SL_HIT":
+        msg = f"{tg_square('red')} {tg_bold('STOP LOSS')} — {s} {tf}"
+    elif t == "CLOSE":
+        msg = f"{tg_square('blue')} {tg_bold('CLOSE')} — {s} {tf}"
+    elif t == "VECTOR_CANDLE":
+        if dirn == "UP":
+            msg = f"{tg_square('green')} {tg_bold('VECTOR UP')} — {s} {tf} {tg_mono(col(price,6))}"
+        elif dirn == "DOWN":
+            msg = f"{tg_square('purple')} {tg_bold('VECTOR DOWN')} — {s} {tf} {tg_mono(col(price,6))}"
+        else:
+            msg = f"{tg_square('blue')} {tg_bold('VECTOR')} — {s} {tf}"
+    elif t.startswith("AOE_"):
+        msg = f"⚡ {tg_bold(t)} — {s} {tf}"
+    else:
+        msg = f"ℹ️ {tg_bold(t)} — {s} {tf}"
+
+    if trade_id:
+        msg += f"\nID: {tg_mono(trade_id)}"
+    return msg
+
+# ---------- Routes ----------
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return "<h1>AI Trader Pro — Backend OK</h1>"
+
+@app.get("/trades", response_class=JSONResponse)
+def trades(limit: int = 50):
+    return {"events": load_events(limit=limit)}
+# =========================
+# main.py — Bloc 3/5
+# TV webhook: parse, persist, telegram notify
+# =========================
+
+# Types que l’on accepte depuis TradingView
+ACCEPTED_TYPES = {
+    "ENTRY", "CLOSE",
+    "TP1_HIT", "TP2_HIT", "TP3_HIT",
+    "SL_HIT",
+    "VECTOR_CANDLE",
+    "AOE_PREMIUM", "AOE_DISCOUNT"
+}
+
+def normalize_type(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    t = raw.strip().upper()
+    # normalisations courantes
+    t = t.replace("TP1", "TP1").replace("TP2", "TP2").replace("TP3", "TP3")
+    if t not in ACCEPTED_TYPES:
+        # cas "TP1", "TP2", "TP3" sans suffixe HIT
+        if t in {"TP1", "TP2", "TP3"}:
+            t = f"{t}_HIT"
+    return t
+
+def normalize_dir(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip().upper()
+    if s in {"UP", "LONG", "BUY"}:
+        return "UP"
+    if s in {"DOWN", "SHORT", "SELL"}:
+        return "DOWN"
+    return None
+
+def normalize_tf(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    # autoriser "15" -> "15", "15m" -> "15m"
+    if s.endswith("m") or s.endswith("h") or s.endswith("d"):
+        return s
+    return s  # laisser tel quel (ex: "15")
+
+def event_status(ev_type: str) -> str:
+    # statut simple pour UI
+    if ev_type == "ENTRY":
+        return "open"
+    if ev_type in {"TP1_HIT", "TP2_HIT", "TP3_HIT"}:
+        return "tp"
+    if ev_type == "SL_HIT":
+        return "sl"
+    if ev_type == "CLOSE":
+        return "closed"
+    if ev_type == "VECTOR_CANDLE":
+        return "vector"
+    if ev_type.startswith("AOE_"):
+        return "aoe"
+    return "info"
+
+def extract_price(payload: Dict[str, Any]) -> Optional[float]:
+    # plusieurs clés possibles suivant tes alertes
+    for k in ("price", "close", "entry", "tp", "sl", "hiWin", "upper"):
+        v = payload.get(k)
+        if v is not None:
+            return safe_float(v)
+    return None
+
+def parse_trade_id(payload: Dict[str, Any]) -> Optional[str]:
+    # utiliser celui fourni si présent, sinon en fabriquer un (pour tracer)
+    tid = payload.get("trade_id") or payload.get("tradeId")
+    if tid:
+        return str(tid)
+    # fallback: symbol_tf_timestamplike
+    sym = (payload.get("symbol") or "").strip()
+    tf  = (payload.get("tf") or "").strip()
+    # horodatage: time ou now
+    ts = payload.get("time")
+    if isinstance(ts, (int, float)) and ts > 0:
+        stamp = int(ts)
+    else:
+        # micro fallback rapide
+        stamp = int(dt.datetime.utcnow().timestamp() * 1000)
+    return f"{sym}_{tf}_{stamp}"
+
+def allowed_by_secret(payload: Dict[str, Any]) -> bool:
+    secret = payload.get("secret") or payload.get("s")
+    expected = os.getenv("TV_WEBHOOK_SECRET")
+    if expected:
+        return (secret == expected)
+    # si pas de secret défini côté serveur, on autorise
+    return True
+
+def should_send_tg(ev_type: str) -> bool:
+    # limiter le spam : on notifie les principaux
+    return ev_type in {
+        "ENTRY", "CLOSE",
+        "TP1_HIT", "TP2_HIT", "TP3_HIT",
+        "SL_HIT",
+        "VECTOR_CANDLE",
+        "AOE_PREMIUM", "AOE_DISCOUNT",
+    }
+
+def cooldown_ok(kind: str, key: str, seconds: int = 20) -> bool:
+    # kind: p.ex. "tg", key: symbol+tf+type
+    k = f"{kind}:{key}"
+    now = time.time()
+    last = _tg_cooldown.get(k)
+    if last and (now - last) < seconds:
+        return False
+    _tg_cooldown[k] = now
+    return True
+
+@app.post("/tv-webhook")
+async def tv_webhook(req: Request):
+    """
+    Webhook TradingView : accepte JSON de tes alertes.
+    Normalise, sauvegarde l'event, et notifie Telegram avec le style demandé.
     """
     try:
-        with _db_connect() as con:
-            total = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            last = con.execute("SELECT MAX(time) FROM events").fetchone()[0] or 0
-        lines = [
-            "# HELP ai_trader_events_total Nombre d'événements enregistrés",
-            "# TYPE ai_trader_events_total counter",
-            f"ai_trader_events_total {total}",
-            "# HELP ai_trader_last_event_ts_ms Timestamp ms du dernier événement",
-            "# TYPE ai_trader_last_event_ts_ms gauge",
-            f"ai_trader_last_event_ts_ms {int(last)}",
-        ]
-        return "\n".join(lines)
-    except Exception as e:
-        return PlainTextResponse(f"# error {e}", status_code=500)
+        payload = await req.json()
+    except Exception:
+        # tenter parsing texte brut (TradingView peut envoyer du texte)
+        body = await req.body()
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            log.error("Webhook payload non JSON")
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-# --------------------------- Aide: stats & recompute ----------------------------
-@app.get("/api/stats", response_class=JSONResponse)
-def api_stats():
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON object")
+
+    # filtrage par secret si défini
+    if not allowed_by_secret(payload):
+        log.warning("Webhook secret mismatch — ignored")
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Normalisations
+    ev_type = normalize_type(payload.get("type"))
+    symbol  = (payload.get("symbol") or "").strip()
+    tf      = normalize_tf(payload.get("tf"))
+    dirn    = normalize_dir(payload.get("direction"))
+    note    = payload.get("note")
+    side    = payload.get("side")
+    price   = extract_price(payload)
+    trade_id = parse_trade_id(payload)
+
+    # Construire l’event interne
+    ev: Dict[str, Any] = {
+        "type": ev_type,
+        "symbol": symbol,
+        "tf": tf,
+        "side": side,
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl"),
+        "tp1": payload.get("tp1"),
+        "tp2": payload.get("tp2"),
+        "tp3": payload.get("tp3"),
+        "r1": payload.get("r1"),
+        "s1": payload.get("s1"),
+        "leverage": payload.get("leverage") or payload.get("lev_reco"),
+        "note": note,
+        "trade_id": trade_id,
+        "price": price,
+        "direction": dirn,
+        "status": event_status(ev_type),
+    }
+
+    # Sauvegarde DB (robuste même si champs manquent)
+    try:
+        save_event(ev)
+    except Exception as e:
+        log.exception(f"save_event failed: {e}")
+        # on continue quand même pour renvoyer 200 à TradingView
+        # (afin d’éviter les retries côté TV)
+
+    # Envoi Telegram si permis + cooldown
+    if TELEGRAM_ENABLED and should_send_tg(ev_type):
+        # clé cooldown = type+symbol+tf (éviter spam)
+        cd_key = f"{ev_type}:{symbol}:{tf}"
+        if cooldown_ok("tg", cd_key, seconds=TELEGRAM_COOLDOWN_S):
+            msg = format_event_msg(ev)
+            ok = send_telegram(msg)
+            if not ok:
+                log.warning("Telegram send skipped due to cooldown or failure")
+        else:
+            log.warning("Telegram send skipped due to cooldown")
+
+    # Réponse HTTP
+    return JSONResponse({"ok": True, "received_at": now_iso(), "normalized_type": ev_type, "trade_id": trade_id})
+# =========================
+# main.py — Bloc 4/5
+# /trades : Dashboard Altseason + tableau des trades
+# =========================
+
+from starlette.responses import HTMLResponse
+
+def _fetch_recent_events(limit:int=1500) -> List[Dict[str,Any]]:
+    rows = db_query("""
+        SELECT 
+            created_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, 
+            r1, s1, leverage, note, trade_id, price, direction, status
+        FROM events
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    out = []
+    for r in rows:
+        out.append({
+            "created_at": r[0], "type": r[1], "symbol": r[2], "tf": r[3],
+            "side": r[4], "entry": r[5], "sl": r[6], "tp1": r[7], "tp2": r[8], "tp3": r[9],
+            "r1": r[10], "s1": r[11], "leverage": r[12], "note": r[13],
+            "trade_id": r[14], "price": r[15], "direction": r[16], "status": r[17],
+        })
+    return out
+
+def _aggregate_trades(events: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     """
-    Petites stats résumées pour la page trades (et le dashboard).
+    Regroupe par trade_id et détermine l'état (TP1/TP2/TP3/SL/CLOSE).
+    On conserve la dernière ENTRY (si présente) pour afficher la config.
+    """
+    by_tid: Dict[str, Dict[str,Any]] = {}
+    for ev in events[::-1]:  # du plus ancien au plus récent pour initialiser puis marquer les hits
+        tid = ev.get("trade_id") or f"{ev.get('symbol','')}_{ev.get('tf','')}"
+        bucket = by_tid.get(tid)
+        if not bucket:
+            bucket = {
+                "trade_id": tid,
+                "symbol": ev.get("symbol"),
+                "tf": ev.get("tf"),
+                "side": ev.get("side"),
+                "entry": ev.get("entry"),
+                "sl": ev.get("sl"),
+                "tp1": ev.get("tp1"),
+                "tp2": ev.get("tp2"),
+                "tp3": ev.get("tp3"),
+                "r1": ev.get("r1"),
+                "s1": ev.get("s1"),
+                "leverage": ev.get("leverage"),
+                "last_type": ev.get("type"),
+                "last_price": ev.get("price"),
+                "created_at": ev.get("created_at"),
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "tp3_hit": False,
+                "sl_hit": False,
+                "closed": False,
+                "vector_last": None,   # "UP" / "DOWN"
+                "confidence": ev.get("confidence"),
+                "horizon": ev.get("horizon"),
+            }
+            by_tid[tid] = bucket
+
+        t = (ev.get("type") or "").upper()
+        if t == "ENTRY":
+            # rafraîchir les niveaux si ré-ENTRY
+            for k in ("entry","sl","tp1","tp2","tp3","r1","s1","leverage","side"):
+                v = ev.get(k)
+                if v is not None:
+                    bucket[k] = v
+        elif t == "TP1_HIT":
+            bucket["tp1_hit"] = True
+        elif t == "TP2_HIT":
+            bucket["tp2_hit"] = True
+        elif t == "TP3_HIT":
+            bucket["tp3_hit"] = True
+        elif t == "SL_HIT":
+            bucket["sl_hit"] = True
+        elif t == "CLOSE":
+            bucket["closed"] = True
+        elif t == "VECTOR_CANDLE":
+            d = (ev.get("direction") or "").upper()
+            if d in ("UP","DOWN"):
+                bucket["vector_last"] = d
+
+        bucket["last_type"]  = t or bucket["last_type"]
+        bucket["last_price"] = ev.get("price") if ev.get("price") is not None else bucket["last_price"]
+        bucket["created_at"] = ev.get("created_at") or bucket["created_at"]
+
+    # ordonner: trades récents d'abord
+    ordered = sorted(by_tid.values(), key=lambda x: x.get("created_at") or "", reverse=True)
+    return ordered
+
+def _altseason_snapshot_safe() -> Dict[str,Any]:
+    """
+    Renvoie un snapshot Altseason sans lever d’erreur si rien n’est encore calculé.
+    Essaie d’utiliser la dernière ligne d’`altseason_snapshots`, sinon fallback neutre.
     """
     try:
-        with _db_connect() as con:
-            cur = con.execute("""
-                SELECT type, COUNT(*) c FROM events GROUP BY type ORDER BY c DESC
-            """)
-            by_type = {r["type"]: r["c"] for r in cur.fetchall()}
-            cur = con.execute("""
-                SELECT symbol, COUNT(*) c FROM events GROUP BY symbol ORDER BY c DESC LIMIT 10
-            """)
-            top_symbols = [{"symbol": r["symbol"], "count": r["c"]} for r in cur.fetchall()]
-            last_ts = con.execute("SELECT MAX(time) m FROM events").fetchone()["m"] or 0
-        return {
-            "ok": True,
-            "by_type": by_type,
-            "top_symbols": top_symbols,
-            "last_event_ts": last_ts,
-            "altseason": _altseason_snapshot,
-        }
+        row = db_query("""
+            SELECT created_at, btc_dom, btc_7d, alts_7d, alts_btc_ratio, heat, phase
+            FROM altseason_snapshots
+            ORDER BY created_at DESC
+            LIMIT 1
+        """)
+        if row:
+            r = row[0]
+            return {
+                "created_at": r[0],
+                "btc_dom": r[1],
+                "btc_7d": r[2],
+                "alts_7d": r[3],
+                "alts_btc_ratio": r[4],
+                "heat": r[5],
+                "phase": r[6],
+            }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        log.warning(f"Altseason snapshot query failed: {e}")
+    # fallback par défaut
+    return {
+        "created_at": now_iso(),
+        "btc_dom": None,
+        "btc_7d": 0.0,
+        "alts_7d": 0.0,
+        "alts_btc_ratio": 1.0,
+        "heat": 0.0,
+        "phase": "Neutre",
+    }
 
-@app.post("/api/recompute-tp", response_class=JSONResponse)
-def api_recompute_tp():
-    """
-    (Hook optionnel) Si vous avez une logique de recalcul externe, branchez-la ici.
-    Pour l’instant, ne fait que renvoyer ok=True.
-    """
-    try:
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def _badge(text: str, cls: str) -> str:
+    return f'<span class="badge {cls}">{html.escape(text)}</span>'
 
-# ------------------------------- Assets front -----------------------------------
-_TRADES_CSS = r"""
+def _vector_chip(v: Optional[str]) -> str:
+    if v == "UP":
+        return '<span class="chip chip-up" title="Vector UP"></span>'
+    if v == "DOWN":
+        return '<span class="chip chip-down" title="Vector DOWN"></span>'
+    return '<span class="chip chip-none" title="No vector"></span>'
+
+def _fmt_price(x: Any) -> str:
+    v = safe_float(x)
+    if v is None:
+        return "—"
+    # format compact
+    if v == 0:
+        return "0"
+    if abs(v) < 0.001:
+        return f"{v:.8f}"
+    if abs(v) < 1:
+        return f"{v:.6f}"
+    if abs(v) < 100:
+        return f"{v:.4f}"
+    return f"{v:.2f}"
+
+def _row_for_trade(t: Dict[str,Any]) -> str:
+    sym = html.escape(str(t.get("symbol") or "—"))
+    tf  = html.escape(str(t.get("tf") or "—"))
+    side = (t.get("side") or "").upper()
+    side_badge = _badge("LONG","green") if side=="LONG" else (_badge("SHORT","red") if side=="SHORT" else _badge("N/A","muted"))
+
+    entry = _fmt_price(t.get("entry"))
+    sl    = _fmt_price(t.get("sl"))
+    tp1   = _fmt_price(t.get("tp1"))
+    tp2   = _fmt_price(t.get("tp2"))
+    tp3   = _fmt_price(t.get("tp3"))
+
+    tp1_cls = "hit" if t.get("tp1_hit") else "idle"
+    tp2_cls = "hit" if t.get("tp2_hit") else "idle"
+    tp3_cls = "hit" if t.get("tp3_hit") else "idle"
+    sl_cls  = "hit" if t.get("sl_hit") else "idle"
+
+    status = "Closed" if t.get("closed") else "Open"
+    status_badge = _badge(status, "muted" if t.get("closed") else "blue")
+
+    lev = html.escape(str(t.get("leverage") or ""))
+    lev = lev or "—"
+
+    vec = _vector_chip(t.get("vector_last"))
+
+    return (
+        "<tr>"
+        f"<td class='sticky'>{sym}<div class='sub'>{tf}</div></td>"
+        f"<td>{side_badge}</td>"
+        f"<td>{entry}</td>"
+        f"<td class='sl {sl_cls}'>{sl}</td>"
+        f"<td class='tp {tp1_cls}'>{tp1}</td>"
+        f"<td class='tp {tp2_cls}'>{tp2}</td>"
+        f"<td class='tp {tp3_cls}'>{tp3}</td>"
+        f"<td>{lev}</td>"
+        f"<td class='center'>{vec}</td>"
+        f"<td>{status_badge}</td>"
+        "</tr>"
+    )
+
+@app.get("/trades")
+def trades_page():
+    # données
+    events = _fetch_recent_events(limit=2000)
+    trades = _aggregate_trades(events)
+    alt = _altseason_snapshot_safe()
+
+    # --- HTML header (pas d’f-string ici -> CSS intact) ---
+    head = """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Trader — Trades</title>
+<style>
 :root{
-  --bg:#0b0e11; --card:#12161c; --muted:#6b7280; --txt:#e5e7eb;
-  --green:#10b981; --red:#ef4444; --amber:#f59e0b; --cyan:#06b6d4;
-  --purple:#8b5cf6;
-  --border: #1f2937;
+  --bg:#0b0f14; --panel:#111723; --muted:#778099; --card:#0f1520;
+  --txt:#e6edf3; --green:#22c55e; --green-weak:#14301f;
+  --red:#ef4444; --red-weak:#2a1416; --blue:#60a5fa; --blue-weak:#142234;
+  --amber:#f59e0b; --amber-weak:#2b220f; --border:#1f2937;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-.container{max-width:1200px;margin:24px auto;padding:0 16px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 0 0 1px rgba(255,255,255,0.02) inset}
-.header{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}
-.header h2{margin:0;font-size:18px}
-.kpi-row{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}
-.kpi{background:#0f1318;border:1px solid var(--border);border-radius:14px;padding:12px}
-.kpi .label{font-size:12px;color:var(--muted)}
-.kpi .value{font-weight:700;margin-top:4px}
-.kpi .hint{font-size:11px;color:var(--muted)}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+.container{max-width:1200px;margin:18px auto;padding:0 12px}
 
-.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;font-size:12px;background:#0f1318;border:1px solid var(--border);color:var(--txt)}
-.badge .dot{width:8px;height:8px;border-radius:50%}
-.dot.up{background:var(--green)}
-.dot.down{background:var(--red)}
-.dot.neutral{background:var(--muted)}
+.panel{
+  background:linear-gradient(180deg,var(--panel),var(--card));
+  border:1px solid var(--border); border-radius:14px; padding:14px; margin-bottom:14px;
+  box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
+}
+h2{margin:0 0 10px 0; font-size:18px}
+.grid{
+  display:grid; gap:10px;
+  grid-template-columns:repeat(5,minmax(0,1fr));
+}
+.indik{
+  background:#0b1220; border:1px solid var(--border); border-radius:12px; padding:12px;
+}
+.indik .label{color:var(--muted); font-size:12px}
+.indik .val{font-weight:700; font-size:18px; margin-top:2px}
+.indik .hint{color:var(--muted); font-size:12px; margin-top:4px}
 
-.table{width:100%;border-collapse:separate;border-spacing:0 8px}
-.table thead th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);text-align:left;padding:0 10px}
-.table tbody tr{background:#0f1318;border:1px solid var(--border)}
-.table tbody tr td{padding:10px}
-.table tbody tr:first-child td{border-top-left-radius:12px;border-top-right-radius:12px}
-.table tbody tr:last-child td{border-bottom-left-radius:12px;border-bottom-right-radius:12px}
+.badge{
+  display:inline-block; padding:3px 8px; border-radius:999px; font-size:12px; line-height:1; border:1px solid var(--border);
+  background:#0e1625; color:#cbd5e1;
+}
+.badge.green{background:var(--green-weak); color:#bbf7d0; border-color:#19452b}
+.badge.red{background:var(--red-weak); color:#fecaca; border-color:#3b161a}
+.badge.blue{background:var(--blue-weak); color:#cfe7ff; border-color:#1e3760}
+.badge.muted{background:#0f1520; color:#95a3b9; border-color:var(--border)}
 
-.tag{padding:2px 8px;border-radius:8px;border:1px solid var(--border);background:#0c1117;font-size:12px;color:var(--muted)}
-.tag.long{color:var(--green);border-color:#094c3a;background:#071b15}
-.tag.short{color:var(--red);border-color:#4c0913;background:#1b0709}
+.table{
+  width:100%; border-collapse:separate; border-spacing:0; overflow:hidden;
+  border:1px solid var(--border); border-radius:14px;
+}
+thead th{
+  text-align:left; font-weight:600; color:#cbd5e1; font-size:12px; letter-spacing:.02em;
+  background:#0f1520; position:sticky; top:0; z-index:2; padding:10px;
+  border-bottom:1px solid var(--border);
+}
+tbody td{ padding:10px; border-bottom:1px solid var(--border); vertical-align:middle }
+tbody tr:hover td{ background:#0b1220 }
+td.sticky{ position:sticky; left:0; background:linear-gradient(90deg,#0f1520,#0f1520); z-index:1 }
+td .sub{ color:var(--muted); font-size:12px }
 
-.tp{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:8px;border:1px solid var(--border);font-size:12px;background:#0c1117}
-.tp.hit{background:#071b15;border-color:#094c3a;color:var(--green)}
-.tp.pending{color:var(--muted)}
-.tp .dot{width:8px;height:8px;border-radius:50%}
-.tp.hit .dot{background:var(--green)}
-.tp.pending .dot{background:var(--muted)}
+.tp.idle{ background:rgba(34,197,94,.06) }
+.tp.hit{ background:rgba(34,197,94,.18); color:#dcfce7; font-weight:600; outline:1px solid rgba(34,197,94,.35) }
+.sl.idle{ background:rgba(239,68,68,.06) }
+.sl.hit{ background:rgba(239,68,68,.18); color:#fee2e2; font-weight:600; outline:1px solid rgba(239,68,68,.35) }
 
-.legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
-.legend .item{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-.legend .sw{width:12px;height:12px;border-radius:4px}
-.sw.vec-up{background:var(--green)}
-.sw.vec-down{background:var(--red)}
-.sw.tp-hit{background:var(--green)}
-.sw.tp-pend{background:var(--muted)}
+.center{ text-align:center }
+
+.chip{
+  display:inline-block; width:10px; height:10px; border-radius:2px; border:1px solid var(--border);
+  box-shadow:0 0 0 1px rgba(0,0,0,.2) inset;
+}
+.chip-up{ background:var(--green) }       /* VERT pour VECTOR UP */
+.chip-down{ background:#8b5cf6 }          /* MAUVE pour VECTOR DOWN */
+.chip-none{ background:#334155 }
+
+.footer-note{ color:var(--muted); font-size:12px; margin-top:8px }
 
 @media (max-width:900px){
-  .kpi-row{grid-template-columns:repeat(2,1fr)}
-  .table thead{display:none}
-  .table tbody tr td{display:block}
+  .grid{ grid-template-columns:repeat(2,minmax(0,1fr)) }
+  thead .hide-sm, tbody .hide-sm{ display:none }
 }
-"""
-
-_TRADES_JS = r"""
-/* petites aides front pour la page trades */
-function applyTpBadges() {
-  document.querySelectorAll('[data-tp]').forEach(cell => {
-    const status = cell.getAttribute('data-tp'); // 'hit' ou 'pending'
-    cell.classList.add('tp', status === 'hit' ? 'hit' : 'pending');
-    if (!cell.querySelector('.dot')) {
-      const dot = document.createElement('span');
-      dot.className = 'dot';
-      cell.prepend(dot);
-    }
-  });
-}
-
-function colorVectorBadges() {
-  document.querySelectorAll('[data-vdir]').forEach(el => {
-    const dir = (el.getAttribute('data-vdir') || '').toUpperCase();
-    const dot = el.querySelector('.dot') || (function(){
-      const s=document.createElement('span'); s.className='dot'; el.prepend(s); return s;
-    })();
-    dot.classList.remove('up','down','neutral');
-    if (dir === 'UP') dot.classList.add('up');
-    else if (dir === 'DOWN') dot.classList.add('down');
-    else dot.classList.add('neutral');
-  });
-}
-
-window.addEventListener('DOMContentLoaded', () => {
-  applyTpBadges();
-  colorVectorBadges();
-});
-"""
-
-@app.get("/assets/trades.css", response_class=PlainTextResponse)
-def assets_css():
-    return PlainTextResponse(_TRADES_CSS, media_type="text/css; charset=utf-8")
-
-@app.get("/assets/trades.js", response_class=PlainTextResponse)
-def assets_js():
-    return PlainTextResponse(_TRADES_JS, media_type="application/javascript; charset=utf-8")
-
-# --------------------------- Page d’accueil simple ------------------------------
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return HTMLResponse("""
-<!doctype html>
-<html lang="fr">
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>AI Trader — Dashboard</title>
-<link rel="stylesheet" href="/assets/trades.css"/>
+</style>
+</head>
 <body>
-  <div class="container">
-    <div class="card header">
-      <h2>AI Trader — Dashboard</h2>
-      <div class="legend">
-        <div class="item"><span class="sw vec-up"></span> Vector UP</div>
-        <div class="item"><span class="sw vec-down"></span> Vector DOWN</div>
-        <div class="item"><span class="sw tp-hit"></span> TP atteint</div>
-        <div class="item"><span class="sw tp-pend"></span> TP en attente</div>
-      </div>
-    </div>
+<div class="container">
+"""
 
-    <!-- Altseason en haut -->
-    <div class="card">
-      <div class="header">
-        <h2>Indicateurs Altseason</h2>
-        <span class="badge"><span class="dot neutral"></span> Live</span>
-      </div>
-      <div class="kpi-row">
-        <div class="kpi">
-          <div class="label">Dominance BTC</div>
-          <div class="value" id="kpi-dbtc">–</div>
-          <div class="hint" id="kpi-dbtc-hint">impact sur alts</div>
-        </div>
-        <div class="kpi">
-          <div class="label">Tendance BTC</div>
-          <div class="value" id="kpi-btc-trend">–</div>
-          <div class="hint">UP = favorable altseason</div>
-        </div>
-        <div class="kpi">
-          <div class="label">Corrélation Alts↔BTC</div>
-          <div class="value" id="kpi-corr">–</div>
-          <div class="hint">faible corrélation ⇒ +alts</div>
-        </div>
-        <div class="kpi">
-          <div class="label">Momentum Alts/USDT</div>
-          <div class="value" id="kpi-momo-usdt">–</div>
-          <div class="hint">moyenne du marché</div>
-        </div>
-        <div class="kpi">
-          <div class="label">Breadth Marché</div>
-          <div class="value" id="kpi-breadth">–</div>
-          <div class="hint">% alts en hausse</div>
-        </div>
-      </div>
-      <div class="legend">
-        <div class="item">Mise à jour: <span id="alt-stamp">–</span></div>
-      </div>
-    </div>
+    # --- Dashboard Altseason ---
+    alt_rows = []
+    def _fmt(v, suffix=""):
+        if v is None: return "—"
+        try:
+            return f"{float(v):.2f}{suffix}"
+        except Exception:
+            return f"{v}{suffix}"
 
-    <div class="card" style="margin-top:16px">
-      <div class="header">
-        <h2>Derniers trades</h2>
-        <a class="tag" href="/api/feed?limit=200" target="_blank">/api/feed</a>
-      </div>
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Quand</th><th>Type</th><th>Symb.</th><th>TF</th><th>Côté</th>
-            <th>Entrée</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th>
-            <th>Prix</th><th>Note</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+    alt_html = f"""
+<div class="panel">
+  <h2>Indicateurs Altseason</h2>
+  <div class="grid">
+    <div class="indik">
+      <div class="label">BTC Dominance</div>
+      <div class="val">{_fmt(alt.get('btc_dom'), '%')}</div>
+      <div class="hint">Poids de BTC sur le marché</div>
+    </div>
+    <div class="indik">
+      <div class="label">BTC 7j</div>
+      <div class="val">{_fmt(alt.get('btc_7d'), '%')}</div>
+      <div class="hint">Perf 7 jours de BTC</div>
+    </div>
+    <div class="indik">
+      <div class="label">Alts 7j</div>
+      <div class="val">{_fmt(alt.get('alts_7d'), '%')}</div>
+      <div class="hint">Perf moyenne des Altcoins (7j)</div>
+    </div>
+    <div class="indik">
+      <div class="label">Rapport Alts/BTC</div>
+      <div class="val">{_fmt(alt.get('alts_btc_ratio'))}</div>
+      <div class="hint">>1 favorise les Alts</div>
+    </div>
+    <div class="indik">
+      <div class="label">Phase</div>
+      <div class="val">{html.escape(str(alt.get('phase') or '—'))}</div>
+      <div class="hint">Synthèse du momentum</div>
     </div>
   </div>
+  <div class="footer-note">Dernière mise à jour : {html.escape(str(alt.get('created_at') or '—'))}</div>
+</div>
+"""
 
-<script src="/assets/trades.js"></script>
-<script>
-async function loadStats() {
-  try {
-    const r = await fetch('/api/stats');
-    const j = await r.json();
-    if (!j.ok) return;
+    # --- Tableau des trades ---
+    table_head = """
+<div class="panel">
+  <h2>Trades en cours & récents</h2>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Symbole</th>
+        <th>Side</th>
+        <th>Entry</th>
+        <th>SL</th>
+        <th>TP1</th>
+        <th>TP2</th>
+        <th>TP3</th>
+        <th class="hide-sm">Lev.</th>
+        <th class="center hide-sm">Vector</th>
+        <th>Statut</th>
+      </tr>
+    </thead>
+    <tbody>
+"""
 
-    const a = j.altseason || {};
-    document.querySelector('#kpi-dbtc').textContent = (a.dominance_btc ?? '–') + '%';
-    document.querySelector('#kpi-btc-trend').textContent = a.btc_trend ?? '–';
-    document.querySelector('#kpi-corr').textContent = a.alts_btc_corr ?? '–';
-    document.querySelector('#kpi-momo-usdt').textContent = a.alts_usdt_momo ?? '–';
-    document.querySelector('#kpi-breadth').textContent = a.market_breadth ?? '–';
-    const stamp = a.stamp ? new Date(a.stamp*1000).toLocaleString() : '–';
-    document.querySelector('#alt-stamp').textContent = stamp;
-  } catch(e) {}
-}
+    rows_html = []
+    for t in trades:
+        rows_html.append(_row_for_trade(t))
 
-function badgeForType(ev){
-  const t = ev.type || '';
-  if (t === 'ENTRY') return '<span class="tag long">ENTRY</span>';
-  if (t === 'SL_HIT') return '<span class="tag short">SL</span>';
-  if (t === 'CLOSE') return '<span class="tag">CLOSE</span>';
-  if (t === 'VECTOR_CANDLE'){
-    const d = (ev.direction||'').toUpperCase();
-    const cls = d==='UP' ? 'up' : (d==='DOWN'?'down':'neutral');
-    return `<span class="badge" data-vdir="${d}"><span class="dot ${cls}"></span>Vector</span>`;
-  }
-  if (t.endsWith('_HIT')) return '<span class="badge"><span class="dot up"></span>TP hit</span>';
-  return `<span class="tag">${t}</span>`;
-}
-
-function tdTp(val, hit){
-  const status = hit ? 'hit' : 'pending';
-  const v = (val==null || val==='') ? '—' : val;
-  return `<td data-tp="${status}">${v}</td>`;
-}
-
-function deriveHitFlags(ev){
-  // heuristique: si type=TPx_HIT, on colore celui atteint en vert.
-  const t = ev.type || '';
-  return {
-    tp1: t==='TP1_HIT' || t==='TP2_HIT' || t==='TP3_HIT',
-    tp2: t==='TP2_HIT' || t==='TP3_HIT',
-    tp3: t==='TP3_HIT'
-  };
-}
-
-async function loadFeed(){
-  const r = await fetch('/api/feed?limit=120');
-  const j = await r.json();
-  const rows = j.events || [];
-  const tb = document.querySelector('#rows');
-  tb.innerHTML = '';
-  for (const ev of rows){
-    const when = ev.created_at || '—';
-    const typeBadge = badgeForType(ev);
-    const side = ev.side || '—';
-    const entry = ev.entry ?? '—';
-    const sl = ev.sl ?? '—';
-    const price = ev.price ?? '—';
-    const note = ev.note ?? '';
-    const tf = ev.tf_label || ev.tf || '—';
-    const flags = deriveHitFlags(ev);
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${when}</td>
-      <td>${typeBadge}</td>
-      <td>${ev.symbol || '—'}</td>
-      <td>${tf}</td>
-      <td>${side? `<span class="tag ${side.toLowerCase()}">${side}</span>` : '—'}</td>
-      <td>${entry}</td>
-      <td>${sl}</td>
-      ${tdTp(ev.tp1, flags.tp1)}
-      ${tdTp(ev.tp2, flags.tp2)}
-      ${tdTp(ev.tp3, flags.tp3)}
-      <td>${price}</td>
-      <td>${note}</td>
-    `;
-    tb.appendChild(tr);
-  }
-  // active styles
-  applyTpBadges();
-  colorVectorBadges();
-}
-
-loadStats();
-loadFeed();
-setInterval(loadStats, 15000);
-setInterval(loadFeed, 8000);
-</script>
+    table_tail = """
+    </tbody>
+  </table>
+  <div class="footer-note">TP en <b>vert</b> quand atteint · SL en <b>rouge</b> · Carré <b>vert</b> = Vector UP · Carré <b>mauve</b> = Vector DOWN.</div>
+</div>
+</div>
 </body>
 </html>
+"""
+
+    html_out = head + alt_html + table_head + "".join(rows_html) + table_tail
+    return HTMLResponse(html_out)
+# =========================
+# main.py — Bloc 5/5
+# API JSON + Altseason Daemon + CORS + Health/404
+# =========================
+
+from typing import List, Dict, Any, Optional
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi import Request
+from datetime import datetime, timezone
+import threading
+import time
+import statistics
+
+# --- Gardes utilitaires au cas où des blocs précédents ne les ont pas définis ---
+if 'now_iso' not in globals():
+    def now_iso() -> str:
+        return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+if 'safe_float' not in globals():
+    def safe_float(x, default=None):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+if 'db_execute' not in globals() or 'db_query' not in globals():
+    raise RuntimeError("db_execute/db_query doivent être définis par les blocs précédents.")
+
+# --- CORS (front, TV, autres origines) ---
+try:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception:
+    # app peut déjà avoir CORS; ignorer
+    pass
+
+# --- Tables nécessaires (si pas déjà créées) ---
+db_execute("""
+CREATE TABLE IF NOT EXISTS altseason_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  btc_dom REAL,
+  btc_7d REAL,
+  alts_7d REAL,
+  alts_btc_ratio REAL,
+  heat REAL,
+  phase TEXT
+);
+""")
+
+# --- Paramètre du daemon Altseason ---
+ALT_INTERVAL = int(os.environ.get("ALT_INTERVAL", "120"))  # secondes
+
+# --- Helpers déjà utilisés par /trades (bloc 4) ---
+def _fetch_recent_events(limit:int=2000) -> List[Dict[str,Any]]:
+    rows = db_query("""
+        SELECT 
+            created_at, type, symbol, tf, side, entry, sl, tp1, tp2, tp3, 
+            r1, s1, leverage, note, trade_id, price, direction, status
+        FROM events
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    out = []
+    for r in rows:
+        out.append({
+            "created_at": r[0], "type": r[1], "symbol": r[2], "tf": r[3],
+            "side": r[4], "entry": r[5], "sl": r[6], "tp1": r[7], "tp2": r[8], "tp3": r[9],
+            "r1": r[10], "s1": r[11], "leverage": r[12], "note": r[13],
+            "trade_id": r[14], "price": r[15], "direction": r[16], "status": r[17],
+        })
+    return out
+
+def _aggregate_trades(events: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+    by_tid: Dict[str, Dict[str,Any]] = {}
+    for ev in events[::-1]:
+        tid = ev.get("trade_id") or f"{ev.get('symbol','')}_{ev.get('tf','')}"
+        if tid not in by_tid:
+            by_tid[tid] = {
+                "trade_id": tid, "symbol": ev.get("symbol"), "tf": ev.get("tf"),
+                "side": ev.get("side"), "entry": ev.get("entry"), "sl": ev.get("sl"),
+                "tp1": ev.get("tp1"), "tp2": ev.get("tp2"), "tp3": ev.get("tp3"),
+                "r1": ev.get("r1"), "s1": ev.get("s1"), "leverage": ev.get("leverage"),
+                "last_type": ev.get("type"), "last_price": ev.get("price"),
+                "created_at": ev.get("created_at"),
+                "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
+                "sl_hit": False, "closed": False, "vector_last": None,
+                "confidence": ev.get("confidence"), "horizon": ev.get("horizon"),
+            }
+        bucket = by_tid[tid]
+        t = (ev.get("type") or "").upper()
+        if t == "ENTRY":
+            for k in ("entry","sl","tp1","tp2","tp3","r1","s1","leverage","side"):
+                v = ev.get(k)
+                if v is not None:
+                    bucket[k] = v
+        elif t == "TP1_HIT":
+            bucket["tp1_hit"] = True
+        elif t == "TP2_HIT":
+            bucket["tp2_hit"] = True
+        elif t == "TP3_HIT":
+            bucket["tp3_hit"] = True
+        elif t == "SL_HIT":
+            bucket["sl_hit"] = True
+        elif t == "CLOSE":
+            bucket["closed"] = True
+        elif t == "VECTOR_CANDLE":
+            d = (ev.get("direction") or "").upper()
+            if d in ("UP","DOWN"): bucket["vector_last"] = d
+        bucket["last_type"]  = t or bucket["last_type"]
+        if ev.get("price") is not None:
+            bucket["last_price"] = ev.get("price")
+        if ev.get("created_at"):
+            bucket["created_at"] = ev.get("created_at")
+    return sorted(by_tid.values(), key=lambda x: x.get("created_at") or "", reverse=True)
+
+# --- Calcul Altseason (proxy simple depuis les events) ---
+def _compute_altseason_snapshot() -> Dict[str,Any]:
+    """
+    Proxy robuste basé sur les événements:
+    - btc_dom: ratio (VECTOR/TP hits) BTC vs tout (approx)
+    - btc_7d, alts_7d: scores d’élan 7j (count UP/DOWN)
+    - alts_btc_ratio: alts_7d / max(btc_7d,1e-9)
+    - heat: normalisé [0..100] basé sur proportion de signaux UP
+    - phase: texte synthétique
+    """
+    # Derniers 7 jours (si created_at est ISO), sinon prendre 10k derniers events
+    rows = db_query("""
+        SELECT created_at, type, symbol, direction
+        FROM events
+        ORDER BY created_at DESC
+        LIMIT 10000
     """)
+    btc_tags = ("BTCUSDT","BTCUSD",".BTC")
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-# ============================ /main.py — BLOC 5/5 ==============================
+    total_up = 0
+    total = 0
+    btc_hits = 0
+    alts_hits = 0
+    btc_up = 0
+    alts_up = 0
 
-# ------------------------------- Récap rapide ----------------------------------
-# - /health : ping de l’app
-# - /metrics : métriques simples
-# - /      : dashboard minimal, Altseason en haut, tableau trades dessous
-# - /assets/trades.css & /assets/trades.js : styles & logique front
-# - TP1/TP2/TP3 deviennent verts (classe .tp.hit) dès qu’un TPx_HIT arrive
-# - Vector UP s’affiche avec pastille verte (et Telegram remplace 🟪 par 🟩)
+    for r in rows:
+        created_at, etype, symbol, direction = r[0], (r[1] or "").upper(), (r[2] or ""), (r[3] or "")
+        # Filtre temporel lax si ISO: on garde tout; Render n’a pas TZ uniforme => on ne jette rien
+        is_btc = any(tag in symbol for tag in btc_tags)
+
+        # Compter signaux impactants
+        if etype in ("VECTOR_CANDLE","TP1_HIT","TP2_HIT","TP3_HIT"):
+            total += 1
+            if is_btc: btc_hits += 1
+            else: alts_hits += 1
+
+            if etype == "VECTOR_CANDLE":
+                if (direction or "").upper() == "UP":
+                    total_up += 1
+                    if is_btc: btc_up += 1
+                    else: alts_up += 1
+            else:
+                # les TP sont pro-haussiers (signal “succès”)
+                total_up += 1
+                if is_btc: btc_up += 1
+                else: alts_up += 1
+
+    btc_dom = (btc_hits / max(total, 1)) * 100.0
+    if total == 0:
+        heat = 0.0
+    else:
+        heat = (total_up / total) * 100.0
+
+    # Scores “7j” approximés par proportion UP par univers
+    btc_7d = (btc_up / max(btc_hits, 1)) * 100.0 if btc_hits else 0.0
+    alts_7d = (alts_up / max(alts_hits, 1)) * 100.0 if alts_hits else 0.0
+    alts_btc_ratio = (alts_7d / max(btc_7d, 1e-6)) if btc_7d > 0 else (2.0 if alts_7d > 0 else 1.0)
+
+    # Phase
+    if heat > 66 and alts_btc_ratio > 1.2:
+        phase = "Altseason (forte)"
+    elif heat > 55 and alts_btc_ratio > 1.0:
+        phase = "Altseason (modérée)"
+    elif heat < 40 and btc_dom > 60:
+        phase = "BTC season"
+    else:
+        phase = "Neutre"
+
+    snap = {
+        "created_at": now_iso(),
+        "btc_dom": round(btc_dom, 2),
+        "btc_7d": round(btc_7d, 2),
+        "alts_7d": round(alts_7d, 2),
+        "alts_btc_ratio": round(alts_btc_ratio, 2),
+        "heat": round(heat, 2),
+        "phase": phase,
+    }
+    return snap
+
+def _save_altseason_snapshot(s: Dict[str,Any]) -> None:
+    db_execute("""
+        INSERT INTO altseason_snapshots (created_at, btc_dom, btc_7d, alts_7d, alts_btc_ratio, heat, phase)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        s.get("created_at"), s.get("btc_dom"), s.get("btc_7d"), s.get("alts_7d"),
+        s.get("alts_btc_ratio"), s.get("heat"), s.get("phase"),
+    ))
+
+def _latest_altseason_snapshot() -> Dict[str,Any]:
+    row = db_query("""
+        SELECT created_at, btc_dom, btc_7d, alts_7d, alts_btc_ratio, heat, phase
+        FROM altseason_snapshots
+        ORDER BY created_at DESC
+        LIMIT 1
+    """)
+    if row:
+        r = row[0]
+        return {
+            "created_at": r[0], "btc_dom": r[1], "btc_7d": r[2], "alts_7d": r[3],
+            "alts_btc_ratio": r[4], "heat": r[5], "phase": r[6]
+        }
+    # fallback
+    return {
+        "created_at": now_iso(), "btc_dom": None, "btc_7d": 0.0, "alts_7d": 0.0,
+        "alts_btc_ratio": 1.0, "heat": 0.0, "phase": "Neutre"
+    }
+
+# --- Daemon Altseason ---
+_altseason_thread: Optional[threading.Thread] = None
+_altseason_running = False
+
+def run_altseason_daemon(interval: int = ALT_INTERVAL):
+    global _altseason_running
+    if _altseason_running:
+        return
+    _altseason_running = True
+    while True:
+        try:
+            snap = _compute_altseason_snapshot()
+            _save_altseason_snapshot(snap)
+        except Exception as e:
+            log.warning(f"Altseason daemon error: {e}")
+        time.sleep(max(10, int(interval)))
+
+@app.on_event("startup")
+def _start_altseason():
+    global _altseason_thread
+    try:
+        if _altseason_thread is None or not _altseason_thread.is_alive():
+            _altseason_thread = threading.Thread(target=run_altseason_daemon, args=(ALT_INTERVAL,), daemon=True)
+            _altseason_thread.start()
+    except Exception as e:
+        log.warning(f"Unable to start altseason daemon: {e}")
+
+# --- API JSON ---
+@app.get("/api/altseason")
+def api_altseason():
+    try:
+        snap = _latest_altseason_snapshot()
+        return JSONResponse({"ok": True, "data": snap})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/api/trades")
+def api_trades(limit: int = 500):
+    try:
+        ev = _fetch_recent_events(limit=3000)
+        trades = _aggregate_trades(ev)
+        return JSONResponse({"ok": True, "data": trades[:max(10, min(limit, 1000))]})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# --- Health & accueil ---
+@app.get("/healthz")
+def healthz():
+    return JSONResponse({"ok": True, "time": now_iso()})
+
+@app.get("/")
+def root():
+    # rediriger vers le dashboard
+    return RedirectResponse(url="/trades", status_code=302)
+
+# --- 404 propre ---
+@app.exception_handler(404)
+async def not_found(request: Request, exc):
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'><title>404</title>"
+        "<style>body{font:14px system-ui;background:#0b0f14;color:#e6edf3;display:grid;place-items:center;height:100vh}"
+        ".card{background:#111723;border:1px solid #1f2937;border-radius:12px;padding:20px;max-width:560px}"
+        "a{color:#60a5fa;text-decoration:none}</style></head><body>"
+        "<div class='card'><h2>Page introuvable</h2>"
+        "<p>La ressource demandée n’existe pas. Retour au <a href='/trades'>dashboard</a>.</p>"
+        "</div></body></html>",
+        status_code=404
+    )
