@@ -33,7 +33,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "15"))
 
-# Vector icons (🟩 vert UP demandé)
+# Vector icons
 VECTOR_UP_ICON = "🟩"
 VECTOR_DN_ICON = "🟥"
 
@@ -61,7 +61,7 @@ def db_query(sql: str, params: tuple = ()) -> List[dict]:
     cur = cur.execute(sql, params)
     return list(cur.fetchall())
 
-# Schéma de base
+# Schéma (souple)
 db_execute("""
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,8 +90,6 @@ CREATE TABLE IF NOT EXISTS events (
     trade_id TEXT
 )
 """)
-
-# Index
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -120,7 +118,6 @@ def ensure_trades_schema():
     cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
     if "tf_label" not in cols:
         db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
-    # réindex au cas où
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -170,12 +167,6 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
         logger.warning(f"Telegram send error: {e}")
         return {"ok": False, "reason": str(e)}
 
-def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
-    icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
-    n = f" — {note}" if note else ""
-    return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
-
-# --- Annonces Telegram format "classique" (ENTRY détaillé) ---
 def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
     return (tf_label or tf_to_label(tf) or "").strip()
 
@@ -186,6 +177,11 @@ def _fmt_side(side: Optional[str]) -> Dict[str, str]:
     if s == "SHORT":
         return {"emoji": "📉", "label": "Short"}
     return {"emoji": "📌", "label": (side or "Side")}
+
+def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
+    icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
+    n = f" — {note}" if note else ""
+    return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
 
 def format_entry_announcement(payload: dict) -> str:
     symbol   = payload.get("symbol", "")
@@ -259,7 +255,7 @@ async def root():
     </body></html>
     """)
 # =========================
-# Save Event (insère tf_label)
+# Save Event
 # =========================
 def save_event(payload: dict):
     etype   = payload.get("type")
@@ -325,11 +321,9 @@ async def tv_webhook(req: Request):
 
     trade_id = save_event(payload)
 
-    # Envoi Telegram (format classique)
     try:
         if TELEGRAM_ENABLED:
             key = f"{etype}:{symbol}"
-
             if etype == "VECTOR_CANDLE":
                 txt = format_vector_message(
                     symbol=symbol,
@@ -339,43 +333,31 @@ async def tv_webhook(req: Request):
                     note=payload.get("note"),
                 )
                 await tg_send_text(txt, key=key)
-
             elif etype == "ENTRY":
                 txt = format_entry_announcement(payload)
                 await tg_send_text(txt, key=payload.get("trade_id") or key)
-
             elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
                 txt = format_event_announcement(etype, payload)
                 await tg_send_text(txt, key=payload.get("trade_id") or key)
-
     except Exception as e:
         logger.warning(f"Telegram send skipped due to cooldown or error: {e}")
 
     return JSONResponse({"ok": True, "trade_id": trade_id})
 
 # =========================
-# Altseason (4 signaux, sans Vectors)
+# Altseason (4 signaux, Vectors exclus)
 # =========================
 def _pct(x, y):
     try:
-        x = float(x or 0)
-        y = float(y or 0)
+        x = float(x or 0); y = float(y or 0)
         return 0.0 if y == 0 else 100.0 * x / y
     except Exception:
         return 0.0
 
 def compute_altseason_snapshot() -> dict:
-    """
-    Score 0-100 basé sur 4 signaux sur 24h :
-      A) % LONG sur les ENTRY
-      B) TP vs SL (on privilégie LONG si side présent)
-      C) Breadth: nb de symboles distincts avec un TP hit
-      D) Momentum: % d’ENTRY dans les 90 dernières minutes / total 24h
-    Vectors EXCLUS.
-    """
     t24 = ms_ago(24*60)
 
-    # A: LONG ratio
+    # A) ratio LONG
     row = db_query("""
         SELECT
           SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
@@ -387,7 +369,7 @@ def compute_altseason_snapshot() -> dict:
     short_n = (row[0]["short_n"] if row else 0) or 0
     A = _pct(long_n, long_n + short_n)
 
-    # B: TP vs SL (LONG si possible)
+    # B) TP vs SL (favorise LONG si side présent)
     row = db_query("""
       WITH tp AS (
         SELECT COUNT(*) AS n FROM events
@@ -403,15 +385,15 @@ def compute_altseason_snapshot() -> dict:
     sl_n = (row[0]["sl_n"] if row else 0) or 0
     B = _pct(tp_n, tp_n + sl_n)
 
-    # C: Breadth
+    # C) Breadth (nb de symboles distincts avec TP hit)
     row = db_query("""
       SELECT COUNT(DISTINCT symbol) AS sym_gain FROM events
       WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
     """, (t24,))
     sym_gain = (row[0]["sym_gain"] if row else 0) or 0
-    C = float(min(100.0, sym_gain * 2.0))  # 50 symboles -> 100 pts
+    C = float(min(100.0, sym_gain * 2.0))  # 50 sym -> 100
 
-    # D: Momentum (90 min / 24h)
+    # D) Momentum: % d'ENTRY dans les 90 dernières minutes / total 24h
     t90 = ms_ago(90)
     row = db_query("""
       WITH w AS (
@@ -440,50 +422,53 @@ def compute_altseason_snapshot() -> dict:
         }
     }
 # =========================
-# Aide /trades : statut & annulation
+# Helpers /trades : statut, outcome, annulation
 # =========================
 def _latest_entry_for_trade(trade_id: str) -> Optional[dict]:
-    rows = db_query("""
+    r = db_query("""
       SELECT * FROM events
       WHERE trade_id=? AND type='ENTRY'
       ORDER BY time DESC LIMIT 1
     """, (trade_id,))
-    return rows[0] if rows else None
+    return r[0] if r else None
 
-def _has_hit(trade_id: str) -> Dict[str, bool]:
+def _has_hit_map(trade_id: str) -> Dict[str, bool]:
     hits = db_query("""
-      SELECT type, MAX(time) AS t FROM events
+      SELECT type, MIN(time) AS t FROM events
       WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT','CLOSE')
       GROUP BY type
     """, (trade_id,))
-    return {r["type"]: True for r in hits}
+    return {h["type"]: True for h in hits}
 
-def _is_cancelled_due_to_opposite_after(entry_row: dict) -> bool:
-    """
-    Marque 'annulé' (orange) si APRES cette ENTRY,
-    on a une autre ENTRY sur le même symbole+tf avec side opposé.
-    """
-    symbol = entry_row.get("symbol")
-    tf     = entry_row.get("tf")
-    side   = (entry_row.get("side") or "").upper()
-    t      = entry_row.get("time") or 0
-    if not symbol or tf is None or not side:
-        return False
-    opposite = "SHORT" if side == "LONG" else ("LONG" if side == "SHORT" else "")
-    if not opposite:
-        return False
+def _first_outcome(trade_id: str) -> Optional[str]:
+    """Retourne 'TP', 'SL' ou None selon le 1er event post-entry."""
+    rows = db_query("""
+      SELECT type, time FROM events
+      WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT')
+      ORDER BY time ASC LIMIT 1
+    """, (trade_id,))
+    if not rows: return None
+    t = rows[0]["type"]
+    return "TP" if t.startswith("TP") else ("SL" if t == "SL_HIT" else None)
+
+def _cancelled_by_opposite(entry_row: dict) -> bool:
+    """Annulé (orange) si une ENTRY opposée plus récente sur même symbole+tf, avant TP/SL."""
+    symbol = entry_row.get("symbol"); tf = entry_row.get("tf")
+    side = (entry_row.get("side") or "").upper(); t = int(entry_row.get("time") or 0)
+    if not symbol or tf is None or side not in ("LONG", "SHORT"): return False
+    opposite = "SHORT" if side == "LONG" else "LONG"
     r = db_query("""
       SELECT 1 FROM events
       WHERE type='ENTRY' AND symbol=? AND tf=? AND time>? AND UPPER(COALESCE(side,''))=?
       LIMIT 1
-    """, (symbol, str(tf), int(t), opposite))
+    """, (symbol, str(tf), t, opposite))
     return bool(r)
 
 # =========================
-# /trades (TP verts, SL rouge, annulé orange)
+# Build rows + KPIs
 # =========================
 def build_trade_rows(limit=300):
-    entries = db_query("""
+    base = db_query("""
       SELECT e.trade_id, MAX(e.time) AS t_entry
       FROM events e
       WHERE e.type='ENTRY'
@@ -491,32 +476,26 @@ def build_trade_rows(limit=300):
       ORDER BY t_entry DESC
       LIMIT ?
     """, (limit,))
-
     rows: List[dict] = []
-    for x in entries:
-        e = _latest_entry_for_trade(x["trade_id"])
-        if not e:
-            continue
+    for item in base:
+        e = _latest_entry_for_trade(item["trade_id"])
+        if not e: continue
 
         tf_label = (e.get("tf_label") or tf_to_label(e.get("tf")))
-        hit = _has_hit(e["trade_id"])
-        tp1_hit, tp2_hit, tp3_hit = bool(hit.get("TP1_HIT")), bool(hit.get("TP2_HIT")), bool(hit.get("TP3_HIT"))
-        sl_hit = bool(hit.get("SL_HIT"))
-        closed = bool(hit.get("CLOSE"))
+        hm = _has_hit_map(e["trade_id"])
+        tp1_hit = bool(hm.get("TP1_HIT")); tp2_hit = bool(hm.get("TP2_HIT")); tp3_hit = bool(hm.get("TP3_HIT"))
+        sl_hit  = bool(hm.get("SL_HIT"));  closed  = bool(hm.get("CLOSE"))
 
-        cancelled = _is_cancelled_due_to_opposite_after(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
-
-        # Statut de ligne pour couleurs de fond:
-        # - rouge si SL
-        # - vert si un TP atteint
-        # - orange si annulé (changement direction)
-        row_state = "normal"
+        cancelled = _cancelled_by_opposite(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
+        # priorité couleur : SL (rouge) > TP (vert) > cancel/close (orange) > normal
         if sl_hit:
-            row_state = "sl"
+            state = "sl"
         elif tp1_hit or tp2_hit or tp3_hit:
-            row_state = "tp"
+            state = "tp"
         elif cancelled or closed:
-            row_state = "cancel"
+            state = "cancel"
+        else:
+            state = "normal"
 
         rows.append({
             "trade_id": e["trade_id"],
@@ -526,14 +505,42 @@ def build_trade_rows(limit=300):
             "entry": e["entry"],
             "tp1": e["tp1"], "tp2": e["tp2"], "tp3": e["tp3"],
             "sl": e["sl"],
-            "tp1_hit": tp1_hit,
-            "tp2_hit": tp2_hit,
-            "tp3_hit": tp3_hit,
-            "sl_hit":  sl_hit,
-            "row_state": row_state,
+            "tp1_hit": tp1_hit, "tp2_hit": tp2_hit, "tp3_hit": tp3_hit,
+            "sl_hit": sl_hit,
+            "row_state": state,
+            "t_entry": item["t_entry"],
         })
     return rows
 
+def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
+    t24 = ms_ago(24*60)
+
+    # Totaux sur 24h
+    total_trades = db_query("SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,))[0]["n"] or 0
+    tp_hits = db_query("SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?", (t24,))[0]["n"] or 0
+
+    # Winrate: 1er outcome TP vs SL (sur 24h)
+    trade_ids = [r["trade_id"] for r in db_query("SELECT DISTINCT trade_id FROM events WHERE type='ENTRY' AND time>=?", (t24,))]
+    wins = 0; losses = 0
+    for tid in trade_ids:
+        o = _first_outcome(tid)
+        if o == "TP": wins += 1
+        elif o == "SL": losses += 1
+    winrate = (wins / max(1, (wins + losses))) * 100.0
+
+    # Actifs: lignes “normal”
+    active = sum(1 for r in rows if r["row_state"] == "normal")
+
+    return {
+        "total_trades": int(total_trades),
+        "active_trades": int(active),
+        "tp_hits": int(tp_hits),
+        "winrate": round(winrate, 1),
+    }
+
+# =========================
+# /trades — UI style maquette
+# =========================
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
     try:
@@ -543,102 +550,181 @@ async def trades_page():
 
     alt = compute_altseason_snapshot()
     rows = build_trade_rows(limit=300)
+    kpi = compute_kpis(rows)
 
     css = """
     <style>
-      :root { --bg:#0b0f14; --card:#111823; --txt:#e6edf3; --muted:#94a3b8;
-              --green:#16a34a; --red:#ef4444; --warn:#f59e0b;
-              --chip:#1f2937; --chip-b:#334155; }
+      :root{
+        --bg:#0b0f14; --panel:#0f1622; --card:#121b2a; --border:#1f2a3a; --txt:#e6edf3; --muted:#a7b3c6;
+        --green:#22c55e; --green-ink:#0f5132;
+        --red:#ef4444; --red-ink:#5f1b1b;
+        --amber:#f59e0b; --amber-ink:#633d0a;
+        --chip:#0f172a; --chip-b:#253143;
+      }
+      *{box-sizing:border-box}
       body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
       .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
-      .altbox{display:flex;justify-content:space-between;align-items:center;background:var(--card);border:1px solid #1f2937;border-radius:16px;padding:16px 18px;margin-bottom:10px}
-      .altbox h2{margin:0;font-size:18px}
-      .altscore{font-weight:700;font-size:20px}
-      .altchips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px 0}
-      .chip{background:var(--chip);border:1px solid var(--chip-b);padding:6px 10px;border-radius:999px;font-size:12px;color:var(--muted)}
-      table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid #1f2937;border-radius:12px;overflow:hidden}
-      thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid #1f2937}
-      tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px}
+
+      .grid{display:grid;gap:16px}
+      .g-2{grid-template-columns:1fr 1fr}
+      .g-4{grid-template-columns:repeat(4,1fr)}
+      @media(max-width:1000px){.g-4{grid-template-columns:repeat(2,1fr)}}
+
+      .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px 18px}
+      .muted{color:var(--muted)}
+      .kpi{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
+      .kpi .t{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px}
+      .kpi .v{margin-top:6px;font-size:22px;font-weight:700}
+
+      .score{display:flex;align-items:center;justify-content:center;width:120px;height:120px;border-radius:999px;background:#f6c453;color:#000;font-size:28px;font-weight:800;margin:0 auto;border:6px solid #7a4c00}
+      .score small{display:block;font-size:11px;font-weight:600}
+
+      /* KPIs bar */
+      .metabox .title{font-size:18px;margin:0 0 6px 0}
+      .mini .kpi .v{font-size:20px}
+      .icon{font-size:16px}
+
+      /* Table */
+      table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+      thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--border)}
+      tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px;vertical-align:middle}
       tbody tr:hover{background:#0e1520}
-      .row-tp    { box-shadow: inset 4px 0 0 0 rgba(22,163,74,.8); }
-      .row-sl    { box-shadow: inset 4px 0 0 0 rgba(239,68,68,.85); }
-      .row-cancel{ box-shadow: inset 4px 0 0 0 rgba(245,158,11,.9); }
-      .tag{padding:2px 8px;border-radius:999px;border:1px solid #263246;background:#0f172a;color:#cbd5e1;font-size:12px;display:inline-block}
-      .hit{background:rgba(22,163,74,.12);border-color:rgba(22,163,74,.45);color:#86efac}
-      .sl {background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
-      .dim{color:var(--muted)}
+      .accent{width:4px}
+      .row-tp .accent{background:var(--green)}
+      .row-sl .accent{background:var(--red)}
+      .row-cancel .accent{background:var(--amber)}
+      .row-normal .accent{background:transparent}
+
+      .pill{padding:4px 10px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);color:#cbd5e1;font-size:12px;display:inline-flex;gap:6px;align-items:center}
+      .pill.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
+      .pill.sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
+      .pill.side-long{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
+      .pill.side-short{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
       .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+
+      .actions a{opacity:.9;text-decoration:none;margin-right:8px}
     </style>
     """
 
+    # Header Altseason + 4 cartes
     alt_html = f"""
-      <div class="altbox">
-        <div>
-          <h2>Indicateurs Altseason</h2>
-          <div class="dim" style="font-size:12px">Fenêtre: {alt['window_minutes']} min — 4 signaux (LONG ratio, TP vs SL, breadth, momentum récent)</div>
+      <div class="panel">
+        <div class="grid g-2" style="align-items:center">
+          <div>
+            <h2 style="margin:0 0 4px 0">Indicateurs Altseason</h2>
+            <div class="muted">Fenêtre: {alt['window_minutes']} min — 4 signaux clés</div>
+          </div>
+          <div class="score">{alt['score']}<small>/ 100</small></div>
         </div>
-        <div class="altscore">{alt['score']}/100&nbsp; {alt['label']}</div>
-      </div>
-      <div class="altchips">
-        <span class="chip">LONG ratio: {alt['signals']['long_ratio']}%</span>
-        <span class="chip">TP vs SL: {alt['signals']['tp_vs_sl']}%</span>
-        <span class="chip">Breadth: {alt['signals']['breadth_symbols']} sym.</span>
-        <span class="chip">Entrées récentes: {alt['signals']['recent_entries_ratio']}%</span>
+        <div class="grid g-4" style="margin-top:14px">
+          <div class="kpi"><div class="t"><span class="icon">📈</span> LONG Ratio</div><div class="v">{alt['signals']['long_ratio']}%</div></div>
+          <div class="kpi"><div class="t"><span class="icon">🎯</span> TP vs SL</div><div class="v">{alt['signals']['tp_vs_sl']}%</div></div>
+          <div class="kpi"><div class="t"><span class="icon">🪄</span> Breadth</div><div class="v">{alt['signals']['breadth_symbols']} sym</div></div>
+          <div class="kpi"><div class="t"><span class="icon">⚡</span> Momentum</div><div class="v">{alt['signals']['recent_entries_ratio']}%</div></div>
+        </div>
       </div>
     """
 
-    def cell_tp(val, hit):
-        if val is None:
-            return '<span class="dim">—</span>'
-        klass = "tag hit" if hit else "tag"
-        return f'<span class="{klass}">TP {val}</span>'
+    # Mini KPI bar
+    mini_html = f"""
+      <div class="grid g-4 mini" style="margin-top:16px">
+        <div class="kpi">
+          <div class="t"><span class="icon">📊</span> Total Trades</div>
+          <div class="v">{kpi['total_trades']}</div>
+        </div>
+        <div class="kpi">
+          <div class="t"><span class="icon">⚡</span> Trades Actifs</div>
+          <div class="v">{kpi['active_trades']}</div>
+        </div>
+        <div class="kpi">
+          <div class="t"><span class="icon">✅</span> TP Atteints</div>
+          <div class="v">{kpi['tp_hits']}</div>
+        </div>
+        <div class="kpi">
+          <div class="t"><span class="icon">🎯</span> Win Rate</div>
+          <div class="v">{kpi['winrate']}%</div>
+        </div>
+      </div>
+    """
 
-    def cell_sl(val, sl_hit):
+    def tp_cell(val, hit):
         if val is None:
-            return '<span class="dim">—</span>'
-        klass = "tag sl" if sl_hit else "tag"
-        return f'<span class="{klass}">SL {val}</span>'
+            return '<span class="pill muted">—</span>'
+        klass = "pill ok" if hit else "pill"
+        icon = "✅" if hit else "🎯"
+        return f'<span class="{klass}">{icon}&nbsp;{val}</span>'
+
+    def sl_cell(val, sl_hit):
+        if val is None:
+            return '<span class="pill muted">—</span>'
+        klass = "pill sl" if sl_hit else "pill"
+        icon = "⛔" if sl_hit else "❌"
+        return f'<span class="{klass}">{icon}&nbsp;{val}</span>'
+
+    def side_cell(side):
+        s = (side or "").upper()
+        if s == "LONG":
+            return '<span class="pill side-long">✅ LONG</span>'
+        if s == "SHORT":
+            return '<span class="pill side-short">🚫 SHORT</span>'
+        return '<span class="pill">—</span>'
 
     def row_class(state: str) -> str:
         return {
             "tp": "row-tp",
             "sl": "row-sl",
             "cancel": "row-cancel",
-            "normal": "",
-        }.get(state or "normal", "")
+            "normal": "row-normal",
+        }.get(state or "normal", "row-normal")
 
-    rows_html = []
+    # Tableau
+    body_rows = []
     for r in rows:
-        rows_html.append(f"""
+        body_rows.append(f"""
           <tr class="{row_class(r.get('row_state'))}">
-            <td class="mono">{(r.get('trade_id') or '')}</td>
+            <td class="accent"></td>
             <td>{r['symbol']}</td>
-            <td><span class="tag">{r['tf_label']}</span></td>
-            <td>{r.get('side') or ''}</td>
+            <td><span class="pill">{r['tf_label']}</span></td>
+            <td>{side_cell(r.get('side'))}</td>
             <td class="mono">{'' if r.get('entry') is None else r.get('entry')}</td>
-            <td>{cell_tp(r.get('tp1'), r.get('tp1_hit'))}</td>
-            <td>{cell_tp(r.get('tp2'), r.get('tp2_hit'))}</td>
-            <td>{cell_tp(r.get('tp3'), r.get('tp3_hit'))}</td>
-            <td>{cell_sl(r.get('sl'), r.get('sl_hit'))}</td>
+            <td>{tp_cell(r.get('tp1'), r.get('tp1_hit'))}</td>
+            <td>{tp_cell(r.get('tp2'), r.get('tp2_hit'))}</td>
+            <td>{tp_cell(r.get('tp3'), r.get('tp3_hit'))}</td>
+            <td>{sl_cell(r.get('sl'), r.get('sl_hit'))}</td>
+            <td class="actions"><a href="#" title="Edit">🖊️</a><a href="#" title="Delete">🗑️</a></td>
           </tr>
         """)
 
     html = f"""<!doctype html>
     <html lang="fr"><head><meta charset="utf-8"><title>Trades</title>{css}</head>
-    <body><div class="wrap">
-      {alt_html}
-      <table>
-        <thead>
-          <tr>
-            <th>Trade ID</th><th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
-            <th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows_html)}
-        </tbody>
-      </table>
-    </div></body></html>"""
+    <body>
+      <div class="wrap">
+        {alt_html}
+        {mini_html}
+        <div class="panel" style="margin-top:16px">
+          <h3 style="margin:0 0 10px 0">Historique des Trades</h3>
+          <table>
+            <thead>
+              <tr>
+                <th class="accent"></th>
+                <th>Symbole</th>
+                <th>TF</th>
+                <th>Side</th>
+                <th>Entry</th>
+                <th>TP1</th>
+                <th>TP2</th>
+                <th>TP3</th>
+                <th>SL</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(body_rows) if body_rows else '<tr><td class="accent"></td><td colspan="9" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </body></html>"""
     return HTMLResponse(content=html)
 # =========================
 # Lancement local (optionnel)
