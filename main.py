@@ -3,7 +3,7 @@ import os
 import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -33,6 +33,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "15"))
 
+# Altseason auto-notify
+ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
+ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))          # nb min de symboles avec TP
+ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))
+
+# Telegram UI (pin + bouton dashboard)
+TELEGRAM_PIN_ALTSEASON = int(os.getenv("TELEGRAM_PIN_ALTSEASON", "1"))
+TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
+TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
+TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
+
 # Vector icons
 VECTOR_UP_ICON = "🟩"
 VECTOR_DN_ICON = "🟥"
@@ -61,7 +72,7 @@ def db_query(sql: str, params: tuple = ()) -> List[dict]:
     cur = cur.execute(sql, params)
     return list(cur.fetchall())
 
-# Schéma (souple)
+# Schéma
 db_execute("""
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +129,7 @@ def ensure_trades_schema():
     cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
     if "tf_label" not in cols:
         db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
+    # réindex de sûreté
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -133,12 +145,37 @@ try:
     ensure_trades_schema()
 except Exception as e:
     logger.warning(f"ensure_trades_schema warning: {e}")
+
+# Durée lisible (ex: 1h10, 15 min, 42 s)
+def human_duration(ms: int) -> str:
+    if ms <= 0:
+        return "0s"
+    s = ms // 1000
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h{m:02d}"
+    if m > 0:
+        return f"{m} min"
+    return f"{sec} s"
 # =========================
 # Telegram
 # =========================
 _last_tg_sent: Dict[str, float] = {}
+_last_altseason_notify_ts: float = 0.0
 
-async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None):
+def _create_dashboard_button() -> Optional[dict]:
+    if not TG_BUTTONS or not TG_DASHBOARD_URL:
+        return None
+    return {
+        "inline_keyboard": [[
+            {"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}
+        ]]
+    }
+
+async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None,
+                       reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
     if not TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
 
@@ -157,12 +194,29 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
         "disable_web_page_preview": disable_web_page_preview,
         "parse_mode": "HTML",
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=payload)
             r.raise_for_status()
+            data = r.json()
             logger.info(f"Telegram sent: {text[:80]}...")
-            return {"ok": True}
+
+            if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
+                try:
+                    message_id = data["result"]["message_id"]
+                    pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+                    await client.post(pin_url, json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "message_id": message_id,
+                        "disable_notification": True
+                    })
+                except Exception as e:
+                    logger.warning(f"Pin message failed: {e}")
+
+            return {"ok": True, "result": data}
     except Exception as e:
         logger.warning(f"Telegram send error: {e}")
         return {"ok": False, "reason": str(e)}
@@ -173,16 +227,27 @@ def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
 def _fmt_side(side: Optional[str]) -> Dict[str, str]:
     s = (side or "").upper()
     if s == "LONG":
-        return {"emoji": "📈", "label": "Long"}
+        return {"emoji": "📈", "label": "LONG"}
     if s == "SHORT":
-        return {"emoji": "📉", "label": "Short"}
-    return {"emoji": "📌", "label": (side or "Side")}
+        return {"emoji": "📉", "label": "SHORT"}
+    return {"emoji": "📌", "label": (side or "Position").upper()}
+
+def _calc_rr(entry: Optional[float], sl: Optional[float], tp1: Optional[float]) -> Optional[float]:
+    try:
+        if entry is None or sl is None or tp1 is None:
+            return None
+        risk = abs(entry - sl)
+        reward = abs(tp1 - entry)
+        return round(reward / risk, 2) if risk > 0 else None
+    except Exception:
+        return None
 
 def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
     icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
     n = f" — {note}" if note else ""
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
 
+# (1) ENTRY — format FR + R/R (TP1)
 def format_entry_announcement(payload: dict) -> str:
     symbol   = payload.get("symbol", "")
     tf_lbl   = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
@@ -196,18 +261,21 @@ def format_entry_announcement(payload: dict) -> str:
     conf     = payload.get("confidence")
     note     = (payload.get("note") or "").strip()
 
+    rr = _calc_rr(entry, sl, tp1)
+    rr_text = f" (R/R: {rr:.2f})" if rr is not None else ""
+
     lines = []
-    if tp1 is not None: lines.append(f"🎯 TP1: {tp1}")
+    if tp1 is not None: lines.append(f"🎯 TP1: {tp1}{rr_text}")
     if tp2 is not None: lines.append(f"🎯 TP2: {tp2}")
     if tp3 is not None: lines.append(f"🎯 TP3: {tp3}")
     if sl  is not None: lines.append(f"❌ SL: {sl}")
 
     conf_line = ""
     if conf is not None:
-        expl = note if note else f"Le setup {side_i['label'].upper()} a un risque acceptable si le contexte le confirme."
-        conf_line = f"🧠 Confiance LLM: {conf}% — {expl}"
+        expl = note if note else "Le setup a un risque acceptable si le contexte le confirme."
+        conf_line = f"🧠 Confiance: {conf}% — {expl}"
 
-    tip_line = "🤖 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
+    tip_line = "💡 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
 
     msg = [
         f"📩 {symbol} {tf_lbl}",
@@ -219,23 +287,26 @@ def format_entry_announcement(payload: dict) -> str:
     ]
     return "\n".join([m for m in msg if m])
 
-def format_event_announcement(etype: str, payload: dict) -> str:
+# (2)(3)(4) TP/SL/CLOSE — avec durée
+def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[int]) -> str:
     symbol = payload.get("symbol", "")
     tf_lbl = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i = _fmt_side(payload.get("side"))
-    price  = payload.get("price")
     base   = f"{symbol} {tf_lbl}"
+    d_txt  = f" — Durée : {human_duration(duration_ms)}" if duration_ms is not None else ""
 
     if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
         tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
-        return f"✅ {tick} atteint — {base}\n{side_i['emoji']} {side_i['label']}" + (f" @ {price}" if price else "")
+        return f"✅ {tick} atteint — {base}\n{side_i['label'].title()}{d_txt}"
+
     if etype == "SL_HIT":
-        return f"🛑 SL touché — {base}\n{side_i['emoji']} {side_i['label']}" + (f" @ {price}" if price else "")
+        return f"🛑 SL touché — {base}\n{side_i['label'].title()}{d_txt}"
+
     if etype == "CLOSE":
         note = payload.get("note") or ""
         return f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}" + (f"\n📝 {note}" if note else "")
-    return f"ℹ️ {etype} — {base}"
 
+    return f"ℹ️ {etype} — {base}"
 # =========================
 # FastAPI
 # =========================
@@ -254,6 +325,7 @@ async def root():
       </ul>
     </body></html>
     """)
+
 # =========================
 # Save Event
 # =========================
@@ -298,6 +370,16 @@ def save_event(payload: dict):
     logger.info(f"Saved event: type={etype} symbol={symbol} tf={tf} trade_id={trade_id}")
     return trade_id
 
+def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
+    if not trade_id:
+        return None
+    r = db_query("""
+        SELECT MIN(time) AS t FROM events
+        WHERE trade_id=? AND type='ENTRY'
+    """, (trade_id,))
+    if r and r[0]["t"] is not None:
+        return int(r[0]["t"])
+    return None
 # =========================
 # Webhook
 # =========================
@@ -315,15 +397,17 @@ async def tv_webhook(req: Request):
     etype = payload.get("type")
     symbol = payload.get("symbol")
     tf = payload.get("tf")
-
     if not etype or not symbol:
         raise HTTPException(422, "Missing type or symbol")
 
+    # 1) sauver
     trade_id = save_event(payload)
 
+    # 2) notifier Telegram
     try:
         if TELEGRAM_ENABLED:
-            key = f"{etype}:{symbol}"
+            key = payload.get("trade_id") or f"{etype}:{symbol}"
+
             if etype == "VECTOR_CANDLE":
                 txt = format_vector_message(
                     symbol=symbol,
@@ -333,12 +417,21 @@ async def tv_webhook(req: Request):
                     note=payload.get("note"),
                 )
                 await tg_send_text(txt, key=key)
+
             elif etype == "ENTRY":
                 txt = format_entry_announcement(payload)
-                await tg_send_text(txt, key=payload.get("trade_id") or key)
+                await tg_send_text(txt, key=key)
+
             elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
-                txt = format_event_announcement(etype, payload)
-                await tg_send_text(txt, key=payload.get("trade_id") or key)
+                hit_time = payload.get("time") or now_ms()
+                entry_t  = get_entry_time_for_trade(payload.get("trade_id"))
+                duration = (hit_time - entry_t) if entry_t is not None else None
+                txt = format_event_announcement(etype, payload, duration)
+                await tg_send_text(txt, key=key)
+
+        # 3) altseason auto-notify opportuniste (après un event)
+        await maybe_altseason_autonotify()
+
     except Exception as e:
         logger.warning(f"Telegram send skipped due to cooldown or error: {e}")
 
@@ -357,7 +450,7 @@ def _pct(x, y):
 def compute_altseason_snapshot() -> dict:
     t24 = ms_ago(24*60)
 
-    # A) ratio LONG
+    # A) LONG ratio
     row = db_query("""
         SELECT
           SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
@@ -385,15 +478,15 @@ def compute_altseason_snapshot() -> dict:
     sl_n = (row[0]["sl_n"] if row else 0) or 0
     B = _pct(tp_n, tp_n + sl_n)
 
-    # C) Breadth (nb de symboles distincts avec TP hit)
+    # C) Breadth
     row = db_query("""
       SELECT COUNT(DISTINCT symbol) AS sym_gain FROM events
       WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
     """, (t24,))
     sym_gain = (row[0]["sym_gain"] if row else 0) or 0
-    C = float(min(100.0, sym_gain * 2.0))  # 50 sym -> 100
+    C = float(min(100.0, sym_gain * 2.0))
 
-    # D) Momentum: % d'ENTRY dans les 90 dernières minutes / total 24h
+    # D) Momentum (90 min / 24h)
     t90 = ms_ago(90)
     row = db_query("""
       WITH w AS (
@@ -421,6 +514,42 @@ def compute_altseason_snapshot() -> dict:
             "recent_entries_ratio": round(D, 1),
         }
     }
+
+async def maybe_altseason_autonotify():
+    """Envoie l'alerte altseason auto (épinglée) si seuils OK + cooldown."""
+    global _last_altseason_notify_ts
+    if not ALTSEASON_AUTONOTIFY or not TELEGRAM_ENABLED:
+        return
+
+    alt = compute_altseason_snapshot()
+    greens = alt["signals"]["breadth_symbols"]
+    now = datetime.now().timestamp()
+    if greens < ALT_GREENS_REQUIRED or alt["score"] < 50:
+        return
+    if (now - _last_altseason_notify_ts) < (ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
+        return
+
+    emoji = "🟢" if alt["score"] >= 75 else "🟡"
+    msg = f"""🚨 <b>Alerte Altseason Automatique</b> {emoji}
+
+📊 <b>Score: {alt['score']}/100</b>
+📈 Status: <b>{alt['label']}</b>
+
+🔥 <b>Signaux détectés</b>:
+• Ratio LONG: {alt['signals']['long_ratio']}%
+• TP vs SL: {alt['signals']['tp_vs_sl']}%
+• Breadth: {alt['signals']['breadth_symbols']} symboles
+• Momentum: {alt['signals']['recent_entries_ratio']}%
+
+⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {ALT_GREENS_REQUIRED})
+
+<i>Notification automatique activée</i>"""
+
+    reply_markup = _create_dashboard_button()
+    res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
+    if res.get("ok"):
+        _last_altseason_notify_ts = now
+
 # =========================
 # Helpers /trades : statut, outcome, annulation
 # =========================
@@ -441,7 +570,6 @@ def _has_hit_map(trade_id: str) -> Dict[str, bool]:
     return {h["type"]: True for h in hits}
 
 def _first_outcome(trade_id: str) -> Optional[str]:
-    """Retourne 'TP', 'SL' ou None selon le 1er event post-entry."""
     rows = db_query("""
       SELECT type, time FROM events
       WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT')
@@ -452,7 +580,6 @@ def _first_outcome(trade_id: str) -> Optional[str]:
     return "TP" if t.startswith("TP") else ("SL" if t == "SL_HIT" else None)
 
 def _cancelled_by_opposite(entry_row: dict) -> bool:
-    """Annulé (orange) si une ENTRY opposée plus récente sur même symbole+tf, avant TP/SL."""
     symbol = entry_row.get("symbol"); tf = entry_row.get("tf")
     side = (entry_row.get("side") or "").upper(); t = int(entry_row.get("time") or 0)
     if not symbol or tf is None or side not in ("LONG", "SHORT"): return False
@@ -463,7 +590,6 @@ def _cancelled_by_opposite(entry_row: dict) -> bool:
       LIMIT 1
     """, (symbol, str(tf), t, opposite))
     return bool(r)
-
 # =========================
 # Build rows + KPIs
 # =========================
@@ -487,7 +613,6 @@ def build_trade_rows(limit=300):
         sl_hit  = bool(hm.get("SL_HIT"));  closed  = bool(hm.get("CLOSE"))
 
         cancelled = _cancelled_by_opposite(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
-        # priorité couleur : SL (rouge) > TP (vert) > cancel/close (orange) > normal
         if sl_hit:
             state = "sl"
         elif tp1_hit or tp2_hit or tp3_hit:
@@ -515,12 +640,16 @@ def build_trade_rows(limit=300):
 def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
     t24 = ms_ago(24*60)
 
-    # Totaux sur 24h
-    total_trades = db_query("SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,))[0]["n"] or 0
-    tp_hits = db_query("SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?", (t24,))[0]["n"] or 0
+    total_trades = db_query(
+        "SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,)
+    )[0]["n"] or 0
+    tp_hits = db_query(
+        "SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?", (t24,)
+    )[0]["n"] or 0
 
-    # Winrate: 1er outcome TP vs SL (sur 24h)
-    trade_ids = [r["trade_id"] for r in db_query("SELECT DISTINCT trade_id FROM events WHERE type='ENTRY' AND time>=?", (t24,))]
+    trade_ids = [r["trade_id"] for r in db_query(
+        "SELECT DISTINCT trade_id FROM events WHERE type='ENTRY' AND time>=?", (t24,)
+    )]
     wins = 0; losses = 0
     for tid in trade_ids:
         o = _first_outcome(tid)
@@ -528,7 +657,6 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
         elif o == "SL": losses += 1
     winrate = (wins / max(1, (wins + losses))) * 100.0
 
-    # Actifs: lignes “normal”
     active = sum(1 for r in rows if r["row_state"] == "normal")
 
     return {
@@ -539,7 +667,7 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
     }
 
 # =========================
-# /trades — UI style maquette
+# /trades — UI
 # =========================
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
@@ -556,9 +684,7 @@ async def trades_page():
     <style>
       :root{
         --bg:#0b0f14; --panel:#0f1622; --card:#121b2a; --border:#1f2a3a; --txt:#e6edf3; --muted:#a7b3c6;
-        --green:#22c55e; --green-ink:#0f5132;
-        --red:#ef4444; --red-ink:#5f1b1b;
-        --amber:#f59e0b; --amber-ink:#633d0a;
+        --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
         --chip:#0f172a; --chip-b:#253143;
       }
       *{box-sizing:border-box}
@@ -575,16 +701,9 @@ async def trades_page():
       .kpi{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
       .kpi .t{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px}
       .kpi .v{margin-top:6px;font-size:22px;font-weight:700}
-
       .score{display:flex;align-items:center;justify-content:center;width:120px;height:120px;border-radius:999px;background:#f6c453;color:#000;font-size:28px;font-weight:800;margin:0 auto;border:6px solid #7a4c00}
       .score small{display:block;font-size:11px;font-weight:600}
 
-      /* KPIs bar */
-      .metabox .title{font-size:18px;margin:0 0 6px 0}
-      .mini .kpi .v{font-size:20px}
-      .icon{font-size:16px}
-
-      /* Table */
       table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
       thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--border)}
       tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px;vertical-align:middle}
@@ -601,12 +720,10 @@ async def trades_page():
       .pill.side-long{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
       .pill.side-short{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
       .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-
       .actions a{opacity:.9;text-decoration:none;margin-right:8px}
     </style>
     """
 
-    # Header Altseason + 4 cartes
     alt_html = f"""
       <div class="panel">
         <div class="grid g-2" style="align-items:center">
@@ -617,33 +734,20 @@ async def trades_page():
           <div class="score">{alt['score']}<small>/ 100</small></div>
         </div>
         <div class="grid g-4" style="margin-top:14px">
-          <div class="kpi"><div class="t"><span class="icon">📈</span> LONG Ratio</div><div class="v">{alt['signals']['long_ratio']}%</div></div>
-          <div class="kpi"><div class="t"><span class="icon">🎯</span> TP vs SL</div><div class="v">{alt['signals']['tp_vs_sl']}%</div></div>
-          <div class="kpi"><div class="t"><span class="icon">🪄</span> Breadth</div><div class="v">{alt['signals']['breadth_symbols']} sym</div></div>
-          <div class="kpi"><div class="t"><span class="icon">⚡</span> Momentum</div><div class="v">{alt['signals']['recent_entries_ratio']}%</div></div>
+          <div class="kpi"><div class="t">📈 LONG Ratio</div><div class="v">{alt['signals']['long_ratio']}%</div></div>
+          <div class="kpi"><div class="t">🎯 TP vs SL</div><div class="v">{alt['signals']['tp_vs_sl']}%</div></div>
+          <div class="kpi"><div class="t">🪄 Breadth</div><div class="v">{alt['signals']['breadth_symbols']} sym</div></div>
+          <div class="kpi"><div class="t">⚡ Momentum</div><div class="v">{alt['signals']['recent_entries_ratio']}%</div></div>
         </div>
       </div>
     """
 
-    # Mini KPI bar
     mini_html = f"""
-      <div class="grid g-4 mini" style="margin-top:16px">
-        <div class="kpi">
-          <div class="t"><span class="icon">📊</span> Total Trades</div>
-          <div class="v">{kpi['total_trades']}</div>
-        </div>
-        <div class="kpi">
-          <div class="t"><span class="icon">⚡</span> Trades Actifs</div>
-          <div class="v">{kpi['active_trades']}</div>
-        </div>
-        <div class="kpi">
-          <div class="t"><span class="icon">✅</span> TP Atteints</div>
-          <div class="v">{kpi['tp_hits']}</div>
-        </div>
-        <div class="kpi">
-          <div class="t"><span class="icon">🎯</span> Win Rate</div>
-          <div class="v">{kpi['winrate']}%</div>
-        </div>
+      <div class="grid g-4" style="margin-top:16px">
+        <div class="kpi"><div class="t">📊 Total Trades</div><div class="v">{kpi['total_trades']}</div></div>
+        <div class="kpi"><div class="t">⚡ Trades Actifs</div><div class="v">{kpi['active_trades']}</div></div>
+        <div class="kpi"><div class="t">✅ TP Atteints</div><div class="v">{kpi['tp_hits']}</div></div>
+        <div class="kpi"><div class="t">🎯 Win Rate</div><div class="v">{kpi['winrate']}%</div></div>
       </div>
     """
 
@@ -677,7 +781,6 @@ async def trades_page():
             "normal": "row-normal",
         }.get(state or "normal", "row-normal")
 
-    # Tableau
     body_rows = []
     for r in rows:
         body_rows.append(f"""
@@ -726,6 +829,7 @@ async def trades_page():
       </div>
     </body></html>"""
     return HTMLResponse(content=html)
+
 # =========================
 # Lancement local (optionnel)
 # =========================
