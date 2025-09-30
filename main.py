@@ -1,27 +1,163 @@
-📈 LONG Entry: 0.08493
-💡Leverage: 15x cross
-🎯 TP1: 0.0868916312...
-INFO:httpx:HTTP Request: POST https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage "HTTP/1.1 429 Too Many Requests"
-INFO:httpx:HTTP Request: POST https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage "HTTP/1.1 429 Too Many Requests"
-INFO:httpx:HTTP Request: POST https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage "HTTP/1.1 429 Too Many Requests"
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-INFO:httpx:HTTP Request: POST https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage "HTTP/1.1 429 Too Many Requests"
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-WARNING:aitrader:Telegram send error: Client error '429 Too Many Requests' for url 'https://api.telegram.org/bot8478131465:AAEh7Z0rvIqSNvn1wKdtkMNb-O96h41LCns/sendMessage'
-For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
-INFO:     10.204.155.5:0 - "GET /trades HTTP/1.1" 200 OK
-     ==> Detected service running on port 8000
-     ==> Docs on specifying a port: https://render.com/docs/web-services#port-binding
-INFO:     10.204.8.241:0 - "GET /trades HTTP/1.1" 200 OK
-                                                                          
+# main.py
+import os
+import sqlite3
+import logging
+import asyncio
+import time
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+
+import httpx
+
+# =========================
+# Logging
+# =========================
+logger = logging.getLogger("aitrader")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+# =========================
+# Config / Env
+# =========================
+DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
+DB_PATH = os.path.join(DB_DIR, "data.db")
+os.makedirs(DB_DIR, exist_ok=True)
+logger.info(f"DB dir OK: {DB_DIR} (using {DB_PATH})")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg")
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "10.0"))
+TG_PER_MIN_LIMIT = int(os.getenv("TG_PER_MIN_LIMIT", "10"))
+
+ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
+ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))
+ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))
+
+TELEGRAM_PIN_ALTSEASON = int(os.getenv("TELEGRAM_PIN_ALTSEASON", "1"))
+TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
+TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
+TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
+
+VECTOR_UP_ICON = "🟩"
+VECTOR_DN_ICON = "🟥"
+VECTOR_GLOBAL_GAP_SEC = int(os.getenv("VECTOR_GLOBAL_GAP_SEC", "10"))
+
+# =========================
+# SQLite
+# =========================
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB.row_factory = dict_factory
+logger.info(f"DB initialized at {DB_PATH}")
+
+def db_execute(sql: str, params: tuple = ()):
+    cur = DB.cursor()
+    cur.execute(sql, params)
+    DB.commit()
+    return cur
+
+def db_query(sql: str, params: tuple = ()) -> List[dict]:
+    cur = DB.cursor()
+    cur = cur.execute(sql, params)
+    return list(cur.fetchall())
+
+db_execute("""
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT,
+    symbol TEXT,
+    tf TEXT,
+    tf_label TEXT,
+    time INTEGER,
+    side TEXT,
+    entry REAL,
+    sl REAL,
+    tp1 REAL,
+    tp2 REAL,
+    tp3 REAL,
+    r1 REAL,
+    s1 REAL,
+    lev_reco REAL,
+    qty_reco REAL,
+    notional REAL,
+    confidence INTEGER,
+    horizon TEXT,
+    leverage TEXT,
+    note TEXT,
+    price REAL,
+    direction TEXT,
+    trade_id TEXT
+)
+""")
+db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
+db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
+db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
+db_execute("CREATE INDEX IF NOT EXISTS idx_events_symbol_tf ON events(symbol, tf)")
+
+# =========================
+# Utils
+# =========================
+def tf_to_label(tf: Any) -> str:
+    if tf is None:
+        return ""
+    s = str(tf)
+    try:
+        n = int(s)
+    except Exception:
+        return s
+    if n < 60:
+        return f"{n}m"
+    if n == 60:
+        return "1h"
+    if n % 60 == 0:
+        return f"{n//60}h"
+    return s
+
+def ensure_trades_schema():
+    cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
+    if "tf_label" not in cols:
+        db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
+    db_execute("CREATE INDEX IF NOT EXISTS idx_events_symbol_tf ON events(symbol, tf)")
+
+def now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def ms_ago(minutes: int) -> int:
+    return int((datetime.now(timezone.utc) - timedelta(minutes=minutes)).timestamp() * 1000)
+
+try:
+    ensure_trades_schema()
+except Exception as e:
+    logger.warning(f"ensure_trades_schema warning: {e}")
+
+def human_duration_verbose(ms: int) -> str:
+    if ms <= 0:
+        return "0 s"
+    s = ms // 1000
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h} h {m} min"
+    if m > 0:
+        return f"{m} min {sec} s"
+    return f"{sec} s"                                                                 
 # =========================
 # Telegram
 # =========================
@@ -1051,3 +1187,4 @@ async def trades_page():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+
