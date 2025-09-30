@@ -152,19 +152,22 @@ try:
 except Exception as e:
     logger.warning(f"ensure_trades_schema warning: {e}")
 
-# Durée lisible (ex: 1h10, 15 min, 42 s)
-def human_duration(ms: int) -> str:
+# Durée FR (ex: "1 heure 10 minutes", "15 minutes 42 secondes", "0 seconde")
+def human_duration_verbose(ms: int) -> str:
     if ms <= 0:
-        return "0s"
+        return "0 seconde"
     s = ms // 1000
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
+    parts = []
     if h > 0:
-        return f"{h}h{m:02d}"
+        parts.append(f"{h} heure" + ("s" if h > 1 else ""))
     if m > 0:
-        return f"{m} min"
-    return f"{sec} s"
+        parts.append(f"{m} minute" + ("s" if m > 1 else ""))
+    if sec > 0 and h == 0:  # pour ne pas faire trop verbeux si > 1h
+        parts.append(f"{sec} seconde" + ("s" if sec > 1 else ""))
+    return " ".join(parts) or "0 seconde"
 # =========================
 # Telegram (worker + helpers)
 # =========================
@@ -180,15 +183,9 @@ _httpx_client: Optional[httpx.AsyncClient] = None
 def _create_dashboard_button() -> Optional[dict]:
     if not TG_BUTTONS or not TG_DASHBOARD_URL:
         return None
-    return {
-        "inline_keyboard": [[
-            {"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}
-        ]]
-    }
+    return {"inline_keyboard": [[{"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}]]}
 
 async def _telegram_worker():
-    """Worker unique qui envoie les messages un par un, respecte un délai global
-    et gère les 429 (retry_after)."""
     global _last_sent_ts, _httpx_client
     _httpx_client = httpx.AsyncClient(timeout=10)
     try:
@@ -196,11 +193,9 @@ async def _telegram_worker():
             job = await _send_queue.get()
             payload = job["payload"]
             pin = job.get("pin", False)
-            tries = 0
             backoff = TG_RETRY_BACKOFF_BASE
 
             while True:
-                # rate limit global
                 now = time.time()
                 delta = now - _last_sent_ts
                 if delta < TG_MIN_DELAY_SEC:
@@ -220,8 +215,6 @@ async def _telegram_worker():
                             pass
                         logger.warning(f"Telegram 429: retry_after={ra}s")
                         await asyncio.sleep(max(ra, TG_MIN_DELAY_SEC))
-                        tries += 1
-                        backoff = max(backoff * 1.2, TG_RETRY_BACKOFF_BASE)
                         continue
 
                     r.raise_for_status()
@@ -229,7 +222,6 @@ async def _telegram_worker():
                     data = r.json()
                     logger.info(f"Telegram sent: {str(payload.get('text',''))[:80]}...")
 
-                    # Pin si demandé
                     if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
                         try:
                             mid = data["result"]["message_id"]
@@ -243,12 +235,10 @@ async def _telegram_worker():
 
                 except httpx.HTTPStatusError as e:
                     logger.warning(f"Telegram HTTP error: {e}")
-                    tries += 1
                     await asyncio.sleep(min(60, backoff))
                     backoff *= 2
                 except Exception as e:
                     logger.warning(f"Telegram send exception: {e}")
-                    tries += 1
                     await asyncio.sleep(min(60, backoff))
                     backoff *= 2
 
@@ -257,14 +247,9 @@ async def _telegram_worker():
         if _httpx_client is not None:
             await _httpx_client.aclose()
 
-async def tg_send_text(
-    text: str,
-    disable_web_page_preview: bool = True,
-    key: Optional[str] = None,
-    reply_markup: Optional[dict] = None,
-    pin: bool = False
-) -> Dict[str, Any]:
-    """Place le message en file ; anti-spam par clé + anti-doublons."""
+async def tg_send_text(text: str, disable_web_page_preview: bool = True,
+                       key: Optional[str] = None, reply_markup: Optional[dict] = None,
+                       pin: bool = False) -> Dict[str, Any]:
     if not TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
 
@@ -276,7 +261,7 @@ async def tg_send_text(
         return {"ok": False, "reason": "cooldown"}
     _last_tg_sent[k] = now
 
-    # Anti-doublon (contenu identique dans les 10s)
+    # anti-doublon sur 10s
     h = f"{hash(text)}"
     if now - _last_msg_dedupe.get(h, 0) < 10:
         logger.warning("Telegram skipped duplicate text")
@@ -316,13 +301,62 @@ def _calc_rr(entry: Optional[float], sl: Optional[float], tp1: Optional[float]) 
     except Exception:
         return None
 
-def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
+def _parse_leverage(leverage: Optional[str]) -> Optional[float]:
+    if not leverage:
+        return None
+    try:
+        # formats possibles: "15x cross", "10x", "20"
+        s = str(leverage).lower().split()[0].replace("x", "")
+        return float(s)
+    except Exception:
+        return None
+
+def _confidence_dynamic(payload: dict) -> Dict[str, Any]:
+    """Calcule une confiance 0-100 + explication, basée sur R/R, momentum, breadth, levier."""
+    entry = payload.get("entry"); sl = payload.get("sl"); tp1 = payload.get("tp1")
+    rr = _calc_rr(entry, sl, tp1) or 1.0
+    lev = _parse_leverage(payload.get("leverage") or payload.get("lev_reco"))
+
+    # Snapshot global
+    alt = compute_altseason_snapshot()
+    momentum_pct = float(alt["signals"]["recent_entries_ratio"])  # 0..100
+    breadth_sym = int(alt["signals"]["breadth_symbols"])          # nombre de sym en TP 24h
+
+    # Normalisations
+    rr_f = min(max(rr / 2.0, 0.0), 1.0)                 # rr 2.0 => 1.0
+    mom_f = min(max(momentum_pct / 100.0, 0.0), 1.0)
+    breadth_f = min(breadth_sym / 20.0, 1.0)            # cap à 20 symboles
+    lev_penalty = 0.0
+    if lev:
+        # >20x pénalise fort, 10-20 pénalise léger
+        lev_penalty = 0.25 if lev >= 20 else (0.10 if lev >= 10 else 0.0)
+
+    # Pondérations
+    score = (
+        0.45 * rr_f +
+        0.30 * mom_f +
+        0.20 * breadth_f -
+        lev_penalty
+    )
+    pct = int(min(max(round(score * 100), 1), 98))
+    # Raison courte et claire
+    reason = f"Basée sur R/R={rr:.2f}, momentum={momentum_pct:.0f}%, breadth={breadth_sym} sym" + (f", lev={int(lev)}x" if lev else "")
+    return {"pct": pct, "reason": reason}
+
+def _append_elapsed(text: str, elapsed_ms: Optional[int]) -> str:
+    if elapsed_ms is None:
+        return text
+    return text + f"\n\n⏱ <i>Temps écoulé :</i> {human_duration_verbose(elapsed_ms)}"
+
+def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any,
+                          note: Optional[str] = None, elapsed_ms: Optional[int] = None) -> str:
     icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
     n = f" — {note}" if note else ""
-    return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
+    base = f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
+    return _append_elapsed(base, elapsed_ms)
 
-# (1) ENTRY — format FR + R/R (TP1)
-def format_entry_announcement(payload: dict) -> str:
+# ENTRY — FR + R/R + confiance dynamique si besoin
+def format_entry_announcement(payload: dict, elapsed_ms: Optional[int]) -> str:
     symbol   = payload.get("symbol", "")
     tf_lbl   = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i   = _fmt_side(payload.get("side"))
@@ -332,7 +366,7 @@ def format_entry_announcement(payload: dict) -> str:
     tp3      = payload.get("tp3")
     sl       = payload.get("sl")
     leverage = payload.get("leverage") or payload.get("lev_reco") or ""
-    conf     = payload.get("confidence")
+    conf_in  = payload.get("confidence")
     note     = (payload.get("note") or "").strip()
 
     rr = _calc_rr(entry, sl, tp1)
@@ -344,10 +378,14 @@ def format_entry_announcement(payload: dict) -> str:
     if tp3 is not None: lines.append(f"🎯 TP3: {tp3}")
     if sl  is not None: lines.append(f"❌ SL: {sl}")
 
+    # Confiance: si non fournie ou toujours 69, on calcule
     conf_line = ""
-    if conf is not None:
-        expl = note if note else "Le setup a un risque acceptable si le contexte le confirme."
-        conf_line = f"🧠 Confiance: {conf}% — {expl}"
+    if conf_in is None or int(conf_in) == 69:
+        dyn = _confidence_dynamic(payload)
+        conf_line = f"🧠 Confiance: {dyn['pct']}% — {dyn['reason']}."
+    else:
+        expl = note if note else "Estimation selon le setup et le contexte."
+        conf_line = f"🧠 Confiance: {int(conf_in)}% — {expl}"
 
     tip_line = "💡 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
 
@@ -359,15 +397,15 @@ def format_entry_announcement(payload: dict) -> str:
         conf_line,
         tip_line,
     ]
-    return "\n".join([m for m in msg if m])
+    return _append_elapsed("\n".join([m for m in msg if m]), elapsed_ms)
 
-# (2)(3)(4) TP/SL/CLOSE — avec durée
+# TP/SL/CLOSE — avec durée
 def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[int]) -> str:
     symbol = payload.get("symbol", "")
     tf_lbl = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i = _fmt_side(payload.get("side"))
     base   = f"{symbol} {tf_lbl}"
-    d_txt  = f" — Durée : {human_duration(duration_ms)}" if duration_ms is not None else ""
+    d_txt  = f" — Durée : {human_duration_verbose(duration_ms)}" if duration_ms is not None else ""
 
     if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
         tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
@@ -378,9 +416,9 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
 
     if etype == "CLOSE":
         note = payload.get("note") or ""
-        return f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}" + (f"\n📝 {note}" if note else "")
+        return f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}" + (f"\n📝 {note}" if note else "") + (d_txt or "")
 
-    return f"ℹ️ {etype} — {base}"
+    return f"ℹ️ {etype} — {base}" + (d_txt or "")
 # =========================
 # FastAPI
 # =========================
@@ -388,7 +426,6 @@ app = FastAPI(title="AI Trader", version="1.0")
 
 @app.on_event("startup")
 async def _startup_worker():
-    # Lance le worker d'envoi Telegram
     if TELEGRAM_ENABLED:
         asyncio.create_task(_telegram_worker())
 
@@ -460,6 +497,17 @@ def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
     if r and r[0]["t"] is not None:
         return int(r[0]["t"])
     return None
+
+def get_latest_entry_time_for_symbol_tf(symbol: str, tf: Any) -> Optional[int]:
+    """Dernier ENTRY pour (symbol, tf) avant maintenant."""
+    rows = db_query("""
+        SELECT time FROM events
+        WHERE type='ENTRY' AND symbol=? AND tf=?
+        ORDER BY time DESC LIMIT 1
+    """, (symbol, str(tf) if tf is not None else None))
+    if rows:
+        return int(rows[0]["time"])
+    return None
 # =========================
 # Webhook
 # =========================
@@ -489,7 +537,6 @@ async def tv_webhook(req: Request):
             key = payload.get("trade_id") or f"{etype}:{symbol}"
 
             if etype == "VECTOR_CANDLE":
-                # Throttle par symbole+tf pour éviter les rafales
                 tf_label = payload.get("tf_label") or tf_to_label(tf)
                 key_vec = f"{symbol}:{tf_label}"
                 now = time.time()
@@ -498,17 +545,23 @@ async def tv_webhook(req: Request):
                     logger.info(f"Skip VECTOR_CANDLE burst for {key_vec}")
                 else:
                     _vector_last_sent[key_vec] = now
+                    # temps écoulé depuis le dernier ENTRY (si dispo)
+                    entry_t = get_latest_entry_time_for_symbol_tf(symbol, tf)
+                    elapsed = (now_ms() - entry_t) if entry_t is not None else None
+
                     txt = format_vector_message(
                         symbol=symbol,
                         tf_label=tf_label,
                         direction=(payload.get("direction") or ""),
                         price=payload.get("price"),
                         note=payload.get("note"),
+                        elapsed_ms=elapsed,
                     )
                     await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
             elif etype == "ENTRY":
-                txt = format_entry_announcement(payload)
+                # ENTRY → elapsed = 0
+                txt = format_entry_announcement(payload, elapsed_ms=0)
                 await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
             elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
@@ -518,7 +571,7 @@ async def tv_webhook(req: Request):
                 txt = format_event_announcement(etype, payload, duration)
                 await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
-        # 3) altseason auto-notify opportuniste (après un event)
+        # 3) altseason auto-notify (après un event)
         await maybe_altseason_autonotify()
 
     except Exception as e:
@@ -549,7 +602,7 @@ def compute_altseason_snapshot() -> dict:
     """, (t24,))
     long_n = (row[0]["long_n"] if row else 0) or 0
     short_n = (row[0]["short_n"] if row else 0) or 0
-    A = _pct(long_n, long_n + short_n)
+    A = _pct(long_n, (long_n + short_n))
 
     # B) TP vs SL (favorise LONG si side présent)
     row = db_query("""
@@ -565,7 +618,7 @@ def compute_altseason_snapshot() -> dict:
     """, (t24, t24))
     tp_n = (row[0]["tp_n"] if row else 0) or 0
     sl_n = (row[0]["sl_n"] if row else 0) or 0
-    B = _pct(tp_n, tp_n + sl_n)
+    B = _pct(tp_n, (tp_n + sl_n))
 
     # C) Breadth
     row = db_query("""
@@ -605,7 +658,6 @@ def compute_altseason_snapshot() -> dict:
     }
 
 async def maybe_altseason_autonotify():
-    """Envoie l'alerte altseason auto (épinglée) si seuils OK + cooldown."""
     global _last_altseason_notify_ts
     if not ALTSEASON_AUTONOTIFY or not TELEGRAM_ENABLED:
         return
@@ -629,8 +681,6 @@ async def maybe_altseason_autonotify():
 • TP vs SL: {alt['signals']['tp_vs_sl']}%
 • Breadth: {alt['signals']['breadth_symbols']} symboles
 • Momentum: {alt['signals']['recent_entries_ratio']}%
-
-⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {ALT_GREENS_REQUIRED})
 
 <i>Notification automatique activée</i>"""
 
@@ -779,12 +829,10 @@ async def trades_page():
       *{box-sizing:border-box}
       body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
       .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
-
       .grid{display:grid;gap:16px}
       .g-2{grid-template-columns:1fr 1fr}
       .g-4{grid-template-columns:repeat(4,1fr)}
       @media(max-width:1000px){.g-4{grid-template-columns:repeat(2,1fr)}}
-
       .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px 18px}
       .muted{color:var(--muted)}
       .kpi{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
@@ -792,7 +840,6 @@ async def trades_page():
       .kpi .v{margin-top:6px;font-size:22px;font-weight:700}
       .score{display:flex;align-items:center;justify-content:center;width:120px;height:120px;border-radius:999px;background:#f6c453;color:#000;font-size:28px;font-weight:800;margin:0 auto;border:6px solid #7a4c00}
       .score small{display:block;font-size:11px;font-weight:600}
-
       table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
       thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--border)}
       tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px;vertical-align:middle}
@@ -802,7 +849,6 @@ async def trades_page():
       .row-sl .accent{background:var(--red)}
       .row-cancel .accent{background:var(--amber)}
       .row-normal .accent{background:transparent}
-
       .pill{padding:4px 10px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);color:#cbd5e1;font-size:12px;display:inline-flex;gap:6px;align-items:center}
       .pill.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
       .pill.sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
