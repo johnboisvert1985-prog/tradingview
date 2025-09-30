@@ -2,6 +2,8 @@
 import os
 import sqlite3
 import logging
+import asyncio
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +35,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "15"))
 
+# Rate-limit global worker
+TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "1.1"))  # ~1 msg / 1.1s
+TG_RETRY_BACKOFF_BASE = float(os.getenv("TG_RETRY_BACKOFF_BASE", "1.5"))
+
 # Altseason auto-notify
 ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
 ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))          # nb min de symboles avec TP
@@ -44,9 +50,10 @@ TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
 TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
 TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
 
-# Vector icons
+# Vector icons + throttling
 VECTOR_UP_ICON = "🟩"
 VECTOR_DN_ICON = "🟥"
+VECTOR_MIN_GAP_SEC = int(os.getenv("VECTOR_MIN_GAP_SEC", "120"))
 
 # =========================
 # SQLite
@@ -129,7 +136,6 @@ def ensure_trades_schema():
     cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
     if "tf_label" not in cols:
         db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
-    # réindex de sûreté
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -160,10 +166,16 @@ def human_duration(ms: int) -> str:
         return f"{m} min"
     return f"{sec} s"
 # =========================
-# Telegram
+# Telegram (worker + helpers)
 # =========================
 _last_tg_sent: Dict[str, float] = {}
+_last_msg_dedupe: Dict[str, float] = {}
 _last_altseason_notify_ts: float = 0.0
+_vector_last_sent: Dict[str, float] = {}
+
+_send_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+_last_sent_ts: float = 0.0
+_httpx_client: Optional[httpx.AsyncClient] = None
 
 def _create_dashboard_button() -> Optional[dict]:
     if not TG_BUTTONS or not TG_DASHBOARD_URL:
@@ -174,20 +186,103 @@ def _create_dashboard_button() -> Optional[dict]:
         ]]
     }
 
-async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None,
-                       reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
+async def _telegram_worker():
+    """Worker unique qui envoie les messages un par un, respecte un délai global
+    et gère les 429 (retry_after)."""
+    global _last_sent_ts, _httpx_client
+    _httpx_client = httpx.AsyncClient(timeout=10)
+    try:
+        while True:
+            job = await _send_queue.get()
+            payload = job["payload"]
+            pin = job.get("pin", False)
+            tries = 0
+            backoff = TG_RETRY_BACKOFF_BASE
+
+            while True:
+                # rate limit global
+                now = time.time()
+                delta = now - _last_sent_ts
+                if delta < TG_MIN_DELAY_SEC:
+                    await asyncio.sleep(TG_MIN_DELAY_SEC - delta)
+
+                try:
+                    r = await _httpx_client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json=payload
+                    )
+                    if r.status_code == 429:
+                        ra = 1.0
+                        try:
+                            data = r.json()
+                            ra = float(data.get("parameters", {}).get("retry_after", 1.0))
+                        except Exception:
+                            pass
+                        logger.warning(f"Telegram 429: retry_after={ra}s")
+                        await asyncio.sleep(max(ra, TG_MIN_DELAY_SEC))
+                        tries += 1
+                        backoff = max(backoff * 1.2, TG_RETRY_BACKOFF_BASE)
+                        continue
+
+                    r.raise_for_status()
+                    _last_sent_ts = time.time()
+                    data = r.json()
+                    logger.info(f"Telegram sent: {str(payload.get('text',''))[:80]}...")
+
+                    # Pin si demandé
+                    if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
+                        try:
+                            mid = data["result"]["message_id"]
+                            await _httpx_client.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage",
+                                json={"chat_id": TELEGRAM_CHAT_ID, "message_id": mid, "disable_notification": True}
+                            )
+                        except Exception as e:
+                            logger.warning(f"Pin message failed: {e}")
+                    break
+
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"Telegram HTTP error: {e}")
+                    tries += 1
+                    await asyncio.sleep(min(60, backoff))
+                    backoff *= 2
+                except Exception as e:
+                    logger.warning(f"Telegram send exception: {e}")
+                    tries += 1
+                    await asyncio.sleep(min(60, backoff))
+                    backoff *= 2
+
+            _send_queue.task_done()
+    finally:
+        if _httpx_client is not None:
+            await _httpx_client.aclose()
+
+async def tg_send_text(
+    text: str,
+    disable_web_page_preview: bool = True,
+    key: Optional[str] = None,
+    reply_markup: Optional[dict] = None,
+    pin: bool = False
+) -> Dict[str, Any]:
+    """Place le message en file ; anti-spam par clé + anti-doublons."""
     if not TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
 
     k = key or "default"
-    now = datetime.now().timestamp()
+    now = time.time()
     last = _last_tg_sent.get(k, 0)
     if now - last < TELEGRAM_COOLDOWN_SEC:
-        logger.warning("Telegram send skipped due to cooldown")
+        logger.warning(f"Telegram skipped by per-key cooldown for key={k}")
         return {"ok": False, "reason": "cooldown"}
     _last_tg_sent[k] = now
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    # Anti-doublon (contenu identique dans les 10s)
+    h = f"{hash(text)}"
+    if now - _last_msg_dedupe.get(h, 0) < 10:
+        logger.warning("Telegram skipped duplicate text")
+        return {"ok": False, "reason": "duplicate"}
+    _last_msg_dedupe[h] = now
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -197,29 +292,8 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            logger.info(f"Telegram sent: {text[:80]}...")
-
-            if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
-                try:
-                    message_id = data["result"]["message_id"]
-                    pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
-                    await client.post(pin_url, json={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "message_id": message_id,
-                        "disable_notification": True
-                    })
-                except Exception as e:
-                    logger.warning(f"Pin message failed: {e}")
-
-            return {"ok": True, "result": data}
-    except Exception as e:
-        logger.warning(f"Telegram send error: {e}")
-        return {"ok": False, "reason": str(e)}
+    await _send_queue.put({"payload": payload, "pin": pin})
+    return {"ok": True}
 
 def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
     return (tf_label or tf_to_label(tf) or "").strip()
@@ -311,6 +385,12 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
 # FastAPI
 # =========================
 app = FastAPI(title="AI Trader", version="1.0")
+
+@app.on_event("startup")
+async def _startup_worker():
+    # Lance le worker d'envoi Telegram
+    if TELEGRAM_ENABLED:
+        asyncio.create_task(_telegram_worker())
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -409,25 +489,34 @@ async def tv_webhook(req: Request):
             key = payload.get("trade_id") or f"{etype}:{symbol}"
 
             if etype == "VECTOR_CANDLE":
-                txt = format_vector_message(
-                    symbol=symbol,
-                    tf_label=payload.get("tf_label") or tf_to_label(tf),
-                    direction=(payload.get("direction") or ""),
-                    price=payload.get("price"),
-                    note=payload.get("note"),
-                )
-                await tg_send_text(txt, key=key)
+                # Throttle par symbole+tf pour éviter les rafales
+                tf_label = payload.get("tf_label") or tf_to_label(tf)
+                key_vec = f"{symbol}:{tf_label}"
+                now = time.time()
+                last = _vector_last_sent.get(key_vec, 0)
+                if now - last < VECTOR_MIN_GAP_SEC:
+                    logger.info(f"Skip VECTOR_CANDLE burst for {key_vec}")
+                else:
+                    _vector_last_sent[key_vec] = now
+                    txt = format_vector_message(
+                        symbol=symbol,
+                        tf_label=tf_label,
+                        direction=(payload.get("direction") or ""),
+                        price=payload.get("price"),
+                        note=payload.get("note"),
+                    )
+                    await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
             elif etype == "ENTRY":
                 txt = format_entry_announcement(payload)
-                await tg_send_text(txt, key=key)
+                await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
             elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
                 hit_time = payload.get("time") or now_ms()
                 entry_t  = get_entry_time_for_trade(payload.get("trade_id"))
                 duration = (hit_time - entry_t) if entry_t is not None else None
                 txt = format_event_announcement(etype, payload, duration)
-                await tg_send_text(txt, key=key)
+                await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
 
         # 3) altseason auto-notify opportuniste (après un event)
         await maybe_altseason_autonotify()
@@ -549,7 +638,6 @@ async def maybe_altseason_autonotify():
     res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
     if res.get("ok"):
         _last_altseason_notify_ts = now
-
 # =========================
 # Helpers /trades : statut, outcome, annulation
 # =========================
@@ -590,6 +678,7 @@ def _cancelled_by_opposite(entry_row: dict) -> bool:
       LIMIT 1
     """, (symbol, str(tf), t, opposite))
     return bool(r)
+
 # =========================
 # Build rows + KPIs
 # =========================
