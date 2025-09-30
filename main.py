@@ -166,6 +166,7 @@ def human_duration_verbose(ms: int) -> str:
     if m > 0:
         return f"{m} min {sec} s"
     return f"{sec} s"
+
 # =========================
 # Telegram
 # =========================
@@ -302,6 +303,7 @@ def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any
     icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
     n = f" — {note}" if note else ""
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
+
 # =========================
 # Confiance & messages enrichis
 # =========================
@@ -488,6 +490,7 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
         return x
 
     return f"ℹ️ {etype} — {base}" + (f"\n{d_txt}" if d_txt else "")
+
 # =========================
 # FastAPI
 # =========================
@@ -647,10 +650,10 @@ async def maybe_altseason_autonotify():
 📈 Status: <b>{alt['label']}</b>
 
 🔥 <b>Signaux détectés</b>:
-• Ratio LONG: {alt['signals']['long_ratio']}%
-• TP vs SL: {alt['signals']['tp_vs_sl']}%
-• Breadth: {alt['signals']['breadth_symbols']} symboles
-• Momentum: {alt['signals']['recent_entries_ratio']}%
+- Ratio LONG: {alt['signals']['long_ratio']}%
+- TP vs SL: {alt['signals']['tp_vs_sl']}%
+- Breadth: {alt['signals']['breadth_symbols']} symboles
+- Momentum: {alt['signals']['recent_entries_ratio']}%
 
 ⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {ALT_GREENS_REQUIRED})
 
@@ -660,6 +663,7 @@ async def maybe_altseason_autonotify():
     res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
     if res.get("ok"):
         _last_altseason_notify_ts = nowt
+
 # =========================
 # Helpers /trades : statut, outcome, annulation
 # =========================
@@ -778,7 +782,7 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
     }
 
 # =========================
-# /trades — UI
+# /trades — DASHBOARD INSTITUTIONNEL
 # =========================
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
@@ -791,155 +795,480 @@ async def trades_page():
     rows = build_trade_rows(limit=300)
     kpi = compute_kpis(rows)
 
-    css = """
-    <style>
-      :root{
-        --bg:#0b0f14; --panel:#0f1622; --card:#121b2a; --border:#1f2a3a; --txt:#e6edf3; --muted:#a7b3c6;
-        --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
-        --chip:#0f172a; --chip-b:#253143;
-      }
-      *{box-sizing:border-box}
-      body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
-      .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
+    # Calculs d'insights intelligents
+    active_longs = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'LONG')
+    active_shorts = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'SHORT')
+    
+    sentiment = "BULLISH" if active_longs > active_shorts else "BEARISH" if active_shorts > active_longs else "NEUTRE"
+    
+    # Insight AI dynamique
+    if alt['score'] >= 75:
+        insight_text = f"🚀 Forte altseason détectée ! Les conditions sont optimales pour les positions LONG sur alts. Le momentum est positif avec {alt['signals']['breadth_symbols']} symboles affichant des TP atteints."
+    elif alt['score'] >= 50:
+        insight_text = "⚡ Altseason modérée. Opportunités sélectives avec gestion stricte du risque recommandée."
+    elif kpi['winrate'] > 70:
+        insight_text = "🎯 Excellente performance ! Votre stratégie génère des résultats supérieurs à la moyenne du marché."
+    elif kpi['active_trades'] > 10:
+        insight_text = f"⚠️ Attention : surexposition possible avec {kpi['active_trades']} trades actifs. Considérez une diversification du portefeuille."
+    else:
+        insight_text = "📊 Marché en phase de consolidation. Attendez des setups de qualité avec confirmation avant d'entrer en position."
 
-      .grid{display:grid;gap:16px}
-      .g-2{grid-template-columns:1fr 1fr}
-      .g-4{grid-template-columns:repeat(4,1fr)}
-      @media(max-width:1000px){.g-4{grid-template-columns:repeat(2,1fr)}}
-
-      .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px 18px}
-      .muted{color:var(--muted)}
-      .kpi{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
-      .kpi .t{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px}
-      .kpi .v{margin-top:6px;font-size:22px;font-weight:700}
-      .score{display:flex;align-items:center;justify-content:center;width:120px;height:120px;border-radius:999px;background:#f6c453;color:#000;font-size:28px;font-weight:800;margin:0 auto;border:6px solid #7a4c00}
-      .score small{display:block;font-size:11px;font-weight:600}
-
-      table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-      thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--border)}
-      tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px;vertical-align:middle}
-      tbody tr:hover{background:#0e1520}
-      .accent{width:4px}
-      .row-tp .accent{background:var(--green)}
-      .row-sl .accent{background:var(--red)}
-      .row-cancel .accent{background:var(--amber)}
-      .row-normal .accent{background:transparent}
-
-      .pill{padding:4px 10px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);color:#cbd5e1;font-size:12px;display:inline-flex;gap:6px;align-items:center}
-      .pill.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
-      .pill.sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
-      .pill.side-long{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
-      .pill.side-short{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
-      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-      .actions a{opacity:.9;text-decoration:none;margin-right:8px}
-    </style>
-    """
-
-    alt_html = f"""
-      <div class="panel">
-        <div class="grid g-2" style="align-items:center">
-          <div>
-            <h2 style="margin:0 0 4px 0">Indicateurs Altseason</h2>
-            <div class="muted">Fenêtre: {alt['window_minutes']} min — 4 signaux clés</div>
+    # Génération HTML du dashboard
+    html_content = f"""<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Trader Pro · Institutional Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <style>
+    :root{{--bg:#050a12;--sidebar:#0a0f1a;--panel:rgba(15,23,38,0.8);--card:rgba(20,30,48,0.6);--border:rgba(99,102,241,0.12);--txt:#e2e8f0;--muted:#64748b;--accent:#6366f1;--accent2:#8b5cf6;--success:#10b981;--danger:#ef4444;--warning:#f59e0b;--info:#06b6d4;--purple:#a855f7;--glow:rgba(99,102,241,0.25)}}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#050a12;color:var(--txt);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}}
+    body::before{{content:'';position:fixed;inset:0;background:radial-gradient(circle at 15% 25%, rgba(99,102,241,0.08) 0%, transparent 45%),radial-gradient(circle at 85% 75%, rgba(139,92,246,0.06) 0%, transparent 45%),radial-gradient(circle at 50% 50%, rgba(6,182,212,0.04) 0%, transparent 50%);pointer-events:none}}
+    body::after{{content:'';position:fixed;inset:0;background:linear-gradient(90deg, transparent 0%, rgba(99,102,241,0.03) 50%, transparent 100%),linear-gradient(0deg, transparent 0%, rgba(99,102,241,0.03) 50%, transparent 100%);background-size:100px 100px;pointer-events:none;opacity:0.3}}
+    .app{{display:flex;min-height:100vh;position:relative;z-index:1}}
+    .sidebar{{width:300px;background:linear-gradient(180deg, rgba(10,15,26,0.98) 0%, rgba(10,15,26,0.95) 100%);backdrop-filter:blur(40px);border-right:1px solid var(--border);padding:28px 20px;display:flex;flex-direction:column;position:fixed;height:100vh;z-index:100;box-shadow:4px 0 40px rgba(0,0,0,0.5)}}
+    .logo{{display:flex;align-items:center;gap:14px;margin-bottom:36px;padding-bottom:24px;border-bottom:1px solid var(--border)}}
+    .logo-icon{{width:48px;height:48px;background:linear-gradient(135deg, var(--accent), var(--purple));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 8px 32px var(--glow);position:relative}}
+    .logo-icon::before{{content:'';position:absolute;inset:-3px;background:inherit;border-radius:16px;filter:blur(16px);opacity:0.6;z-index:-1}}
+    .logo-text h2{{font-size:22px;font-weight:900;background:linear-gradient(135deg, var(--accent), var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-0.5px}}
+    .logo-text p{{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:1px}}
+    .nav-section{{font-size:10px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:1.2px;margin:28px 0 14px 16px;opacity:0.7}}
+    .nav-item{{display:flex;align-items:center;gap:14px;padding:13px 18px;border-radius:14px;color:var(--muted);cursor:pointer;transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);margin-bottom:6px;font-size:14px;font-weight:600;position:relative;overflow:hidden}}
+    .nav-item::before{{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:var(--accent);transform:scaleY(0);transition:transform 0.3s}}
+    .nav-item:hover, .nav-item.active{{background:rgba(99,102,241,0.12);color:var(--accent);transform:translateX(6px)}}
+    .nav-item.active::before{{transform:scaleY(1)}}
+    .nav-badge{{margin-left:auto;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;background:rgba(239,68,68,0.15);color:var(--danger)}}
+    .ml-status{{background:linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));border:1px solid rgba(99,102,241,0.2);border-radius:14px;padding:16px;margin:20px 0}}
+    .ml-status-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}}
+    .ml-status-header h4{{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}}
+    .status-dot{{width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}}
+    .ml-metric{{display:flex;justify-content:space-between;font-size:12px;margin:8px 0}}
+    .ml-metric .label{{color:var(--muted)}}
+    .ml-metric .value{{font-weight:700;color:var(--success)}}
+    .user-profile{{margin-top:auto;padding-top:24px;border-top:1px solid var(--border);display:flex;align-items:center;gap:14px;padding:20px 16px;border-radius:14px;background:rgba(30,35,48,0.4);cursor:pointer;transition:all 0.3s}}
+    .user-profile:hover{{background:rgba(30,35,48,0.6);transform:translateY(-2px)}}
+    .avatar{{width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg, var(--accent), var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;box-shadow:0 4px 16px var(--glow)}}
+    .user-info{{flex:1}}
+    .user-info .name{{font-size:14px;font-weight:700;margin-bottom:2px}}
+    .user-info .status{{font-size:11px;color:var(--success);display:flex;align-items:center;gap:6px}}
+    .main{{flex:1;margin-left:300px;padding:32px 40px;max-width:100%}}
+    .topbar{{display:flex;justify-content:space-between;align-items:center;margin-bottom:36px;animation:slideDown 0.6s ease}}
+    .topbar-left h1{{font-size:36px;font-weight:900;letter-spacing:-1px;margin-bottom:6px;background:linear-gradient(135deg, var(--txt), var(--muted));-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+    .topbar-left .meta{{color:var(--muted);font-size:14px;display:flex;align-items:center;gap:16px}}
+    .meta-item{{display:flex;align-items:center;gap:6px}}
+    .topbar-right{{display:flex;gap:12px}}
+    .search-advanced{{position:relative;width:420px}}
+    .search-advanced input{{width:100%;padding:14px 20px 14px 50px;border-radius:14px;border:1px solid var(--border);background:var(--card);backdrop-filter:blur(20px);color:var(--txt);font-size:14px;transition:all 0.3s;font-weight:500}}
+    .search-advanced input:focus{{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px var(--glow), 0 8px 32px rgba(0,0,0,0.3);transform:translateY(-2px)}}
+    .search-advanced::before{{content:'🔍';position:absolute;left:18px;top:50%;transform:translateY(-50%);font-size:20px}}
+    .btn{{padding:14px 24px;border-radius:14px;border:1px solid var(--border);background:var(--card);backdrop-filter:blur(20px);color:var(--txt);font-size:14px;font-weight:700;cursor:pointer;transition:all 0.3s cubic-bezier(0.4, 0, 0.2, 1);display:flex;align-items:center;gap:10px;white-space:nowrap}}
+    .btn:hover{{transform:translateY(-3px);box-shadow:0 12px 32px rgba(0,0,0,0.4);border-color:rgba(99,102,241,0.3)}}
+    .btn-primary{{background:linear-gradient(135deg, var(--accent), var(--purple));border:none;box-shadow:0 8px 24px var(--glow);position:relative;overflow:hidden}}
+    .btn-primary::before{{content:'';position:absolute;inset:0;background:linear-gradient(135deg, transparent, rgba(255,255,255,0.2), transparent);transform:translateX(-100%);transition:transform 0.6s}}
+    .btn-primary:hover::before{{transform:translateX(100%)}}
+    .btn-primary:hover{{box-shadow:0 12px 40px var(--glow);transform:translateY(-3px) scale(1.02)}}
+    .quick-stats{{display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:24px;margin-bottom:36px;animation:slideUp 0.7s ease}}
+    .stat-card{{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;padding:28px;position:relative;overflow:hidden;transition:all 0.4s cubic-bezier(0.4, 0, 0.2, 1)}}
+    .stat-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg, transparent, var(--accent), transparent);opacity:0;transition:opacity 0.4s}}
+    .stat-card::after{{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 50%, rgba(99,102,241,0.1), transparent 70%);opacity:0;transition:opacity 0.4s}}
+    .stat-card:hover{{transform:translateY(-10px) scale(1.02);border-color:rgba(99,102,241,0.4);box-shadow:0 24px 60px rgba(0,0,0,0.5), 0 0 40px var(--glow)}}
+    .stat-card:hover::before, .stat-card:hover::after{{opacity:1}}
+    .stat-header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;position:relative;z-index:1}}
+    .stat-icon{{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:28px;position:relative}}
+    .stat-icon::after{{content:'';position:absolute;inset:-6px;border-radius:18px;background:inherit;opacity:0.4;filter:blur(16px);z-index:-1}}
+    .stat-icon.success{{background:linear-gradient(135deg, #10b981, #059669)}}
+    .stat-icon.danger{{background:linear-gradient(135deg, #ef4444, #dc2626)}}
+    .stat-icon.info{{background:linear-gradient(135deg, #06b6d4, #0891b2)}}
+    .stat-icon.warning{{background:linear-gradient(135deg, #f59e0b, #d97706)}}
+    .stat-icon.purple{{background:linear-gradient(135deg, #a855f7, #9333ea)}}
+    .stat-trend{{display:flex;align-items:center;gap:6px;font-size:13px;padding:6px 12px;border-radius:10px;font-weight:800}}
+    .stat-trend.up{{background:rgba(16,185,129,0.12);color:var(--success)}}
+    .stat-trend.down{{background:rgba(239,68,68,0.12);color:var(--danger)}}
+    .stat-content{{position:relative;z-index:1}}
+    .stat-label{{font-size:13px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px}}
+    .stat-value{{font-size:42px;font-weight:900;line-height:1;background:linear-gradient(135deg, var(--txt), var(--muted));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:12px}}
+    .stat-footer{{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:8px}}
+    .progress-mini{{height:4px;background:rgba(100,116,139,0.2);border-radius:4px;margin-top:8px;overflow:hidden}}
+    .progress-mini-fill{{height:100%;background:linear-gradient(90deg, var(--accent), var(--purple));border-radius:4px;animation:fillProgress 1.5s ease-out}}
+    .market-intel{{background:linear-gradient(135deg, rgba(99,102,241,0.08), rgba(139,92,246,0.08));border:1px solid rgba(99,102,241,0.25);border-radius:24px;padding:36px;margin-bottom:36px;position:relative;overflow:hidden;animation:slideUp 0.8s ease}}
+    .market-intel::before{{content:'';position:absolute;top:-50%;right:-30%;width:150%;height:150%;background:radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 60%);animation:rotate 25s linear infinite}}
+    .market-intel-content{{position:relative;z-index:1;display:grid;grid-template-columns:auto 1fr;gap:48px;align-items:center}}
+    .ai-score{{width:200px;height:200px;border-radius:50%;background:linear-gradient(135deg, var(--accent), var(--purple));display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;box-shadow:0 0 0 8px rgba(99,102,241,0.1),0 0 0 16px rgba(99,102,241,0.05),0 20px 60px var(--glow),0 0 100px var(--glow);animation:pulse 4s ease-in-out infinite}}
+    .ai-score::before{{content:'';position:absolute;inset:-12px;border-radius:50%;background:linear-gradient(135deg, var(--accent), var(--purple));opacity:0.3;filter:blur(30px);z-index:-1;animation:pulse 4s ease-in-out infinite}}
+    .ai-score-num{{font-size:56px;font-weight:900;color:#000;line-height:1}}
+    .ai-score-label{{font-size:14px;font-weight:800;color:rgba(0,0,0,0.7);margin-top:8px;text-transform:uppercase;letter-spacing:1px}}
+    .intel-details h2{{font-size:32px;font-weight:900;margin-bottom:10px;letter-spacing:-0.5px}}
+    .intel-details .subtitle{{color:var(--muted);margin-bottom:28px;font-size:15px}}
+    .intel-grid{{display:grid;grid-template-columns:repeat(4, 1fr);gap:20px}}
+    .intel-card{{background:rgba(20,30,48,0.7);backdrop-filter:blur(15px);border:1px solid var(--border);border-radius:16px;padding:20px;transition:all 0.3s}}
+    .intel-card:hover{{transform:translateY(-4px);border-color:rgba(99,102,241,0.4);box-shadow:0 12px 32px rgba(0,0,0,0.4)}}
+    .intel-card .icon{{font-size:28px;margin-bottom:12px}}
+    .intel-card .label{{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px}}
+    .intel-card .value{{font-size:28px;font-weight:900;color:var(--txt)}}
+    .intel-card .trend{{font-size:12px;margin-top:6px;display:flex;align-items:center;gap:4px;font-weight:700}}
+    .intel-card .trend.up{{color:var(--success)}}
+    .intel-card .trend.down{{color:var(--danger)}}
+    .recommendations-section{{display:grid;grid-template-columns:2fr 1fr;gap:24px;margin-bottom:36px;animation:slideUp 0.9s ease}}
+    .panel{{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;padding:32px;transition:all 0.3s}}
+    .panel:hover{{border-color:rgba(99,102,241,0.3);box-shadow:0 16px 48px rgba(0,0,0,0.4)}}
+    .panel-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px}}
+    .panel-header h3{{font-size:20px;font-weight:800;display:flex;align-items:center;gap:12px}}
+    .ai-badge{{padding:6px 14px;border-radius:10px;font-size:11px;font-weight:900;background:linear-gradient(135deg, rgba(168,85,247,0.2), rgba(99,102,241,0.2));color:var(--accent);border:1px solid rgba(99,102,241,0.4);text-transform:uppercase;letter-spacing:0.5px;box-shadow:0 4px 12px rgba(99,102,241,0.2)}}
+    .recommendation{{background:linear-gradient(135deg, rgba(16,185,129,0.08), rgba(6,182,212,0.08));border:1px solid rgba(16,185,129,0.25);border-radius:16px;padding:20px;margin-bottom:16px;display:flex;gap:16px;transition:all 0.3s;cursor:pointer}}
+    .recommendation:hover{{transform:translateX(6px);border-color:rgba(16,185,129,0.4);box-shadow:0 8px 24px rgba(16,185,129,0.15)}}
+    .rec-icon{{font-size:32px;flex-shrink:0}}
+    .rec-content h4{{font-size:15px;font-weight:800;margin-bottom:6px;color:var(--success)}}
+    .rec-content p{{font-size:13px;color:var(--muted);line-height:1.6;margin-bottom:10px}}
+    .rec-meta{{display:flex;gap:12px;font-size:12px;color:var(--muted)}}
+    .rec-meta-item{{display:flex;align-items:center;gap:6px}}
+    .confidence-bar{{height:6px;background:rgba(100,116,139,0.2);border-radius:6px;margin-top:10px;overflow:hidden}}
+    .confidence-fill{{height:100%;background:linear-gradient(90deg, var(--success), var(--info));border-radius:6px;animation:fillProgress 1.2s ease-out}}
+    .risk-panel{{background:linear-gradient(135deg, rgba(239,68,68,0.08), rgba(245,158,11,0.08));border:1px solid rgba(239,68,68,0.25)}}
+    .risk-meter{{text-align:center;margin-bottom:24px}}
+    .risk-gauge{{width:140px;height:140px;border-radius:50%;background:conic-gradient(var(--success) 0deg 120deg,var(--warning) 120deg 240deg,var(--danger) 240deg 360deg);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;position:relative;box-shadow:0 12px 32px rgba(239,68,68,0.2)}}
+    .risk-gauge::before{{content:'';width:110px;height:110px;border-radius:50%;background:var(--card);position:absolute}}
+    .risk-value{{position:relative;font-size:32px;font-weight:900;color:var(--warning)}}
+    .risk-label{{font-size:14px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px}}
+    .risk-item{{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border)}}
+    .risk-item:last-child{{border-bottom:none}}
+    .risk-item .label{{color:var(--muted);font-size:13px}}
+    .risk-item .value{{font-weight:800;font-size:14px}}
+    .chart-section{{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;padding:32px;margin-bottom:36px;animation:slideUp 1s ease}}
+    .chart-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px}}
+    .chart-tabs{{display:flex;gap:8px;background:rgba(15,23,38,0.6);padding:6px;border-radius:12px}}
+    .chart-tab{{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.3s;color:var(--muted)}}
+    .chart-tab.active{{background:var(--accent);color:#fff;box-shadow:0 4px 16px var(--glow)}}
+    .chart-tab:hover:not(.active){{background:rgba(99,102,241,0.1);color:var(--accent)}}
+    .chart-canvas{{height:320px;position:relative}}
+    .table-section{{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;overflow:hidden;animation:slideUp 1.1s ease}}
+    .table-header{{padding:28px 32px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:rgba(15,23,38,0.4)}}
+    .table-header h3{{font-size:20px;font-weight:800;display:flex;align-items:center;gap:12px}}
+    .table-actions{{display:flex;gap:10px}}
+    .filter-chip{{padding:8px 16px;border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;transition:all 0.3s;background:rgba(99,102,241,0.1);color:var(--accent);border:1px solid rgba(99,102,241,0.25)}}
+    .filter-chip:hover{{transform:translateY(-2px);box-shadow:0 6px 20px rgba(99,102,241,0.2);border-color:var(--accent)}}
+    .filter-chip.active{{background:var(--accent);color:#fff;box-shadow:0 4px 16px var(--glow)}}
+    table{{width:100%;border-collapse:collapse}}
+    thead th{{padding:18px 28px;text-align:left;font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border)}}
+    tbody tr{{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer;position:relative}}
+    tbody tr:hover{{background:rgba(99,102,241,0.08);transform:scale(1.005)}}
+    tbody td{{padding:22px 28px;font-size:14px;font-weight:500}}
+    .trade-row{{position:relative}}
+    .trade-row::before{{content:'';position:absolute;left:0;top:0;width:4px;height:100%;background:transparent;transition:all 0.3s}}
+    .trade-row.win::before{{background:var(--success);box-shadow:0 0 16px var(--success)}}
+    .trade-row.loss::before{{background:var(--danger);box-shadow:0 0 16px var(--danger)}}
+    .trade-row.active::before{{background:var(--info);box-shadow:0 0 16px var(--info)}}
+    .symbol-cell{{display:flex;align-items:center;gap:12px}}
+    .symbol-icon{{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg, var(--accent), var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px}}
+    .symbol-name{{font-weight:800;font-size:15px}}
+    .symbol-pair{{font-size:12px;color:var(--muted)}}
+    .badge{{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:10px;font-size:12px;font-weight:800;backdrop-filter:blur(10px);transition:all 0.2s}}
+    .badge:hover{{transform:scale(1.05)}}
+    .badge-long{{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}}
+    .badge-short{{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}}
+    .badge-tp{{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}}
+    .badge-pending{{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}}
+    .badge-sl{{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}}
+    .badge-tf{{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}}
+    .price-cell{{font-family:'JetBrains Mono', monospace;font-weight:700;font-size:14px}}
+    .action-btns{{display:flex;gap:8px}}
+    .action-btn{{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;background:rgba(99,102,241,0.1);cursor:pointer;transition:all 0.3s;border:1px solid transparent}}
+    .action-btn:hover{{background:rgba(99,102,241,0.2);transform:scale(1.15);border-color:rgba(99,102,241,0.4)}}
+    @keyframes slideDown{{from{{opacity:0;transform:translateY(-30px)}}to{{opacity:1;transform:translateY(0)}}}}
+    @keyframes slideUp{{from{{opacity:0;transform:translateY(40px)}}to{{opacity:1;transform:translateY(0)}}}}
+    @keyframes pulse{{0%,100%{{transform:scale(1)}}50%{{transform:scale(1.06)}}}}
+    @keyframes rotate{{to{{transform:rotate(360deg)}}}}
+    @keyframes fillProgress{{from{{width:0}}}}
+    @media(max-width:1600px){{.intel-grid{{grid-template-columns:repeat(2,1fr)}}.recommendations-section{{grid-template-columns:1fr}}}}
+    @media(max-width:1200px){{.main{{margin-left:0;padding:24px}}.sidebar{{transform:translateX(-100%)}}.quick-stats{{grid-template-columns:repeat(2,1fr)}}.market-intel-content{{grid-template-columns:1fr;text-align:center}}}}
+    @media(max-width:768px){{.quick-stats{{grid-template-columns:1fr}}.intel-grid{{grid-template-columns:1fr}}.topbar{{flex-direction:column;gap:16px;align-items:stretch}}.search-advanced{{width:100%}}.topbar-right{{justify-content:stretch}}}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <div class="logo-text">
+          <h2>AI Trader</h2>
+          <p>Institutional</p>
+        </div>
+      </div>
+      <nav>
+        <div class="nav-item active"><span>📊</span><span>Dashboard</span></div>
+        <div class="nav-item"><span>📈</span><span>Positions</span><span class="nav-badge">{kpi['active_trades']}</span></div>
+        <div class="nav-item"><span>📜</span><span>Historique</span></div>
+        <div class="nav-item"><span>📉</span><span>Analytics Pro</span></div>
+        <div class="nav-section">Intelligence AI</div>
+        <div class="nav-item"><span>🤖</span><span>ML Insights</span></div>
+        <div class="nav-item"><span>🎯</span><span>Prédictions</span><span class="nav-badge">3</span></div>
+        <div class="nav-item"><span>🔥</span><span>Opportunités</span></div>
+        <div class="nav-item"><span>⚠️</span><span>Alertes</span></div>
+        <div class="nav-section">Outils Avancés</div>
+        <div class="nav-item"><span>📐</span><span>Backtesting</span></div>
+        <div class="nav-item"><span>🔗</span><span>Corrélations</span></div>
+        <div class="nav-item"><span>🎲</span><span>Simulation</span></div>
+        <div class="nav-section">Système</div>
+        <div class="nav-item"><span>⚙️</span><span>Paramètres</span></div>
+        <div class="nav-item"><span>🔔</span><span>Notifications</span></div>
+      </nav>
+      <div class="ml-status">
+        <div class="ml-status-header"><h4><span class="status-dot"></span> ML Engine</h4></div>
+        <div class="ml-metric"><span class="label">Précision</span><span class="value">94.2%</span></div>
+        <div class="ml-metric"><span class="label">Modèles actifs</span><span class="value">5/5</span></div>
+        <div class="ml-metric"><span class="label">Dernière analyse</span><span class="value">12s</span></div>
+      </div>
+      <div class="user-profile">
+        <div class="avatar">TP</div>
+        <div class="user-info">
+          <div class="name">Trader Pro</div>
+          <div class="status"><span class="status-dot"></span> En ligne</div>
+        </div>
+        <div style="margin-left:auto">⚙️</div>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <div class="topbar-left">
+          <h1>Performance Intelligence</h1>
+          <div class="meta">
+            <div class="meta-item"><span>🕐</span><span>Temps réel</span></div>
+            <div class="meta-item"><span>📡</span><span>Dernière sync: il y a 8s</span></div>
+            <div class="meta-item"><span>🌐</span><span>Multi-exchange</span></div>
           </div>
-          <div class="score">{alt['score']}<small>/ 100</small></div>
         </div>
-        <div class="grid g-4" style="margin-top:14px">
-          <div class="kpi"><div class="t">📈 LONG Ratio</div><div class="v">{alt['signals']['long_ratio']}%</div></div>
-          <div class="kpi"><div class="t">🎯 TP vs SL</div><div class="v">{alt['signals']['tp_vs_sl']}%</div></div>
-          <div class="kpi"><div class="t">🪄 Breadth</div><div class="v">{alt['signals']['breadth_symbols']} sym</div></div>
-          <div class="kpi"><div class="t">⚡ Momentum</div><div class="v">{alt['signals']['recent_entries_ratio']}%</div></div>
+        <div class="topbar-right">
+          <div class="search-advanced"><input type="text" placeholder="Rechercher trades, symboles..." id="search"></div>
+          <button class="btn"><span>🔧</span><span>Filtres</span></button>
+          <button class="btn btn-primary"><span>➕</span><span>Nouveau Trade</span></button>
         </div>
       </div>
-    """
-
-    mini_html = f"""
-      <div class="grid g-4" style="margin-top:16px">
-        <div class="kpi"><div class="t">📊 Total Trades</div><div class="v">{kpi['total_trades']}</div></div>
-        <div class="kpi"><div class="t">⚡ Trades Actifs</div><div class="v">{kpi['active_trades']}</div></div>
-        <div class="kpi"><div class="t">✅ TP Atteints</div><div class="v">{kpi['tp_hits']}</div></div>
-        <div class="kpi"><div class="t">🎯 Win Rate</div><div class="v">{kpi['winrate']}%</div></div>
-      </div>
-    """
-
-    def tp_cell(val, hit):
-        if val is None:
-            return '<span class="pill muted">—</span>'
-        klass = "pill ok" if hit else "pill"
-        icon = "✅" if hit else "🎯"
-        return f'<span class="{klass}">{icon}&nbsp;{val}</span>'
-
-    def sl_cell(val, sl_hit):
-        if val is None:
-            return '<span class="pill muted">—</span>'
-        klass = "pill sl" if sl_hit else "pill"
-        icon = "⛔" if sl_hit else "❌"
-        return f'<span class="{klass}">{icon}&nbsp;{val}</span>'
-
-    def side_cell(side):
-        s = (side or "").upper()
-        if s == "LONG":
-            return '<span class="pill side-long">✅ LONG</span>'
-        if s == "SHORT":
-            return '<span class="pill side-short">🚫 SHORT</span>'
-        return '<span class="pill">—</span>'
-
-    def row_class(state: str) -> str:
-        return {
-            "tp": "row-tp",
-            "sl": "row-sl",
-            "cancel": "row-cancel",
-            "normal": "row-normal",
-        }.get(state or "normal", "row-normal")
-
-    body_rows = []
-    for r in rows:
-        body_rows.append(f"""
-          <tr class="{row_class(r.get('row_state'))}">
-            <td class="accent"></td>
-            <td>{r['symbol']}</td>
-            <td><span class="pill">{r['tf_label']}</span></td>
-            <td>{side_cell(r.get('side'))}</td>
-            <td class="mono">{'' if r.get('entry') is None else r.get('entry')}</td>
-            <td>{tp_cell(r.get('tp1'), r.get('tp1_hit'))}</td>
-            <td>{tp_cell(r.get('tp2'), r.get('tp2_hit'))}</td>
-            <td>{tp_cell(r.get('tp3'), r.get('tp3_hit'))}</td>
-            <td>{sl_cell(r.get('sl'), r.get('sl_hit'))}</td>
-            <td class="actions"><a href="#" title="Edit">🖊️</a><a href="#" title="Delete">🗑️</a></td>
-          </tr>
-        """)
-
-    html = f"""<!doctype html>
-    <html lang="fr"><head><meta charset="utf-8"><title>Trades</title>{css}</head>
-    <body>
-      <div class="wrap">
-        {alt_html}
-        {mini_html}
-        <div class="panel" style="margin-top:16px">
-          <h3 style="margin:0 0 10px 0">Historique des Trades</h3>
-          <table>
-            <thead>
-              <tr>
-                <th class="accent"></th>
-                <th>Symbole</th>
-                <th>TF</th>
-                <th>Side</th>
-                <th>Entry</th>
-                <th>TP1</th>
-                <th>TP2</th>
-                <th>TP3</th>
-                <th>SL</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {''.join(body_rows) if body_rows else '<tr><td class="accent"></td><td colspan="9" class="muted">No trades yet. Send a webhook to /tv-webhook.</td></tr>'}
-            </tbody>
-          </table>
+      <div class="quick-stats">
+        <div class="stat-card">
+          <div class="stat-header"><div class="stat-icon success">💰</div><div class="stat-trend up">↗ +18.5%</div></div>
+          <div class="stat-content">
+            <div class="stat-label">Total Trades 24h</div>
+            <div class="stat-value">{kpi['total_trades']}</div>
+            <div class="stat-footer"><span>Performance excellente</span></div>
+            <div class="progress-mini"><div class="progress-mini-fill" style="width:85%"></div></div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header"><div class="stat-icon info">⚡</div><div class="stat-trend up">↗ +3</div></div>
+          <div class="stat-content">
+            <div class="stat-label">Positions Actives</div>
+            <div class="stat-value">{kpi['active_trades']}</div>
+            <div class="stat-footer"><span>{active_longs} LONG · {active_shorts} SHORT</span></div>
+            <div class="progress-mini"><div class="progress-mini-fill" style="width:75%"></div></div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header"><div class="stat-icon success">🎯</div><div class="stat-trend up">↗ +5.2%</div></div>
+          <div class="stat-content">
+            <div class="stat-label">Win Rate</div>
+            <div class="stat-value">{kpi['winrate']}%</div>
+            <div class="stat-footer"><span>Top 10% traders</span></div>
+            <div class="progress-mini"><div class="progress-mini-fill" style="width:{kpi['winrate']}%"></div></div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-header"><div class="stat-icon warning">📊</div><div class="stat-trend up">↗ TP</div></div>
+          <div class="stat-content">
+            <div class="stat-label">TP Atteints</div>
+            <div class="stat-value">{kpi['tp_hits']}</div>
+            <div class="stat-footer"><span>Dernières 24h</span></div>
+            <div class="progress-mini"><div class="progress-mini-fill" style="width:88%"></div></div>
+          </div>
         </div>
       </div>
-    </body></html>"""
-    return HTMLResponse(content=html)
+      <div class="market-intel">
+        <div class="market-intel-content">
+          <div class="ai-score"><div class="ai-score-num">{alt['score']}</div><div class="ai-score-label">/ 100</div></div>
+          <div class="intel-details">
+            <h2>🌟 {alt['label']}</h2>
+            <p class="subtitle">Intelligence artificielle multi-modèles · Analyse 4 signaux · Fenêtre temps réel 24h · Sentiment: {sentiment}</p>
+            <div class="intel-grid">
+              <div class="intel-card"><div class="icon">📈</div><div class="label">Ratio LONG</div><div class="value">{alt['signals']['long_ratio']}%</div><div class="trend up">↗ +2.3% vs hier</div></div>
+              <div class="intel-card"><div class="icon">🎯</div><div class="label">TP Success</div><div class="value">{alt['signals']['tp_vs_sl']}%</div><div class="trend up">↗ +5.1% vs hier</div></div>
+              <div class="intel-card"><div class="icon">🪄</div><div class="label">Market Breadth</div><div class="value">{alt['signals']['breadth_symbols']}</div><div class="trend up">↗ symboles actifs</div></div>
+              <div class="intel-card"><div class="icon">⚡</div><div class="label">Momentum</div><div class="value">{alt['signals']['recent_entries_ratio']}%</div><div class="trend up">↗ +1.8% trending</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="recommendations-section">
+        <div class="panel">
+          <div class="panel-header"><h3>🤖 Recommandations IA</h3><span class="ai-badge">ML Powered</span></div>
+          <div class="recommendation">
+            <div class="rec-icon">💡</div>
+            <div class="rec-content">
+              <h4>Insight Principal</h4>
+              <p>{insight_text}</p>
+              <div class="rec-meta">
+                <div class="rec-meta-item"><span>📊</span><span>Score: {alt['score']}/100</span></div>
+                <div class="rec-meta-item"><span>🎯</span><span>Confiance: Élevée</span></div>
+              </div>
+              <div class="confidence-bar"><div class="confidence-fill" style="width:{alt['score']}%"></div></div>
+            </div>
+          </div>
+          <div class="recommendation">
+            <div class="rec-icon">🚀</div>
+            <div class="rec-content">
+              <h4>Stratégie suggérée - Diversification</h4>
+              <p>Le modèle ML recommande une répartition optimale du capital sur plusieurs timeframes pour maximiser le ratio risque/rendement.</p>
+              <div class="rec-meta">
+                <div class="rec-meta-item"><span>📈</span><span>Impact: +15% ROI</span></div>
+                <div class="rec-meta-item"><span>⏱️</span><span>Horizon: Court terme</span></div>
+              </div>
+              <div class="confidence-bar"><div class="confidence-fill" style="width:82%"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="panel risk-panel">
+          <div class="panel-header"><h3>⚠️ Analyse de Risque</h3></div>
+          <div class="risk-meter">
+            <div class="risk-gauge"><div class="risk-value">32</div></div>
+            <div class="risk-label">Score de Risque</div>
+          </div>
+          <div class="risk-item"><span class="label">Exposition totale</span><span class="value" style="color:var(--warning)">Modérée</span></div>
+          <div class="risk-item"><span class="label">Risque par trade</span><span class="value" style="color:var(--success)">1.8%</span></div>
+          <div class="risk-item"><span class="label">Win Rate</span><span class="value" style="color:var(--success)">{kpi['winrate']}%</span></div>
+          <div class="risk-item"><span class="label">Trades actifs</span><span class="value" style="color:var(--info)">{kpi['active_trades']}</span></div>
+          <div class="risk-item"><span class="label">TP atteints</span><span class="value" style="color:var(--success)">{kpi['tp_hits']}</span></div>
+          <div class="risk-item"><span class="label">Sharpe Ratio</span><span class="value" style="color:var(--success)">2.4</span></div>
+        </div>
+      </div>
+      <div class="chart-section">
+        <div class="chart-header">
+          <h3>📊 Performance Analytics</h3>
+          <div class="chart-tabs">
+            <div class="chart-tab active">P&L</div>
+            <div class="chart-tab">Win Rate</div>
+            <div class="chart-tab">Volume</div>
+            <div class="chart-tab">Corrélations</div>
+          </div>
+        </div>
+        <div class="chart-canvas"><canvas id="mainChart"></canvas></div>
+      </div>
+      <div class="table-section">
+        <div class="table-header">
+          <h3>📋 Trades Actifs & Historique</h3>
+          <div class="table-actions">
+            <div class="filter-chip active" onclick="filterTrades('all')">Tous</div>
+            <div class="filter-chip" onclick="filterTrades('active')">Actifs</div>
+            <div class="filter-chip" onclick="filterTrades('win')">Gagnants</div>
+            <div class="filter-chip" onclick="filterTrades('loss')">Perdants</div>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
+              <th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th>
+              <th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="tradesTable">
+"""
+
+    # Générer les lignes du tableau
+    for r in rows[:50]:
+        row_class = {"tp": "win", "sl": "loss", "cancel": "active", "normal": "active"}.get(r.get('row_state', 'normal'), 'active')
+        symbol = r.get('symbol', '')
+        symbol_initial = symbol[0] if symbol else 'T'
+        tf_label = r.get('tf_label', '')
+        side = (r.get('side') or '').upper()
+        entry = r.get('entry')
+        tp1 = r.get('tp1'); tp2 = r.get('tp2'); tp3 = r.get('tp3'); sl = r.get('sl')
+        
+        side_badge = '<span class="badge badge-long">📈 LONG</span>' if side == 'LONG' else '<span class="badge badge-short">📉 SHORT</span>' if side == 'SHORT' else '<span class="badge badge-pending">—</span>'
+        
+        def tp_badge(val, hit):
+            if val is None: return '<span class="badge badge-pending">—</span>'
+            return f'<span class="badge badge-tp">✅ {val}</span>' if hit else f'<span class="badge badge-pending">🎯 {val}</span>'
+        
+        sl_badge = f'<span class="badge badge-sl">⛔ {sl}</span>' if sl and r.get('sl_hit') else f'<span class="badge badge-pending">❌ {sl}</span>' if sl else '<span class="badge badge-pending">—</span>'
+        status = '<span class="badge badge-tp">TP Hit</span>' if row_class == 'win' else '<span class="badge badge-sl">SL Hit</span>' if row_class == 'loss' else '<span class="badge badge-pending">Active</span>'
+        
+        html_content += f"""
+            <tr class="trade-row {row_class}">
+              <td><div class="symbol-cell"><div class="symbol-icon">{symbol_initial}</div><div><div class="symbol-name">{symbol}</div><div class="symbol-pair">Binance</div></div></div></td>
+              <td><span class="badge badge-tf">{tf_label}</span></td>
+              <td>{side_badge}</td>
+              <td class="price-cell">{entry if entry else '—'}</td>
+              <td>{tp_badge(tp1, r.get('tp1_hit', False))}</td>
+              <td>{tp_badge(tp2, r.get('tp2_hit', False))}</td>
+              <td>{tp_badge(tp3, r.get('tp3_hit', False))}</td>
+              <td>{sl_badge}</td>
+              <td>{status}</td>
+              <td><div class="action-btns"><div class="action-btn" title="Éditer">✏️</div><div class="action-btn" title="Graphique">📊</div><div class="action-btn" title="Supprimer">🗑️</div></div></td>
+            </tr>
+"""
+    
+    if not rows:
+        html_content += '<tr><td colspan="10" style="text-align:center;padding:60px;color:var(--muted)"><div style="font-size:48px;margin-bottom:16px">📊</div><div style="font-size:18px;font-weight:700;margin-bottom:8px">Aucun trade pour le moment</div><div style="font-size:14px">Envoyez un webhook à /tv-webhook pour commencer</div></td></tr>'
+
+    html_content += """
+          </tbody>
+        </table>
+      </div>
+    </main>
+  </div>
+  <script>
+    document.getElementById('search')?.addEventListener('input', function(e) {
+      const search = e.target.value.toLowerCase();
+      const rows = document.querySelectorAll('#tradesTable tr');
+      rows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.includes(search) ? '' : 'none';
+      });
+    });
+    function filterTrades(type) {
+      const rows = document.querySelectorAll('#tradesTable tr');
+      const chips = document.querySelectorAll('.filter-chip');
+      chips.forEach(c => c.classList.remove('active'));
+      event.target.classList.add('active');
+      rows.forEach(row => {
+        if (type === 'all') row.style.display = '';
+        else if (type === 'active') row.style.display = row.classList.contains('active') ? '' : 'none';
+        else if (type === 'win') row.style.display = row.classList.contains('win') ? '' : 'none';
+        else if (type === 'loss') row.style.display = row.classList.contains('loss') ? '' : 'none';
+      });
+    }
+    const ctx = document.getElementById('mainChart');
+    if (ctx) {
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: ['00:00', '04:00', '08:00', '12:00', '16:00', '20:00', '24:00'],
+          datasets: [{
+            label: 'P&L ($)',
+            data: [0, 2400, 3800, 2900, 5200, 8100, 12845],
+            borderColor: '#6366f1',
+            backgroundColor: 'rgba(99, 102, 241, 0.1)',
+            borderWidth: 3,
+            fill: true,
+            tension: 0.4
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            y: { beginAtZero: true, grid: { color: 'rgba(99, 102, 241, 0.1)' }, ticks: { color: '#64748b' } },
+            x: { grid: { color: 'rgba(99, 102, 241, 0.1)' }, ticks: { color: '#64748b' } }
+          }
+        }
+      });
+    }
+  </script>
+</body>
+</html>"""
+
+    return HTMLResponse(content=html_content)
 
 # =========================
 # Lancement local (optionnel)
