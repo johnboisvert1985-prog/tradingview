@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import asyncio
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -33,11 +34,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nqgjiebqgiehgq8e76qhefjqer78gfq0ey
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "15"))
 
-# Rate-limit global worker
-TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "1.1"))  # ~1 msg / 1.1s
-TG_RETRY_BACKOFF_BASE = float(os.getenv("TG_RETRY_BACKOFF_BASE", "1.5"))
+# Flood control (plus conservateur que Telegram)
+TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "3.3"))  # délai mini entre messages
+TG_PER_MIN_LIMIT = int(os.getenv("TG_PER_MIN_LIMIT", "18"))     # plafond / minute (safe < 20)
 
 # Altseason auto-notify
 ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
@@ -50,10 +50,10 @@ TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
 TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
 TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
 
-# Vector icons + throttling
+# Vector icons & throttle
 VECTOR_UP_ICON = "🟩"
 VECTOR_DN_ICON = "🟥"
-VECTOR_MIN_GAP_SEC = int(os.getenv("VECTOR_MIN_GAP_SEC", "120"))
+VECTOR_GLOBAL_GAP_SEC = int(os.getenv("VECTOR_GLOBAL_GAP_SEC", "5"))  # max 1 vector / 5s global
 
 # =========================
 # SQLite
@@ -136,6 +136,7 @@ def ensure_trades_schema():
     cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
     if "tf_label" not in cols:
         db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
+    # réindex de sûreté
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -152,122 +153,80 @@ try:
 except Exception as e:
     logger.warning(f"ensure_trades_schema warning: {e}")
 
-# Durée FR (ex: "1 heure 10 minutes", "15 minutes 42 secondes", "0 seconde")
+# Durée lisible (ex: 1h10, 23 min 10 s)
 def human_duration_verbose(ms: int) -> str:
     if ms <= 0:
-        return "0 seconde"
+        return "0 s"
     s = ms // 1000
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
-    parts = []
     if h > 0:
-        parts.append(f"{h} heure" + ("s" if h > 1 else ""))
+        return f"{h} h {m} min"
     if m > 0:
-        parts.append(f"{m} minute" + ("s" if m > 1 else ""))
-    if sec > 0 and h == 0:  # pour ne pas faire trop verbeux si > 1h
-        parts.append(f"{sec} seconde" + ("s" if sec > 1 else ""))
-    return " ".join(parts) or "0 seconde"
+        return f"{m} min {sec} s"
+    return f"{sec} s"
 # =========================
-# Telegram (worker + helpers)
+# Telegram
 # =========================
 _last_tg_sent: Dict[str, float] = {}
-_last_msg_dedupe: Dict[str, float] = {}
 _last_altseason_notify_ts: float = 0.0
-_vector_last_sent: Dict[str, float] = {}
 
-_send_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-_last_sent_ts: float = 0.0
-_httpx_client: Optional[httpx.AsyncClient] = None
+# Throttle global
+_last_global_send_ts: float = 0.0
+_send_times_window = deque()  # timestamps des envois < 60s
+_last_vector_flush_ts: float = 0.0
 
 def _create_dashboard_button() -> Optional[dict]:
     if not TG_BUTTONS or not TG_DASHBOARD_URL:
         return None
-    return {"inline_keyboard": [[{"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}]]}
+    return {
+        "inline_keyboard": [[
+            {"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}
+        ]]
+    }
 
-async def _telegram_worker():
-    global _last_sent_ts, _httpx_client
-    _httpx_client = httpx.AsyncClient(timeout=10)
-    try:
-        while True:
-            job = await _send_queue.get()
-            payload = job["payload"]
-            pin = job.get("pin", False)
-            backoff = TG_RETRY_BACKOFF_BASE
+async def _respect_rate_limits():
+    """Respecte les limites: délai mini + plafond / minute."""
+    global _last_global_send_ts, _send_times_window
 
-            while True:
-                now = time.time()
-                delta = now - _last_sent_ts
-                if delta < TG_MIN_DELAY_SEC:
-                    await asyncio.sleep(TG_MIN_DELAY_SEC - delta)
+    now = time.time()
 
-                try:
-                    r = await _httpx_client.post(
-                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                        json=payload
-                    )
-                    if r.status_code == 429:
-                        ra = 1.0
-                        try:
-                            data = r.json()
-                            ra = float(data.get("parameters", {}).get("retry_after", 1.0))
-                        except Exception:
-                            pass
-                        logger.warning(f"Telegram 429: retry_after={ra}s")
-                        await asyncio.sleep(max(ra, TG_MIN_DELAY_SEC))
-                        continue
+    # fenêtre glissante 60s
+    while _send_times_window and now - _send_times_window[0] > 60:
+        _send_times_window.popleft()
 
-                    r.raise_for_status()
-                    _last_sent_ts = time.time()
-                    data = r.json()
-                    logger.info(f"Telegram sent: {str(payload.get('text',''))[:80]}...")
+    if len(_send_times_window) >= TG_PER_MIN_LIMIT:
+        sleep_for = 60 - (now - _send_times_window[0]) + 0.2
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
 
-                    if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
-                        try:
-                            mid = data["result"]["message_id"]
-                            await _httpx_client.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage",
-                                json={"chat_id": TELEGRAM_CHAT_ID, "message_id": mid, "disable_notification": True}
-                            )
-                        except Exception as e:
-                            logger.warning(f"Pin message failed: {e}")
-                    break
+    # délai minimal inter-messages
+    delta = now - _last_global_send_ts
+    if delta < TG_MIN_DELAY_SEC:
+        await asyncio.sleep(TG_MIN_DELAY_SEC - delta)
 
-                except httpx.HTTPStatusError as e:
-                    logger.warning(f"Telegram HTTP error: {e}")
-                    await asyncio.sleep(min(60, backoff))
-                    backoff *= 2
-                except Exception as e:
-                    logger.warning(f"Telegram send exception: {e}")
-                    await asyncio.sleep(min(60, backoff))
-                    backoff *= 2
+def _record_sent():
+    global _last_global_send_ts, _send_times_window
+    ts = time.time()
+    _last_global_send_ts = ts
+    _send_times_window.append(ts)
 
-            _send_queue.task_done()
-    finally:
-        if _httpx_client is not None:
-            await _httpx_client.aclose()
-
-async def tg_send_text(text: str, disable_web_page_preview: bool = True,
-                       key: Optional[str] = None, reply_markup: Optional[dict] = None,
-                       pin: bool = False) -> Dict[str, Any]:
+async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None,
+                       reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
     if not TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
 
     k = key or "default"
-    now = time.time()
-    last = _last_tg_sent.get(k, 0)
-    if now - last < TELEGRAM_COOLDOWN_SEC:
-        logger.warning(f"Telegram skipped by per-key cooldown for key={k}")
+    # anti-spam par clé (en plus du global)
+    now_ts = time.time()
+    last = _last_tg_sent.get(k, 0.0)
+    if now_ts - last < TG_MIN_DELAY_SEC:
+        logger.warning("Telegram send skipped due to per-key cooldown")
         return {"ok": False, "reason": "cooldown"}
-    _last_tg_sent[k] = now
+    _last_tg_sent[k] = now_ts
 
-    # anti-doublon sur 10s
-    h = f"{hash(text)}"
-    if now - _last_msg_dedupe.get(h, 0) < 10:
-        logger.warning("Telegram skipped duplicate text")
-        return {"ok": False, "reason": "duplicate"}
-    _last_msg_dedupe[h] = now
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -277,8 +236,46 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True,
     if reply_markup:
         payload["reply_markup"] = reply_markup
 
-    await _send_queue.put({"payload": payload, "pin": pin})
-    return {"ok": True}
+    await _respect_rate_limits()
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+            # Gestion 429 — on lit retry_after & on retente 1 fois
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    ra = float(j.get("parameters", {}).get("retry_after", 30))
+                except Exception:
+                    ra = 30.0
+                logger.warning(f"Telegram 429: retry_after={ra:.1f}s")
+                await asyncio.sleep(ra + 0.5)
+                # retente une fois
+                await _respect_rate_limits()
+                r = await client.post(url, json=payload)
+
+            r.raise_for_status()
+            data = r.json()
+            logger.info(f"Telegram sent: {text[:80]}...")
+
+            _record_sent()
+
+            if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
+                try:
+                    message_id = data["result"]["message_id"]
+                    pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+                    await client.post(pin_url, json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "message_id": message_id,
+                        "disable_notification": True
+                    })
+                except Exception as e:
+                    logger.warning(f"Pin message failed: {e}")
+
+            return {"ok": True, "result": data}
+    except Exception as e:
+        logger.warning(f"Telegram send error: {e}")
+        return {"ok": False, "reason": str(e)}
 
 def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
     return (tf_label or tf_to_label(tf) or "").strip()
@@ -301,62 +298,130 @@ def _calc_rr(entry: Optional[float], sl: Optional[float], tp1: Optional[float]) 
     except Exception:
         return None
 
-def _parse_leverage(leverage: Optional[str]) -> Optional[float]:
-    if not leverage:
-        return None
-    try:
-        # formats possibles: "15x cross", "10x", "20"
-        s = str(leverage).lower().split()[0].replace("x", "")
-        return float(s)
-    except Exception:
-        return None
-
-def _confidence_dynamic(payload: dict) -> Dict[str, Any]:
-    """Calcule une confiance 0-100 + explication, basée sur R/R, momentum, breadth, levier."""
-    entry = payload.get("entry"); sl = payload.get("sl"); tp1 = payload.get("tp1")
-    rr = _calc_rr(entry, sl, tp1) or 1.0
-    lev = _parse_leverage(payload.get("leverage") or payload.get("lev_reco"))
-
-    # Snapshot global
-    alt = compute_altseason_snapshot()
-    momentum_pct = float(alt["signals"]["recent_entries_ratio"])  # 0..100
-    breadth_sym = int(alt["signals"]["breadth_symbols"])          # nombre de sym en TP 24h
-
-    # Normalisations
-    rr_f = min(max(rr / 2.0, 0.0), 1.0)                 # rr 2.0 => 1.0
-    mom_f = min(max(momentum_pct / 100.0, 0.0), 1.0)
-    breadth_f = min(breadth_sym / 20.0, 1.0)            # cap à 20 symboles
-    lev_penalty = 0.0
-    if lev:
-        # >20x pénalise fort, 10-20 pénalise léger
-        lev_penalty = 0.25 if lev >= 20 else (0.10 if lev >= 10 else 0.0)
-
-    # Pondérations
-    score = (
-        0.45 * rr_f +
-        0.30 * mom_f +
-        0.20 * breadth_f -
-        lev_penalty
-    )
-    pct = int(min(max(round(score * 100), 1), 98))
-    # Raison courte et claire
-    reason = f"Basée sur R/R={rr:.2f}, momentum={momentum_pct:.0f}%, breadth={breadth_sym} sym" + (f", lev={int(lev)}x" if lev else "")
-    return {"pct": pct, "reason": reason}
-
-def _append_elapsed(text: str, elapsed_ms: Optional[int]) -> str:
-    if elapsed_ms is None:
-        return text
-    return text + f"\n\n⏱ <i>Temps écoulé :</i> {human_duration_verbose(elapsed_ms)}"
-
-def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any,
-                          note: Optional[str] = None, elapsed_ms: Optional[int] = None) -> str:
+def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
     icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
     n = f" — {note}" if note else ""
-    base = f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
-    return _append_elapsed(base, elapsed_ms)
+    return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
+# =========================
+# Confiance & messages enrichis
+# =========================
+def compute_altseason_snapshot() -> dict:
+    t24 = ms_ago(24*60)
 
-# ENTRY — FR + R/R + confiance dynamique si besoin
-def format_entry_announcement(payload: dict, elapsed_ms: Optional[int]) -> str:
+    # A) LONG ratio
+    row = db_query("""
+        SELECT
+          SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
+          SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS short_n
+        FROM events
+        WHERE type='ENTRY' AND time>=?
+    """, (t24,))
+    long_n = (row[0]["long_n"] if row else 0) or 0
+    short_n = (row[0]["short_n"] if row else 0) or 0
+
+    def _pct(x, y):
+        try:
+            x = float(x or 0); y = float(y or 0)
+            return 0.0 if y == 0 else 100.0 * x / y
+        except Exception:
+            return 0.0
+
+    A = _pct(long_n, long_n + short_n)
+
+    # B) TP vs SL (favorise LONG si side présent)
+    row = db_query("""
+      WITH tp AS (
+        SELECT COUNT(*) AS n FROM events
+        WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=? AND (side IS NULL OR side='LONG')
+      ),
+      sl AS (
+        SELECT COUNT(*) AS n FROM events
+        WHERE type='SL_HIT' AND time>=? AND (side IS NULL OR side='LONG')
+      )
+      SELECT tp.n AS tp_n, sl.n AS sl_n FROM tp, sl
+    """, (t24, t24))
+    tp_n = (row[0]["tp_n"] if row else 0) or 0
+    sl_n = (row[0]["sl_n"] if row else 0) or 0
+    B = _pct(tp_n, tp_n + sl_n)
+
+    # C) Breadth
+    row = db_query("""
+      SELECT COUNT(DISTINCT symbol) AS sym_gain FROM events
+      WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
+    """, (t24,))
+    sym_gain = (row[0]["sym_gain"] if row else 0) or 0
+    C = float(min(100.0, sym_gain * 2.0))
+
+    # D) Momentum (90 min / 24h)
+    t90 = ms_ago(90)
+    row = db_query("""
+      WITH w AS (
+        SELECT SUM(CASE WHEN time>=? THEN 1 ELSE 0 END) AS recent_n,
+               COUNT(*) AS total_n
+        FROM events
+        WHERE type='ENTRY' AND time>=?
+      )
+      SELECT recent_n, total_n FROM w
+    """, (t90, t24))
+    recent_n = (row[0]["recent_n"] if row else 0) or 0
+    total_n  = (row[0]["total_n"] if row else 0) or 0
+    D = _pct(recent_n, total_n)
+
+    score = round((A + B + C + D)/4.0)
+    label = "Altseason (forte)" if score >= 75 else ("Altseason (modérée)" if score >= 50 else "Marché neutre/faible")
+    return {
+        "score": int(score),
+        "label": label,
+        "window_minutes": 24*60,
+        "signals": {
+            "long_ratio": round(A, 1),
+            "tp_vs_sl": round(B, 1),
+            "breadth_symbols": int(sym_gain),
+            "recent_entries_ratio": round(D, 1),
+        }
+    }
+
+def build_confidence_line(payload: dict) -> str:
+    """
+    Génère un texte explicatif dynamique de la confiance basé sur:
+    - R/R calculé (si entry, sl, tp1 présents)
+    - Altseason snapshot (momentum, breadth, ratio long)
+    - Leverage (faible/moyen/élevé)
+    """
+    entry = payload.get("entry"); sl = payload.get("sl"); tp1 = payload.get("tp1")
+    rr = _calc_rr(entry, sl, tp1)
+    alt = compute_altseason_snapshot()
+    lev = (payload.get("leverage") or payload.get("lev_reco") or "").strip()
+
+    factors = []
+    if rr is not None:
+        factors.append(f"R/R {rr}")
+    factors.append(f"Momentum {alt['signals']['recent_entries_ratio']}%")
+    factors.append(f"Breadth {alt['signals']['breadth_symbols']} sym")
+    factors.append(f"Bias LONG {alt['signals']['long_ratio']}%")
+    if lev:
+        try:
+            lev_f = float(str(lev).lower().replace("x","").replace("cross","").strip())
+            lev_txt = "lev élevé" if lev_f >= 15 else ("lev moyen" if lev_f >= 7 else "lev faible")
+        except Exception:
+            lev_txt = lev
+        factors.append(lev_txt)
+
+    conf = payload.get("confidence")
+    # Si la confiance n'est pas fournie, on la déduit grossièrement d'un mix (RR, momentum, breadth)
+    if conf is None:
+        base = 50
+        if rr is not None:
+            base += max(min((rr - 1.0) * 10, 20), -10)  # RR 2≈ +10, RR 3≈ +20
+        base += max(min((alt["signals"]["recent_entries_ratio"] - 50) * 0.3, 15), -15)
+        base += max(min((alt["signals"]["breadth_symbols"] - 10) * 0.7, 15), -10)
+        conf = int(max(5, min(95, round(base))))
+        payload["confidence"] = conf  # on enrichit pour l'affichage
+
+    return f"🧠 Confiance: {conf}% — basé sur " + ", ".join(factors)
+
+# (1) ENTRY — format FR + R/R + temps écoulé
+def format_entry_announcement(payload: dict) -> str:
     symbol   = payload.get("symbol", "")
     tf_lbl   = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i   = _fmt_side(payload.get("side"))
@@ -366,7 +431,6 @@ def format_entry_announcement(payload: dict, elapsed_ms: Optional[int]) -> str:
     tp3      = payload.get("tp3")
     sl       = payload.get("sl")
     leverage = payload.get("leverage") or payload.get("lev_reco") or ""
-    conf_in  = payload.get("confidence")
     note     = (payload.get("note") or "").strip()
 
     rr = _calc_rr(entry, sl, tp1)
@@ -378,16 +442,13 @@ def format_entry_announcement(payload: dict, elapsed_ms: Optional[int]) -> str:
     if tp3 is not None: lines.append(f"🎯 TP3: {tp3}")
     if sl  is not None: lines.append(f"❌ SL: {sl}")
 
-    # Confiance: si non fournie ou toujours 69, on calcule
-    conf_line = ""
-    if conf_in is None or int(conf_in) == 69:
-        dyn = _confidence_dynamic(payload)
-        conf_line = f"🧠 Confiance: {dyn['pct']}% — {dyn['reason']}."
-    else:
-        expl = note if note else "Estimation selon le setup et le contexte."
-        conf_line = f"🧠 Confiance: {int(conf_in)}% — {expl}"
-
+    conf_line = build_confidence_line(payload)
     tip_line = "💡 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
+
+    # Temps écoulé depuis l'entry (0 s au moment de l'entry)
+    t_entry = payload.get("time") or now_ms()
+    elapsed = max(0, (now_ms() - int(t_entry)))
+    elapsed_line = f"⏱ Temps écoulé : {human_duration_verbose(elapsed)}"
 
     msg = [
         f"📩 {symbol} {tf_lbl}",
@@ -396,38 +457,41 @@ def format_entry_announcement(payload: dict, elapsed_ms: Optional[int]) -> str:
         *lines,
         conf_line,
         tip_line,
+        elapsed_line,
     ]
-    return _append_elapsed("\n".join([m for m in msg if m]), elapsed_ms)
+    if note:
+        msg.append(f"📝 {note}")
+    return "\n".join([m for m in msg if m])
 
-# TP/SL/CLOSE — avec durée
+# (2)(3)(4) TP/SL/CLOSE — avec temps écoulé
 def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[int]) -> str:
     symbol = payload.get("symbol", "")
     tf_lbl = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i = _fmt_side(payload.get("side"))
     base   = f"{symbol} {tf_lbl}"
-    d_txt  = f" — Durée : {human_duration_verbose(duration_ms)}" if duration_ms is not None else ""
+    d_txt  = f"⏱ Temps écoulé : {human_duration_verbose(duration_ms)}" if duration_ms is not None else ""
 
     if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
         tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
-        return f"✅ {tick} atteint — {base}\n{side_i['label'].title()}{d_txt}"
+        return f"✅ {tick} atteint — {base}\n{side_i['label'].title()}\n{d_txt}"
 
     if etype == "SL_HIT":
-        return f"🛑 SL touché — {base}\n{side_i['label'].title()}{d_txt}"
+        return f"🛑 SL touché — {base}\n{side_i['label'].title()}\n{d_txt}"
 
     if etype == "CLOSE":
         note = payload.get("note") or ""
-        return f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}" + (f"\n📝 {note}" if note else "") + (d_txt or "")
+        x = f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}"
+        if note:
+            x += f"\n📝 {note}"
+        if d_txt:
+            x += f"\n{d_txt}"
+        return x
 
-    return f"ℹ️ {etype} — {base}" + (d_txt or "")
+    return f"ℹ️ {etype} — {base}" + (f"\n{d_txt}" if d_txt else "")
 # =========================
 # FastAPI
 # =========================
 app = FastAPI(title="AI Trader", version="1.0")
-
-@app.on_event("startup")
-async def _startup_worker():
-    if TELEGRAM_ENABLED:
-        asyncio.create_task(_telegram_worker())
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -498,16 +562,6 @@ def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
         return int(r[0]["t"])
     return None
 
-def get_latest_entry_time_for_symbol_tf(symbol: str, tf: Any) -> Optional[int]:
-    """Dernier ENTRY pour (symbol, tf) avant maintenant."""
-    rows = db_query("""
-        SELECT time FROM events
-        WHERE type='ENTRY' AND symbol=? AND tf=?
-        ORDER BY time DESC LIMIT 1
-    """, (symbol, str(tf) if tf is not None else None))
-    if rows:
-        return int(rows[0]["time"])
-    return None
 # =========================
 # Webhook
 # =========================
@@ -537,41 +591,34 @@ async def tv_webhook(req: Request):
             key = payload.get("trade_id") or f"{etype}:{symbol}"
 
             if etype == "VECTOR_CANDLE":
-                tf_label = payload.get("tf_label") or tf_to_label(tf)
-                key_vec = f"{symbol}:{tf_label}"
-                now = time.time()
-                last = _vector_last_sent.get(key_vec, 0)
-                if now - last < VECTOR_MIN_GAP_SEC:
-                    logger.info(f"Skip VECTOR_CANDLE burst for {key_vec}")
+                # Throttle global des vectors
+                global _last_vector_flush_ts
+                now_sec = time.time()
+                if now_sec - _last_vector_flush_ts < VECTOR_GLOBAL_GAP_SEC:
+                    logger.info("Skip VECTOR_CANDLE by global throttle")
                 else:
-                    _vector_last_sent[key_vec] = now
-                    # temps écoulé depuis le dernier ENTRY (si dispo)
-                    entry_t = get_latest_entry_time_for_symbol_tf(symbol, tf)
-                    elapsed = (now_ms() - entry_t) if entry_t is not None else None
-
+                    _last_vector_flush_ts = now_sec
                     txt = format_vector_message(
                         symbol=symbol,
-                        tf_label=tf_label,
+                        tf_label=payload.get("tf_label") or tf_to_label(tf),
                         direction=(payload.get("direction") or ""),
                         price=payload.get("price"),
                         note=payload.get("note"),
-                        elapsed_ms=elapsed,
                     )
-                    await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
+                    await tg_send_text(txt, key=key)
 
             elif etype == "ENTRY":
-                # ENTRY → elapsed = 0
-                txt = format_entry_announcement(payload, elapsed_ms=0)
-                await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
+                txt = format_entry_announcement(payload)
+                await tg_send_text(txt, key=key)
 
             elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
                 hit_time = payload.get("time") or now_ms()
                 entry_t  = get_entry_time_for_trade(payload.get("trade_id"))
                 duration = (hit_time - entry_t) if entry_t is not None else None
                 txt = format_event_announcement(etype, payload, duration)
-                await tg_send_text(txt, key=key, reply_markup=_create_dashboard_button())
+                await tg_send_text(txt, key=key)
 
-        # 3) altseason auto-notify (après un event)
+        # 3) altseason auto-notify opportuniste (après un event)
         await maybe_altseason_autonotify()
 
     except Exception as e:
@@ -579,95 +626,18 @@ async def tv_webhook(req: Request):
 
     return JSONResponse({"ok": True, "trade_id": trade_id})
 
-# =========================
-# Altseason (4 signaux, Vectors exclus)
-# =========================
-def _pct(x, y):
-    try:
-        x = float(x or 0); y = float(y or 0)
-        return 0.0 if y == 0 else 100.0 * x / y
-    except Exception:
-        return 0.0
-
-def compute_altseason_snapshot() -> dict:
-    t24 = ms_ago(24*60)
-
-    # A) LONG ratio
-    row = db_query("""
-        SELECT
-          SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
-          SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS short_n
-        FROM events
-        WHERE type='ENTRY' AND time>=?
-    """, (t24,))
-    long_n = (row[0]["long_n"] if row else 0) or 0
-    short_n = (row[0]["short_n"] if row else 0) or 0
-    A = _pct(long_n, (long_n + short_n))
-
-    # B) TP vs SL (favorise LONG si side présent)
-    row = db_query("""
-      WITH tp AS (
-        SELECT COUNT(*) AS n FROM events
-        WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=? AND (side IS NULL OR side='LONG')
-      ),
-      sl AS (
-        SELECT COUNT(*) AS n FROM events
-        WHERE type='SL_HIT' AND time>=? AND (side IS NULL OR side='LONG')
-      )
-      SELECT tp.n AS tp_n, sl.n AS sl_n FROM tp, sl
-    """, (t24, t24))
-    tp_n = (row[0]["tp_n"] if row else 0) or 0
-    sl_n = (row[0]["sl_n"] if row else 0) or 0
-    B = _pct(tp_n, (tp_n + sl_n))
-
-    # C) Breadth
-    row = db_query("""
-      SELECT COUNT(DISTINCT symbol) AS sym_gain FROM events
-      WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
-    """, (t24,))
-    sym_gain = (row[0]["sym_gain"] if row else 0) or 0
-    C = float(min(100.0, sym_gain * 2.0))
-
-    # D) Momentum (90 min / 24h)
-    t90 = ms_ago(90)
-    row = db_query("""
-      WITH w AS (
-        SELECT SUM(CASE WHEN time>=? THEN 1 ELSE 0 END) AS recent_n,
-               COUNT(*) AS total_n
-        FROM events
-        WHERE type='ENTRY' AND time>=?
-      )
-      SELECT recent_n, total_n FROM w
-    """, (t90, t24))
-    recent_n = (row[0]["recent_n"] if row else 0) or 0
-    total_n  = (row[0]["total_n"] if row else 0) or 0
-    D = _pct(recent_n, total_n)
-
-    score = round((A + B + C + D)/4.0)
-    label = "Altseason (forte)" if score >= 75 else ("Altseason (modérée)" if score >= 50 else "Marché neutre/faible")
-    return {
-        "score": int(score),
-        "label": label,
-        "window_minutes": 24*60,
-        "signals": {
-            "long_ratio": round(A, 1),
-            "tp_vs_sl": round(B, 1),
-            "breadth_symbols": int(sym_gain),
-            "recent_entries_ratio": round(D, 1),
-        }
-    }
-
 async def maybe_altseason_autonotify():
+    """Envoie l'alerte altseason auto (épinglée) si seuils OK + cooldown."""
     global _last_altseason_notify_ts
     if not ALTSEASON_AUTONOTIFY or not TELEGRAM_ENABLED:
         return
 
     alt = compute_altseason_snapshot()
     greens = alt["signals"]["breadth_symbols"]
-    now = datetime.now().timestamp()
+    nowt = time.time()
     if greens < ALT_GREENS_REQUIRED or alt["score"] < 50:
         return
-    if (now - _last_altseason_notify_ts) < (ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
+    if (nowt - _last_altseason_notify_ts) < (ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
         return
 
     emoji = "🟢" if alt["score"] >= 75 else "🟡"
@@ -682,12 +652,14 @@ async def maybe_altseason_autonotify():
 • Breadth: {alt['signals']['breadth_symbols']} symboles
 • Momentum: {alt['signals']['recent_entries_ratio']}%
 
+⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {ALT_GREENS_REQUIRED})
+
 <i>Notification automatique activée</i>"""
 
     reply_markup = _create_dashboard_button()
     res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
     if res.get("ok"):
-        _last_altseason_notify_ts = now
+        _last_altseason_notify_ts = nowt
 # =========================
 # Helpers /trades : statut, outcome, annulation
 # =========================
@@ -829,10 +801,12 @@ async def trades_page():
       *{box-sizing:border-box}
       body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
       .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
+
       .grid{display:grid;gap:16px}
       .g-2{grid-template-columns:1fr 1fr}
       .g-4{grid-template-columns:repeat(4,1fr)}
       @media(max-width:1000px){.g-4{grid-template-columns:repeat(2,1fr)}}
+
       .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px 18px}
       .muted{color:var(--muted)}
       .kpi{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:14px 16px}
@@ -840,6 +814,7 @@ async def trades_page():
       .kpi .v{margin-top:6px;font-size:22px;font-weight:700}
       .score{display:flex;align-items:center;justify-content:center;width:120px;height:120px;border-radius:999px;background:#f6c453;color:#000;font-size:28px;font-weight:800;margin:0 auto;border:6px solid #7a4c00}
       .score small{display:block;font-size:11px;font-weight:600}
+
       table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
       thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--border)}
       tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px;vertical-align:middle}
@@ -849,6 +824,7 @@ async def trades_page():
       .row-sl .accent{background:var(--red)}
       .row-cancel .accent{background:var(--amber)}
       .row-normal .accent{background:transparent}
+
       .pill{padding:4px 10px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);color:#cbd5e1;font-size:12px;display:inline-flex;gap:6px;align-items:center}
       .pill.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.45);color:#86efac}
       .pill.sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
