@@ -3,10 +3,10 @@ import os
 import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import httpx
 
@@ -33,9 +33,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 TELEGRAM_COOLDOWN_SEC = int(os.getenv("TELEGRAM_COOLDOWN_SEC", "15"))
 
-# Vector icons
-VECTOR_UP_ICON = "🟩"   # carré vert
-VECTOR_DN_ICON = "🟥"   # carré rouge (si DOWN)
+# Vector icons (🟩 vert UP demandé)
+VECTOR_UP_ICON = "🟩"
+VECTOR_DN_ICON = "🟥"
 
 # =========================
 # SQLite
@@ -60,7 +60,8 @@ def db_query(sql: str, params: tuple = ()) -> List[dict]:
     cur = DB.cursor()
     cur = cur.execute(sql, params)
     return list(cur.fetchall())
-# Initial schema (souple : n’écrase pas si déjà existant)
+
+# Schéma de base
 db_execute("""
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +91,7 @@ CREATE TABLE IF NOT EXISTS events (
 )
 """)
 
-# Index utiles
+# Index
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
 db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -119,7 +120,7 @@ def ensure_trades_schema():
     cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
     if "tf_label" not in cols:
         db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
-    # Réindex de sûreté
+    # réindex au cas où
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
     db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
@@ -135,7 +136,6 @@ try:
     ensure_trades_schema()
 except Exception as e:
     logger.warning(f"ensure_trades_schema warning: {e}")
-
 # =========================
 # Telegram
 # =========================
@@ -145,7 +145,6 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
     if not TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
 
-    # Cooldown par "key"
     k = key or "default"
     now = datetime.now().timestamp()
     last = _last_tg_sent.get(k, 0)
@@ -175,6 +174,72 @@ def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any
     icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
     n = f" — {note}" if note else ""
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
+
+# --- Annonces Telegram format "classique" (ENTRY détaillé) ---
+def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
+    return (tf_label or tf_to_label(tf) or "").strip()
+
+def _fmt_side(side: Optional[str]) -> Dict[str, str]:
+    s = (side or "").upper()
+    if s == "LONG":
+        return {"emoji": "📈", "label": "Long"}
+    if s == "SHORT":
+        return {"emoji": "📉", "label": "Short"}
+    return {"emoji": "📌", "label": (side or "Side")}
+
+def format_entry_announcement(payload: dict) -> str:
+    symbol   = payload.get("symbol", "")
+    tf_lbl   = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
+    side_i   = _fmt_side(payload.get("side"))
+    entry    = payload.get("entry")
+    tp1      = payload.get("tp1")
+    tp2      = payload.get("tp2")
+    tp3      = payload.get("tp3")
+    sl       = payload.get("sl")
+    leverage = payload.get("leverage") or payload.get("lev_reco") or ""
+    conf     = payload.get("confidence")
+    note     = (payload.get("note") or "").strip()
+
+    lines = []
+    if tp1 is not None: lines.append(f"🎯 TP1: {tp1}")
+    if tp2 is not None: lines.append(f"🎯 TP2: {tp2}")
+    if tp3 is not None: lines.append(f"🎯 TP3: {tp3}")
+    if sl  is not None: lines.append(f"❌ SL: {sl}")
+
+    conf_line = ""
+    if conf is not None:
+        expl = note if note else f"Le setup {side_i['label'].upper()} a un risque acceptable si le contexte le confirme."
+        conf_line = f"🧠 Confiance LLM: {conf}% — {expl}"
+
+    tip_line = "🤖 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
+
+    msg = [
+        f"📩 {symbol} {tf_lbl}",
+        f"{side_i['emoji']} {side_i['label']} Entry: {entry}" if entry is not None else f"{side_i['emoji']} {side_i['label']}",
+        f"💡Leverage: {leverage}" if leverage else "",
+        *lines,
+        conf_line,
+        tip_line,
+    ]
+    return "\n".join([m for m in msg if m])
+
+def format_event_announcement(etype: str, payload: dict) -> str:
+    symbol = payload.get("symbol", "")
+    tf_lbl = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
+    side_i = _fmt_side(payload.get("side"))
+    price  = payload.get("price")
+    base   = f"{symbol} {tf_lbl}"
+
+    if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
+        tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
+        return f"✅ {tick} atteint — {base}\n{side_i['emoji']} {side_i['label']}" + (f" @ {price}" if price else "")
+    if etype == "SL_HIT":
+        return f"🛑 SL touché — {base}\n{side_i['emoji']} {side_i['label']}" + (f" @ {price}" if price else "")
+    if etype == "CLOSE":
+        note = payload.get("note") or ""
+        return f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}" + (f"\n📝 {note}" if note else "")
+    return f"ℹ️ {etype} — {base}"
+
 # =========================
 # FastAPI
 # =========================
@@ -193,7 +258,6 @@ async def root():
       </ul>
     </body></html>
     """)
-
 # =========================
 # Save Event (insère tf_label)
 # =========================
@@ -248,7 +312,6 @@ async def tv_webhook(req: Request):
     except Exception:
         raise HTTPException(400, "Invalid JSON")
 
-    # Secret check (souple : si non fourni côté TV, on n’échoue pas si WEBHOOK_SECRET vide)
     secret = payload.get("secret")
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
@@ -260,42 +323,36 @@ async def tv_webhook(req: Request):
     if not etype or not symbol:
         raise HTTPException(422, "Missing type or symbol")
 
-    # Sauvegarde
     trade_id = save_event(payload)
 
-    # Optionnel : envoyer Telegram selon le type
+    # Envoi Telegram (format classique)
     try:
         if TELEGRAM_ENABLED:
             key = f"{etype}:{symbol}"
+
             if etype == "VECTOR_CANDLE":
                 txt = format_vector_message(
                     symbol=symbol,
                     tf_label=payload.get("tf_label") or tf_to_label(tf),
-                    direction=payload.get("direction") or "",
+                    direction=(payload.get("direction") or ""),
                     price=payload.get("price"),
                     note=payload.get("note"),
                 )
                 await tg_send_text(txt, key=key)
-            elif etype in {"ENTRY", "CLOSE", "TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"}:
-                tfl = payload.get("tf_label") or tf_to_label(tf)
-                info = []
-                if payload.get("entry") is not None:
-                    info.append(f"entry <code>{payload['entry']}</code>")
-                if payload.get("sl") is not None:
-                    info.append(f"SL <code>{payload['sl']}</code>")
-                if payload.get("tp1") is not None:
-                    info.append(f"TP1 <code>{payload['tp1']}</code>")
-                if payload.get("tp2") is not None:
-                    info.append(f"TP2 <code>{payload['tp2']}</code>")
-                if payload.get("tp3") is not None:
-                    info.append(f"TP3 <code>{payload['tp3']}</code>")
-                detail = " | ".join(info) if info else ""
-                txt = f"<b>{etype}</b> | <b>{symbol}</b> <i>{tfl}</i>" + (f" — {detail}" if detail else "")
-                await tg_send_text(txt, key=key)
+
+            elif etype == "ENTRY":
+                txt = format_entry_announcement(payload)
+                await tg_send_text(txt, key=payload.get("trade_id") or key)
+
+            elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
+                txt = format_event_announcement(etype, payload)
+                await tg_send_text(txt, key=payload.get("trade_id") or key)
+
     except Exception as e:
         logger.warning(f"Telegram send skipped due to cooldown or error: {e}")
 
     return JSONResponse({"ok": True, "trade_id": trade_id})
+
 # =========================
 # Altseason (4 signaux, sans Vectors)
 # =========================
@@ -383,364 +440,209 @@ def compute_altseason_snapshot() -> dict:
         }
     }
 # =========================
-# /trades — Dashboard avancé (TP verts, SL rouge, Cancel/Flip orange + filtres)
+# Aide /trades : statut & annulation
 # =========================
-def _parse_date_to_ms(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%d")
-        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
-    except Exception:
-        return None
-
-def _fetch_entries(symbol: Optional[str], tf: Optional[str],
-                   since_ms: Optional[int], until_ms: Optional[int],
-                   limit: int) -> List[dict]:
-    where = ["type='ENTRY'"]
-    params: List[Any] = []
-    if symbol:
-        if "%" in symbol:
-            where.append("symbol LIKE ?")
-        else:
-            where.append("symbol = ?")
-        params.append(symbol.upper())
-    if tf:
-        where.append("(tf = ? OR tf_label = ?)")
-        params += [tf, tf]
-    if since_ms:
-        where.append("time >= ?")
-        params.append(int(since_ms))
-    if until_ms:
-        where.append("time < ?")
-        params.append(int(until_ms))
-
-    sql = f"""
-      SELECT trade_id, symbol, tf, COALESCE(tf_label,'') AS tf_label,
-             side, entry, sl, tp1, tp2, tp3, MAX(time) AS opened_ts
-      FROM events
-      WHERE {" AND ".join(where)}
-      GROUP BY trade_id
-      ORDER BY opened_ts DESC
-      LIMIT ?
-    """
-    params.append(limit)
-    return db_query(sql, tuple(params))
-
-def _fetch_hits_for_trade(trade_id: str) -> dict:
+def _latest_entry_for_trade(trade_id: str) -> Optional[dict]:
     rows = db_query("""
-        SELECT type, time, COALESCE(note,'') AS note
-        FROM events
-        WHERE trade_id = ?
-          AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT','CLOSE')
-        ORDER BY time ASC
+      SELECT * FROM events
+      WHERE trade_id=? AND type='ENTRY'
+      ORDER BY time DESC LIMIT 1
     """, (trade_id,))
-    hit = {
-        "tp1": False, "tp2": False, "tp3": False,
-        "sl": False, "closed": False, "flip_note": False,
-        "first_close_ts": None, "first_hit_ts": None
-    }
-    for r in rows:
-        t = r["type"]
-        if t == "TP1_HIT":
-            hit["tp1"] = True
-            hit["first_hit_ts"] = hit["first_hit_ts"] or r["time"]
-        elif t == "TP2_HIT":
-            hit["tp2"] = True
-            hit["first_hit_ts"] = hit["first_hit_ts"] or r["time"]
-        elif t == "TP3_HIT":
-            hit["tp3"] = True
-            hit["first_hit_ts"] = hit["first_hit_ts"] or r["time"]
-        elif t == "SL_HIT":
-            hit["sl"] = True
-            hit["first_hit_ts"] = hit["first_hit_ts"] or r["time"]
-        elif t == "CLOSE":
-            hit["closed"] = True
-            hit["first_close_ts"] = hit["first_close_ts"] or r["time"]
-            note = (r.get("note") or "").lower()
-            if "flip" in note or "reverse" in note or "direction" in note:
-                hit["flip_note"] = True
-    return hit
+    return rows[0] if rows else None
 
-def _detect_flip(symbol: str, tf: str, opened_ts: int, side: Optional[str], this_trade_id: str) -> Optional[int]:
+def _has_hit(trade_id: str) -> Dict[str, bool]:
+    hits = db_query("""
+      SELECT type, MAX(time) AS t FROM events
+      WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT','CLOSE')
+      GROUP BY type
+    """, (trade_id,))
+    return {r["type"]: True for r in hits}
+
+def _is_cancelled_due_to_opposite_after(entry_row: dict) -> bool:
     """
-    Flip détecté si un ENTRY plus récent existe pour le même symbol+tf
-    avec un side opposé (LONG vs SHORT). Retourne le timestamp du flip si trouvé.
+    Marque 'annulé' (orange) si APRES cette ENTRY,
+    on a une autre ENTRY sur le même symbole+tf avec side opposé.
     """
-    if not side:
-        return None
-    opposite = "SHORT" if side.upper() == "LONG" else "LONG"
-    row = db_query("""
-        SELECT MIN(time) AS t
-        FROM events
-        WHERE type='ENTRY' AND symbol=? AND (tf=? OR tf_label=?)
-          AND time > ? AND UPPER(COALESCE(side,'')) = ?
-    """, (symbol, tf, tf, opened_ts, opposite))
-    t = (row[0]["t"] if row and row[0]["t"] is not None else None)
-    return int(t) if t else None
+    symbol = entry_row.get("symbol")
+    tf     = entry_row.get("tf")
+    side   = (entry_row.get("side") or "").upper()
+    t      = entry_row.get("time") or 0
+    if not symbol or tf is None or not side:
+        return False
+    opposite = "SHORT" if side == "LONG" else ("LONG" if side == "SHORT" else "")
+    if not opposite:
+        return False
+    r = db_query("""
+      SELECT 1 FROM events
+      WHERE type='ENTRY' AND symbol=? AND tf=? AND time>? AND UPPER(COALESCE(side,''))=?
+      LIMIT 1
+    """, (symbol, str(tf), int(t), opposite))
+    return bool(r)
 
-def _fmt_duration_secs(opened_ts: Optional[int], end_ts: Optional[int]) -> int:
-    if not opened_ts or not end_ts:
-        return 0
-    return max(0, int((end_ts - opened_ts) / 1000))
+# =========================
+# /trades (TP verts, SL rouge, annulé orange)
+# =========================
+def build_trade_rows(limit=300):
+    entries = db_query("""
+      SELECT e.trade_id, MAX(e.time) AS t_entry
+      FROM events e
+      WHERE e.type='ENTRY'
+      GROUP BY e.trade_id
+      ORDER BY t_entry DESC
+      LIMIT ?
+    """, (limit,))
 
-def _compute_summary(rows: List[dict]) -> dict:
-    total = len(rows)
-    wins = losses = 0
-    tp1n = tp2n = tp3n = 0
-    durations: List[int] = []
-    for r in rows:
-        if r["sl_hit"]:
-            losses += 1
-            durations.append(_fmt_duration_secs(r["opened_ts"], r["end_ts"] or r["opened_ts"]))
-        elif r["tp3_hit"] or r["tp2_hit"] or r["tp1_hit"]:
-            wins += 1
-            tp1n += int(r["tp1_hit"])
-            tp2n += int(r["tp2_hit"])
-            tp3n += int(r["tp3_hit"])
-            durations.append(_fmt_duration_secs(r["opened_ts"], r["end_ts"] or r["opened_ts"]))
-        elif r["opened_ts"] and r["end_ts"]:
-            durations.append(_fmt_duration_secs(r["opened_ts"], r["end_ts"]))
-    avg = int(sum(durations) / len(durations)) if durations else 0
-    winrate = round((wins / total) * 100, 1) if total else 0.0
-    return {"total": total, "wins": wins, "losses": losses, "winrate": winrate,
-            "tp1": tp1n, "tp2": tp2n, "tp3": tp3n, "avg_time": avg}
+    rows: List[dict] = []
+    for x in entries:
+        e = _latest_entry_for_trade(x["trade_id"])
+        if not e:
+            continue
 
-def build_trade_rows_v2(symbol: Optional[str], tf: Optional[str],
-                        start_date: Optional[str], end_date: Optional[str],
-                        limit: int) -> List[dict]:
-    since_ms = _parse_date_to_ms(start_date)
-    until_ms = _parse_date_to_ms(end_date)
-    entries = _fetch_entries(symbol, tf, since_ms, until_ms, limit)
-    out: List[dict] = []
-    for e in entries:
-        trade_id = e["trade_id"]
-        tf_label = e["tf_label"] or tf_to_label(e["tf"])
-        hits = _fetch_hits_for_trade(trade_id)
+        tf_label = (e.get("tf_label") or tf_to_label(e.get("tf")))
+        hit = _has_hit(e["trade_id"])
+        tp1_hit, tp2_hit, tp3_hit = bool(hit.get("TP1_HIT")), bool(hit.get("TP2_HIT")), bool(hit.get("TP3_HIT"))
+        sl_hit = bool(hit.get("SL_HIT"))
+        closed = bool(hit.get("CLOSE"))
 
-        # Statut par défaut
-        end_ts = None
-        row_class = ""
-        outcome_txt = "—"
+        cancelled = _is_cancelled_due_to_opposite_after(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
 
-        # 1) SL ou TP (prioritaires)
-        if hits["sl"]:
-            row_class = "row-sl"
-            outcome_txt = "SL"
-            end_ts = hits["first_hit_ts"]
-        elif hits["tp3"] or hits["tp2"] or hits["tp1"]:
-            if hits["tp3"]:
-                outcome_txt = "TP3"
-            elif hits["tp2"]:
-                outcome_txt = "TP2"
-            else:
-                outcome_txt = "TP1"
-            end_ts = hits["first_hit_ts"]
+        # Statut de ligne pour couleurs de fond:
+        # - rouge si SL
+        # - vert si un TP atteint
+        # - orange si annulé (changement direction)
+        row_state = "normal"
+        if sl_hit:
+            row_state = "sl"
+        elif tp1_hit or tp2_hit or tp3_hit:
+            row_state = "tp"
+        elif cancelled or closed:
+            row_state = "cancel"
 
-        # 2) CLOSE / NOTE flip
-        elif hits["closed"]:
-            row_class = "row-cancel"
-            outcome_txt = "Flip" if hits["flip_note"] else "Canceled"
-            end_ts = hits["first_close_ts"]
-
-        # 3) ENTRY opposé (flip “silencieux”)
-        flip_ts = _detect_flip(e["symbol"], str(e["tf"] or tf_label), e["opened_ts"], e["side"], trade_id)
-        if flip_ts and (end_ts is None or flip_ts < end_ts):
-            row_class = "row-cancel"
-            outcome_txt = "Flip"
-            end_ts = flip_ts
-
-        out.append({
-            "trade_id": trade_id,
+        rows.append({
+            "trade_id": e["trade_id"],
             "symbol": e["symbol"],
             "tf_label": tf_label,
             "side": e["side"],
             "entry": e["entry"],
-            "sl": e["sl"],
             "tp1": e["tp1"], "tp2": e["tp2"], "tp3": e["tp3"],
-            "opened_ts": e["opened_ts"],
-            "end_ts": end_ts,
-            "duration": _fmt_duration_secs(e["opened_ts"], end_ts),
-            "tp1_hit": hits["tp1"], "tp2_hit": hits["tp2"], "tp3_hit": hits["tp3"],
-            "sl_hit": hits["sl"],
-            "row_class": row_class, "outcome": outcome_txt
+            "sl": e["sl"],
+            "tp1_hit": tp1_hit,
+            "tp2_hit": tp2_hit,
+            "tp3_hit": tp3_hit,
+            "sl_hit":  sl_hit,
+            "row_state": row_state,
         })
-    return out
+    return rows
 
 @app.get("/trades", response_class=HTMLResponse)
-async def trades_page(
-    symbol: Optional[str] = Query(default=None, description="Ex: BTCUSDT.P (peut contenir %)"),
-    tf: Optional[str] = Query(default=None, description="Ex: 15, 60, 1D (tf ou tf_label)"),
-    start: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
-    end: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
-    limit: int = Query(default=100, ge=1, le=1000),
-):
+async def trades_page():
     try:
         ensure_trades_schema()
     except Exception:
         pass
 
     alt = compute_altseason_snapshot()
-    rows = build_trade_rows_v2(symbol, tf, start, end, limit)
-    summary = _compute_summary(rows)
+    rows = build_trade_rows(limit=300)
 
     css = """
     <style>
       :root { --bg:#0b0f14; --card:#111823; --txt:#e6edf3; --muted:#94a3b8;
-              --green:#16a34a; --red:#ef4444; --orange:#f59e0b;
-              --chip:#0f172a; --chip-b:#243041; --line:#1e293b; }
-      *{box-sizing:border-box}
-      body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+              --green:#16a34a; --red:#ef4444; --warn:#f59e0b;
+              --chip:#1f2937; --chip-b:#334155; }
+      body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
       .wrap{max-width:1200px;margin:24px auto;padding:0 16px}
-      .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
-      h2{margin:0 0 8px 0;font-size:18px}
-      .muted{color:var(--muted)}
-      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-      input,button{height:38px;border-radius:10px;border:1px solid var(--line);background:#0d1420;color:var(--txt);padding:0 10px}
-      input{min-width:160px}
-      button{background:#2563eb;border-color:#1e40af;cursor:pointer}
-      button:hover{filter:brightness(1.05)}
-      table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-      thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid var(--line)}
+      .altbox{display:flex;justify-content:space-between;align-items:center;background:var(--card);border:1px solid #1f2937;border-radius:16px;padding:16px 18px;margin-bottom:10px}
+      .altbox h2{margin:0;font-size:18px}
+      .altscore{font-weight:700;font-size:20px}
+      .altchips{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px 0}
+      .chip{background:var(--chip);border:1px solid var(--chip-b);padding:6px 10px;border-radius:999px;font-size:12px;color:var(--muted)}
+      table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid #1f2937;border-radius:12px;overflow:hidden}
+      thead th{font-size:12px;color:var(--muted);text-align:left;padding:10px;border-bottom:1px solid #1f2937}
       tbody td{padding:10px;border-bottom:1px solid #162032;font-size:14px}
       tbody tr:hover{background:#0e1520}
-      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+      .row-tp    { box-shadow: inset 4px 0 0 0 rgba(22,163,74,.8); }
+      .row-sl    { box-shadow: inset 4px 0 0 0 rgba(239,68,68,.85); }
+      .row-cancel{ box-shadow: inset 4px 0 0 0 rgba(245,158,11,.9); }
       .tag{padding:2px 8px;border-radius:999px;border:1px solid #263246;background:#0f172a;color:#cbd5e1;font-size:12px;display:inline-block}
       .hit{background:rgba(22,163,74,.12);border-color:rgba(22,163,74,.45);color:#86efac}
-      .cell-sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
-      .row-sl td{background:rgba(239,68,68,.08)}
-      .row-cancel td{background:rgba(245,158,11,.08)}
-      .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
-      .kpi{background:var(--chip);border:1px solid var(--chip-b);border-radius:10px;padding:6px 10px;font-size:12px;color:#cbd5e1}
-      .empty{padding:20px;color:var(--muted)}
+      .sl {background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
+      .dim{color:var(--muted)}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
     </style>
     """
 
-    # En-tête Altseason
     alt_html = f"""
-      <div class="card" style="margin-bottom:12px">
-        <h2>Indicateurs Altseason</h2>
-        <div class="muted">Fenêtre: {alt['window_minutes']} min — 4 signaux (LONG ratio, TP vs SL, breadth, momentum récent)</div>
-        <div class="row" style="margin-top:10px">
-          <span class="kpi">Score: {alt['score']}/100</span>
-          <span class="kpi">{alt['label']}</span>
-          <span class="kpi">LONG ratio: {alt['signals']['long_ratio']}%</span>
-          <span class="kpi">TP vs SL: {alt['signals']['tp_vs_sl']}%</span>
-          <span class="kpi">Breadth: {alt['signals']['breadth_symbols']} sym.</span>
-          <span class="kpi">Entrées récentes: {alt['signals']['recent_entries_ratio']}%</span>
+      <div class="altbox">
+        <div>
+          <h2>Indicateurs Altseason</h2>
+          <div class="dim" style="font-size:12px">Fenêtre: {alt['window_minutes']} min — 4 signaux (LONG ratio, TP vs SL, breadth, momentum récent)</div>
         </div>
+        <div class="altscore">{alt['score']}/100&nbsp; {alt['label']}</div>
+      </div>
+      <div class="altchips">
+        <span class="chip">LONG ratio: {alt['signals']['long_ratio']}%</span>
+        <span class="chip">TP vs SL: {alt['signals']['tp_vs_sl']}%</span>
+        <span class="chip">Breadth: {alt['signals']['breadth_symbols']} sym.</span>
+        <span class="chip">Entrées récentes: {alt['signals']['recent_entries_ratio']}%</span>
       </div>
     """
 
-    # Filtres (GET)
-    def _val(v): return "" if v is None else str(v)
-    filters_html = f"""
-    <div class="card" style="margin-bottom:12px">
-      <h2>Trades — Dashboard</h2>
-      <div class="muted" style="margin-bottom:10px">Filtrez par symbole / timeframe / date, puis validez.</div>
-      <form method="get" class="row" action="/trades">
-        <input name="symbol" placeholder="symbol (ex: BTCUSDT.P ou %USDT.P)" value="{_val(symbol)}" />
-        <input name="tf" placeholder="tf (ex: 15, 60, 1D)" value="{_val(tf)}" />
-        <input name="start" type="date" value="{_val(start)}" />
-        <input name="end" type="date" value="{_val(end)}" />
-        <input name="limit" type="number" min="1" max="1000" value="{limit}" style="width:90px" />
-        <button type="submit">Appliquer</button>
-        <a class="kpi" href="/">&larr; Home</a>
-      </form>
-    </div>
-    """
-
-    kpi_html = f"""
-    <div class="kpis" style="margin:-6px 0 12px 0">
-      <div class="kpi">Total: {summary['total']}</div>
-      <div class="kpi">Winrate: {summary['winrate']}%</div>
-      <div class="kpi">Wins: {summary['wins']}</div>
-      <div class="kpi">Losses: {summary['losses']}</div>
-      <div class="kpi">TP1: {summary['tp1']}</div>
-      <div class="kpi">TP2: {summary['tp2']}</div>
-      <div class="kpi">TP3: {summary['tp3']}</div>
-      <div class="kpi">Avg. time: {summary['avg_time']}s</div>
-    </div>
-    """
-
-    # Helpers cellule
     def cell_tp(val, hit):
         if val is None:
-            return '<span class="muted">—</span>'
+            return '<span class="dim">—</span>'
         klass = "tag hit" if hit else "tag"
         return f'<span class="{klass}">TP {val}</span>'
 
     def cell_sl(val, sl_hit):
         if val is None:
-            return '<span class="muted">—</span>'
-        klass = "tag cell-sl" if sl_hit else "tag"
+            return '<span class="dim">—</span>'
+        klass = "tag sl" if sl_hit else "tag"
         return f'<span class="{klass}">SL {val}</span>'
 
-    body_rows = []
-    if not rows:
-        body_rows.append('<tr><td colspan="12" class="empty">No trades yet. Send a webhook to <code>/tv-webhook</code>.</td></tr>')
-    else:
-        for r in rows:
-            body_rows.append(f"""
-              <tr class="{r['row_class']}">
-                <td class="mono">{r['trade_id']}</td>
-                <td>{r['symbol']}</td>
-                <td><span class="tag">{r['tf_label']}</span></td>
-                <td>{r.get('side') or ''}</td>
-                <td class="mono">{'' if r.get('entry') is None else r.get('entry')}</td>
-                <td>{cell_tp(r.get('tp1'), r.get('tp1_hit'))}</td>
-                <td>{cell_tp(r.get('tp2'), r.get('tp2_hit'))}</td>
-                <td>{cell_tp(r.get('tp3'), r.get('tp3_hit'))}</td>
-                <td>{cell_sl(r.get('sl'), r.get('sl_hit'))}</td>
-                <td>{r['outcome']}</td>
-                <td class="mono">{r['duration']}</td>
-              </tr>
-            """)
+    def row_class(state: str) -> str:
+        return {
+            "tp": "row-tp",
+            "sl": "row-sl",
+            "cancel": "row-cancel",
+            "normal": "",
+        }.get(state or "normal", "")
 
-    table_html = f"""
-    <div class="card">
-      <div class="muted" style="margin-bottom:8px">Stats</div>
-      {kpi_html}
+    rows_html = []
+    for r in rows:
+        rows_html.append(f"""
+          <tr class="{row_class(r.get('row_state'))}">
+            <td class="mono">{(r.get('trade_id') or '')}</td>
+            <td>{r['symbol']}</td>
+            <td><span class="tag">{r['tf_label']}</span></td>
+            <td>{r.get('side') or ''}</td>
+            <td class="mono">{'' if r.get('entry') is None else r.get('entry')}</td>
+            <td>{cell_tp(r.get('tp1'), r.get('tp1_hit'))}</td>
+            <td>{cell_tp(r.get('tp2'), r.get('tp2_hit'))}</td>
+            <td>{cell_tp(r.get('tp3'), r.get('tp3_hit'))}</td>
+            <td>{cell_sl(r.get('sl'), r.get('sl_hit'))}</td>
+          </tr>
+        """)
+
+    html = f"""<!doctype html>
+    <html lang="fr"><head><meta charset="utf-8"><title>Trades</title>{css}</head>
+    <body><div class="wrap">
+      {alt_html}
       <table>
         <thead>
           <tr>
-            <th>Trade ID</th>
-            <th>Symbol</th>
-            <th>TF</th>
-            <th>Side</th>
-            <th>Entry</th>
-            <th>TP1</th>
-            <th>TP2</th>
-            <th>TP3</th>
-            <th>SL</th>
-            <th>Outcome</th>
-            <th>Duration(s)</th>
+            <th>Trade ID</th><th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
+            <th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(body_rows)}
+          {''.join(rows_html)}
         </tbody>
       </table>
-    </div>
-    """
-
-    html = f"""<!doctype html>
-    <html lang="fr">
-      <head><meta charset="utf-8"><title>Trades</title>{css}</head>
-      <body>
-        <div class="wrap">
-          {alt_html}
-          {filters_html}
-          {table_html}
-        </div>
-      </body>
-    </html>"""
+    </div></body></html>"""
     return HTMLResponse(content=html)
-
 # =========================
 # Lancement local (optionnel)
 # =========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
-
