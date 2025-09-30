@@ -437,7 +437,7 @@ def _fetch_hits_for_trade(trade_id: str) -> dict:
     """, (trade_id,))
     hit = {
         "tp1": False, "tp2": False, "tp3": False,
-        "sl": False, "closed": False, "flip": False,
+        "sl": False, "closed": False, "flip_note": False,
         "first_close_ts": None, "first_hit_ts": None
     }
     for r in rows:
@@ -459,8 +459,25 @@ def _fetch_hits_for_trade(trade_id: str) -> dict:
             hit["first_close_ts"] = hit["first_close_ts"] or r["time"]
             note = (r.get("note") or "").lower()
             if "flip" in note or "reverse" in note or "direction" in note:
-                hit["flip"] = True
+                hit["flip_note"] = True
     return hit
+
+def _detect_flip(symbol: str, tf: str, opened_ts: int, side: Optional[str], this_trade_id: str) -> Optional[int]:
+    """
+    Flip détecté si un ENTRY plus récent existe pour le même symbol+tf
+    avec un side opposé (LONG vs SHORT). Retourne le timestamp du flip si trouvé.
+    """
+    if not side:
+        return None
+    opposite = "SHORT" if side.upper() == "LONG" else "LONG"
+    row = db_query("""
+        SELECT MIN(time) AS t
+        FROM events
+        WHERE type='ENTRY' AND symbol=? AND (tf=? OR tf_label=?)
+          AND time > ? AND UPPER(COALESCE(side,'')) = ?
+    """, (symbol, tf, tf, opened_ts, opposite))
+    t = (row[0]["t"] if row and row[0]["t"] is not None else None)
+    return int(t) if t else None
 
 def _fmt_duration_secs(opened_ts: Optional[int], end_ts: Optional[int]) -> int:
     if not opened_ts or not end_ts:
@@ -501,10 +518,12 @@ def build_trade_rows_v2(symbol: Optional[str], tf: Optional[str],
         tf_label = e["tf_label"] or tf_to_label(e["tf"])
         hits = _fetch_hits_for_trade(trade_id)
 
+        # Statut par défaut
         end_ts = None
         row_class = ""
         outcome_txt = "—"
 
+        # 1) SL ou TP (prioritaires)
         if hits["sl"]:
             row_class = "row-sl"
             outcome_txt = "SL"
@@ -517,10 +536,19 @@ def build_trade_rows_v2(symbol: Optional[str], tf: Optional[str],
             else:
                 outcome_txt = "TP1"
             end_ts = hits["first_hit_ts"]
+
+        # 2) CLOSE / NOTE flip
         elif hits["closed"]:
             row_class = "row-cancel"
-            outcome_txt = "Flip" if hits["flip"] else "Canceled"
+            outcome_txt = "Flip" if hits["flip_note"] else "Canceled"
             end_ts = hits["first_close_ts"]
+
+        # 3) ENTRY opposé (flip “silencieux”)
+        flip_ts = _detect_flip(e["symbol"], str(e["tf"] or tf_label), e["opened_ts"], e["side"], trade_id)
+        if flip_ts and (end_ts is None or flip_ts < end_ts):
+            row_class = "row-cancel"
+            outcome_txt = "Flip"
+            end_ts = flip_ts
 
         out.append({
             "trade_id": trade_id,
@@ -534,7 +562,7 @@ def build_trade_rows_v2(symbol: Optional[str], tf: Optional[str],
             "end_ts": end_ts,
             "duration": _fmt_duration_secs(e["opened_ts"], end_ts),
             "tp1_hit": hits["tp1"], "tp2_hit": hits["tp2"], "tp3_hit": hits["tp3"],
-            "sl_hit": hits["sl"], "closed": hits["closed"], "flip": hits["flip"],
+            "sl_hit": hits["sl"],
             "row_class": row_class, "outcome": outcome_txt
         })
     return out
@@ -579,6 +607,7 @@ async def trades_page(
       .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
       .tag{padding:2px 8px;border-radius:999px;border:1px solid #263246;background:#0f172a;color:#cbd5e1;font-size:12px;display:inline-block}
       .hit{background:rgba(22,163,74,.12);border-color:rgba(22,163,74,.45);color:#86efac}
+      .cell-sl{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
       .row-sl td{background:rgba(239,68,68,.08)}
       .row-cancel td{background:rgba(245,158,11,.08)}
       .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
@@ -587,7 +616,7 @@ async def trades_page(
     </style>
     """
 
-    # En-tête Altseason (cosmétique, indépendant des Vectors)
+    # En-tête Altseason
     alt_html = f"""
       <div class="card" style="margin-bottom:12px">
         <h2>Indicateurs Altseason</h2>
@@ -621,7 +650,6 @@ async def trades_page(
     </div>
     """
 
-    summary = _compute_summary(rows)
     kpi_html = f"""
     <div class="kpis" style="margin:-6px 0 12px 0">
       <div class="kpi">Total: {summary['total']}</div>
@@ -645,7 +673,8 @@ async def trades_page(
     def cell_sl(val, sl_hit):
         if val is None:
             return '<span class="muted">—</span>'
-        return f'<span class="tag">SL {val}</span>'
+        klass = "tag cell-sl" if sl_hit else "tag"
+        return f'<span class="{klass}">SL {val}</span>'
 
     body_rows = []
     if not rows:
@@ -714,3 +743,4 @@ async def trades_page(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+
