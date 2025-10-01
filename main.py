@@ -1,4 +1,4 @@
-# main.py - Version Professionnelle
+# main.py - Version Professionnelle Corrigée
 import os
 import sqlite3
 import logging
@@ -389,6 +389,7 @@ def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
 
 def compute_altseason_snapshot() -> dict:
+    """Calcule le score altseason avec la liste des symboles"""
     t24 = ms_ago(24*60)
     row = db_query("""
         SELECT
@@ -420,11 +421,16 @@ def compute_altseason_snapshot() -> dict:
     tp_n = (row[0]["tp_n"] if row else 0) or 0
     sl_n = (row[0]["sl_n"] if row else 0) or 0
     B = _pct(tp_n, tp_n + sl_n)
-    row = db_query("""
-      SELECT COUNT(DISTINCT symbol) AS sym_gain FROM events
+    
+    # Récupérer la liste des symboles avec TP
+    symbols_with_tp = db_query("""
+      SELECT DISTINCT symbol FROM events
       WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
+      ORDER BY symbol
     """, (t24,))
-    sym_gain = (row[0]["sym_gain"] if row else 0) or 0
+    symbol_list = [r["symbol"] for r in symbols_with_tp]
+    sym_gain = len(symbol_list)
+    
     C = float(min(100.0, sym_gain * 2.0))
     t90 = ms_ago(90)
     row = db_query("""
@@ -451,39 +457,74 @@ def compute_altseason_snapshot() -> dict:
             "tp_vs_sl": round(B, 1),
             "breadth_symbols": int(sym_gain),
             "recent_entries_ratio": round(D, 1),
-        }
+        },
+        "symbols_with_tp": symbol_list  # NOUVEAU: liste des symboles
     }
 
 def build_confidence_line(payload: dict) -> str:
-    entry = payload.get("entry"); sl = payload.get("sl"); tp1 = payload.get("tp1")
+    """Calcule la confiance dynamique par trade"""
+    entry = payload.get("entry")
+    sl = payload.get("sl")
+    tp1 = payload.get("tp1")
     rr = _calc_rr(entry, sl, tp1)
     alt = compute_altseason_snapshot()
     lev = (payload.get("leverage") or payload.get("lev_reco") or "").strip()
+    
     factors = []
-    if rr is not None:
-        factors.append(f"R/R {rr}")
-    factors.append(f"Momentum {alt['signals']['recent_entries_ratio']}%")
-    factors.append(f"Breadth {alt['signals']['breadth_symbols']} sym")
-    factors.append(f"Bias LONG {alt['signals']['long_ratio']}%")
-    if lev:
-        try:
-            lev_f = float(str(lev).lower().replace("x","").replace("cross","").strip())
-            lev_txt = "lev élevé" if lev_f >= 15 else ("lev moyen" if lev_f >= 7 else "lev faible")
-        except Exception:
-            lev_txt = lev
-        factors.append(lev_txt)
     conf = payload.get("confidence")
+    
     if conf is None:
         base = 50
+        
+        # R/R contribution
         if rr is not None:
             base += max(min((rr - 1.0) * 10, 20), -10)
-        base += max(min((alt["signals"]["recent_entries_ratio"] - 50) * 0.3, 15), -15)
-        base += max(min((alt["signals"]["breadth_symbols"] - 10) * 0.7, 15), -10)
+            factors.append(f"R/R {rr}")
+        
+        # Momentum contribution
+        momentum_val = alt["signals"]["recent_entries_ratio"]
+        base += max(min((momentum_val - 50) * 0.3, 15), -15)
+        factors.append(f"Momentum {momentum_val}%")
+        
+        # Breadth contribution
+        breadth_val = alt["signals"]["breadth_symbols"]
+        base += max(min((breadth_val - 10) * 0.7, 15), -10)
+        factors.append(f"Breadth {breadth_val} sym")
+        
+        # Bias LONG contribution
+        long_ratio = alt["signals"]["long_ratio"]
+        factors.append(f"Bias LONG {long_ratio}%")
+        
+        # Leverage factor
+        if lev:
+            try:
+                lev_f = float(str(lev).lower().replace("x","").replace("cross","").strip())
+                if lev_f >= 15:
+                    lev_txt = "lev élevé"
+                    base -= 5  # Pénalité pour lev élevé
+                elif lev_f >= 7:
+                    lev_txt = "lev moyen"
+                else:
+                    lev_txt = "lev faible"
+                    base += 5  # Bonus pour lev faible
+            except Exception:
+                lev_txt = lev
+            factors.append(lev_txt)
+        
         conf = int(max(5, min(95, round(base))))
         payload["confidence"] = conf
+    else:
+        # Si conf existe déjà, on garde les facteurs pour info
+        if rr is not None:
+            factors.append(f"R/R {rr}")
+        factors.append(f"Momentum {alt['signals']['recent_entries_ratio']}%")
+        factors.append(f"Breadth {alt['signals']['breadth_symbols']} sym")
+        factors.append(f"Bias LONG {alt['signals']['long_ratio']}%")
+    
     return f"🧠 Confiance: {conf}% — basé sur " + ", ".join(factors)
 
 def format_entry_announcement(payload: dict) -> str:
+    """Formate le message d'entrée avec prix visible"""
     symbol   = payload.get("symbol", "")
     tf_lbl   = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i   = _fmt_side(payload.get("side"))
@@ -494,56 +535,81 @@ def format_entry_announcement(payload: dict) -> str:
     sl       = payload.get("sl")
     leverage = payload.get("leverage") or payload.get("lev_reco") or ""
     note     = (payload.get("note") or "").strip()
+    
     rr = _calc_rr(entry, sl, tp1)
     rr_text = f" (R/R: {rr:.2f})" if rr is not None else ""
+    
     lines = []
     if tp1 is not None: lines.append(f"🎯 TP1: {tp1}{rr_text}")
     if tp2 is not None: lines.append(f"🎯 TP2: {tp2}")
     if tp3 is not None: lines.append(f"🎯 TP3: {tp3}")
     if sl  is not None: lines.append(f"❌ SL: {sl}")
+    
     conf_line = build_confidence_line(payload)
     tip_line = "💡 Astuce: après TP1, placez SL au BE." if tp1 is not None else ""
+    
     t_entry = payload.get("time") or now_ms()
     elapsed = max(0, (now_ms() - int(t_entry)))
     elapsed_line = f"⏱ Temps écoulé : {human_duration_verbose(elapsed)}"
+    
+    # Message avec prix d'entrée bien visible
+    entry_text = f"<b>Entry: {entry}</b>" if entry is not None else "Entry: N/A"
+    
     msg = [
-        f"📩 {symbol} {tf_lbl}",
-        f"{side_i['emoji']} {side_i['label']} Entry: {entry}" if entry is not None else f"{side_i['emoji']} {side_i['label']}",
-        f"💡Leverage: {leverage}" if leverage else "",
+        f"🚨 <b>NOUVELLE POSITION</b>",
+        f"📊 {symbol} {tf_lbl}",
+        f"{side_i['emoji']} {side_i['label']} | {entry_text}",
+        f"⚡ Leverage: {leverage}" if leverage else "",
+        "",
         *lines,
+        "",
         conf_line,
         tip_line,
         elapsed_line,
     ]
     if note:
         msg.append(f"📝 {note}")
+    
     return "\n".join([m for m in msg if m])
 
 def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[int]) -> str:
+    """Formate les annonces avec temps écoulé TOUJOURS affiché"""
     symbol = payload.get("symbol", "")
     tf_lbl = _fmt_tf_label(payload.get("tf"), payload.get("tf_label"))
     side_i = _fmt_side(payload.get("side"))
     base   = f"{symbol} {tf_lbl}"
-    d_txt  = f"⏱ Temps écoulé : {human_duration_verbose(duration_ms)}" if duration_ms is not None else ""
+    
+    # Temps écoulé TOUJOURS présent
+    if duration_ms is not None and duration_ms > 0:
+        d_txt = f"⏱ Temps écoulé : {human_duration_verbose(duration_ms)}"
+    else:
+        d_txt = "⏱ Temps écoulé : N/A"
+    
     if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
         tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
-        return f"✅ {tick} atteint — {base}\n{side_i['label'].title()}\n{d_txt}"
+        price = payload.get("price") or payload.get("tp1") or payload.get("tp2") or payload.get("tp3") or ""
+        price_txt = f" @ {price}" if price else ""
+        return f"✅ <b>{tick} ATTEINT</b>{price_txt}\n📊 {base}\n{side_i['emoji']} {side_i['label']}\n{d_txt}"
+    
     if etype == "SL_HIT":
-        return f"🛑 SL touché — {base}\n{side_i['label'].title()}\n{d_txt}"
+        price = payload.get("price") or payload.get("sl") or ""
+        price_txt = f" @ {price}" if price else ""
+        return f"🛑 <b>SL TOUCHÉ</b>{price_txt}\n📊 {base}\n{side_i['emoji']} {side_i['label']}\n{d_txt}"
+    
     if etype == "CLOSE":
         note = payload.get("note") or ""
-        x = f"📪 Trade clôturé — {base}\n{side_i['emoji']} {side_i['label']}"
+        x = f"📪 <b>TRADE CLÔTURÉ</b>\n📊 {base}\n{side_i['emoji']} {side_i['label']}"
         if note:
             x += f"\n📝 {note}"
-        if d_txt:
-            x += f"\n{d_txt}"
+        x += f"\n{d_txt}"
         return x
-    return f"ℹ️ {etype} — {base}" + (f"\n{d_txt}" if d_txt else "")
+    
+    return f"ℹ️ {etype} — {base}\n{d_txt}"
 
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="AI Trader Pro", version="2.0")
+app = FastAPI(title="AI Trader Pro", version="2.1")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -558,7 +624,7 @@ async def root():
     return HTMLResponse("""
     <html><head><meta charset="utf-8"><title>AI Trader Pro</title></head>
     <body style="font-family:system-ui; padding:24px; background:#0b0f14; color:#e6edf3;">
-      <h1>AI Trader Pro</h1>
+      <h1>AI Trader Pro v2.1</h1>
       <p>Endpoints:</p>
       <ul>
         <li><a href="/trades">/trades</a> — Dashboard</li>
@@ -587,7 +653,7 @@ async def health_check():
         "total_events": db_records,
         "telegram_enabled": settings.TELEGRAM_ENABLED,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "2.0"
+        "version": "2.1"
     }
 
 def save_event(payload: WebhookPayload) -> str:
@@ -717,6 +783,12 @@ async def maybe_altseason_autonotify():
     if (nowt - _last_altseason_notify_ts) < (settings.ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
         return
     emoji = "🟢" if alt["score"] >= 75 else "🟡"
+    
+    # Liste des symboles
+    symbols_list = ", ".join(alt["symbols_with_tp"][:15])  # Max 15 symboles
+    if len(alt["symbols_with_tp"]) > 15:
+        symbols_list += f" +{len(alt['symbols_with_tp'])-15} autres"
+    
     msg = f"""🚨 <b>Alerte Altseason Automatique</b> {emoji}
 
 📊 <b>Score: {alt['score']}/100</b>
@@ -728,7 +800,8 @@ async def maybe_altseason_autonotify():
 - Breadth: {alt['signals']['breadth_symbols']} symboles
 - Momentum: {alt['signals']['recent_entries_ratio']}%
 
-⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {settings.ALT_GREENS_REQUIRED})
+⚡ <b>{greens} symboles</b> avec TP atteints:
+{symbols_list}
 
 <i>{alt['disclaimer']}</i>"""
     reply_markup = _create_dashboard_button()
@@ -753,14 +826,21 @@ def _has_hit_map(trade_id: str) -> Dict[str, bool]:
     return {h["type"]: True for h in hits}
 
 def _first_outcome(trade_id: str) -> Optional[str]:
+    """Trouve le premier outcome TP ou SL - CORRIGÉ"""
     rows = db_query("""
       SELECT type, time FROM events
       WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT')
       ORDER BY time ASC LIMIT 1
     """, (trade_id,))
-    if not rows: return None
+    if not rows:
+        return None
     t = rows[0]["type"]
-    return "TP" if t.startswith("TP") else ("SL" if t == "SL_HIT" else None)
+    # TP1_HIT, TP2_HIT, TP3_HIT = TP
+    if t in ('TP1_HIT', 'TP2_HIT', 'TP3_HIT'):
+        return "TP"
+    elif t == "SL_HIT":
+        return "SL"
+    return None
 
 def _cancelled_by_opposite(entry_row: dict) -> bool:
     symbol = entry_row.get("symbol")
@@ -819,22 +899,37 @@ def build_trade_rows(limit=300):
     return rows
 
 def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
-    """Calcul KPI avec métriques réalistes"""
+    """Calcul KPI avec métriques réalistes - CORRIGÉ"""
     t24 = ms_ago(24*60)
     total_trades = db_query(
         "SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,)
     )[0]["n"] or 0
+    
+    # TP hits totaux
     tp_hits = db_query(
         "SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?", (t24,)
     )[0]["n"] or 0
+    
+    # Liste des trades avec détails TP
+    tp_details = db_query("""
+        SELECT DISTINCT symbol, type, time 
+        FROM events 
+        WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
+        ORDER BY time DESC
+    """, (t24,))
+    
     trade_ids = [r["trade_id"] for r in db_query(
         "SELECT DISTINCT trade_id FROM events WHERE type='ENTRY' AND time>=?", (t24,)
     )]
-    wins = 0; losses = 0
+    
+    wins = 0
+    losses = 0
     for tid in trade_ids:
         o = _first_outcome(tid)
-        if o == "TP": wins += 1
-        elif o == "SL": losses += 1
+        if o == "TP":
+            wins += 1
+        elif o == "SL":
+            losses += 1
     
     winrate = (wins / max(1, (wins + losses))) * 100.0 if (wins + losses) > 0 else 0.0
     active = sum(1 for r in rows if r["row_state"] == "normal")
@@ -844,6 +939,7 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
         "total_trades": int(total_trades),
         "active_trades": int(active),
         "tp_hits": int(tp_hits),
+        "tp_details": tp_details,  # NOUVEAU
         "winrate": round(winrate, 1),
         "wins": wins,
         "losses": losses,
@@ -873,31 +969,14 @@ def generate_sidebar_html(active_page: str, kpi: dict) -> str:
           <span>📜</span><span>Historique</span>
         </div>
         <div class="nav-item" onclick="alert('Section en développement')">
-          <span>📉</span><span>Analytics Pro</span>
-        </div>
-        <div class="nav-section">Intelligence AI</div>
-        <div class="nav-item" onclick="alert('Section en développement')">
-          <span>🤖</span><span>ML Insights</span>
-        </div>
-        <div class="nav-item" onclick="alert('Section en développement')">
-          <span>🎯</span><span>Prédictions</span>
-        </div>
-        <div class="nav-item" onclick="alert('Section en développement')">
-          <span>🔥</span><span>Opportunités</span>
-        </div>
-        <div class="nav-section">Outils</div>
-        <div class="nav-item" onclick="alert('Section en développement')">
-          <span>📐</span><span>Backtesting</span>
-        </div>
-        <div class="nav-item" onclick="alert('Section en développement')">
-          <span>⚙️</span><span>Paramètres</span>
+          <span>📉</span><span>Analytics</span>
         </div>
       </nav>
       <div class="ml-status">
-        <div class="ml-status-header"><h4><span class="status-dot"></span> Système</h4></div>
+        <div class="ml-status-header"><h4><span class="status-dot"></span> Performance</h4></div>
         <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
-        <div class="ml-metric"><span class="label">Trades fermés</span><span class="value">{kpi.get('total_closed', 0)}</span></div>
-        <div class="ml-metric"><span class="label">Annulés</span><span class="value">{kpi.get('cancelled', 0)}</span></div>
+        <div class="ml-metric"><span class="label">Wins/Losses</span><span class="value">{kpi.get('wins', 0)}/{kpi.get('losses', 0)}</span></div>
+        <div class="ml-metric"><span class="label">TP Atteints</span><span class="value">{kpi.get('tp_hits', 0)}</span></div>
       </div>
       <div class="user-profile">
         <div class="avatar">TP</div>
@@ -924,7 +1003,6 @@ def get_base_css() -> str:
     .logo-icon::before{content:'';position:absolute;inset:-3px;background:inherit;border-radius:16px;filter:blur(16px);opacity:0.6;z-index:-1}
     .logo-text h2{font-size:22px;font-weight:900;background:linear-gradient(135deg, var(--accent), var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-0.5px}
     .logo-text p{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:1px}
-    .nav-section{font-size:10px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:1.2px;margin:28px 0 14px 16px;opacity:0.7}
     .nav-item{display:flex;align-items:center;gap:14px;padding:13px 18px;border-radius:14px;color:var(--muted);cursor:pointer;transition:all 0.3s;margin-bottom:6px;font-size:14px;font-weight:600;position:relative}
     .nav-item::before{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:var(--accent);transform:scaleY(0);transition:transform 0.3s}
     .nav-item:hover, .nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent);transform:translateX(6px)}
@@ -966,7 +1044,7 @@ def get_base_css() -> str:
     @media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
     """
 
-# Import des routes (dashboard, positions, history)
+# Import des routes (positions, history, trades - suite dans le prochain message à cause de la limite de caractères)
 @app.get("/positions", response_class=HTMLResponse)
 async def positions_page():
     try:
@@ -1166,14 +1244,29 @@ async def trades_page():
     active_shorts = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'SHORT')
     sentiment = "BULLISH" if active_longs > active_shorts else "BEARISH" if active_shorts > active_longs else "NEUTRE"
     
+    # Liste des symboles avec TP
+    symbols_text = ", ".join(alt["symbols_with_tp"][:10])
+    if len(alt["symbols_with_tp"]) > 10:
+        symbols_text += f" +{len(alt['symbols_with_tp'])-10} autres"
+    
     if alt['score'] >= 75:
-        insight_text = f"Forte altseason détectée avec {alt['signals']['breadth_symbols']} symboles."
+        insight_text = f"Forte altseason détectée. Symboles: {symbols_text}"
     elif alt['score'] >= 50:
-        insight_text = "Altseason modérée. Gestion stricte du risque recommandée."
+        insight_text = f"Altseason modérée. Gestion risque stricte. Symboles: {symbols_text}"
     elif kpi['winrate'] > 70:
-        insight_text = f"Excellente performance avec {kpi['winrate']}% winrate."
+        insight_text = f"Excellente performance {kpi['winrate']}% winrate sur {kpi['total_closed']} trades."
     else:
         insight_text = "Marché en consolidation. Patience recommandée."
+
+    # Détails des TP atteints
+    tp_list = ""
+    for tp in kpi.get('tp_details', [])[:10]:
+        tp_type = tp['type'].replace('_HIT', '')
+        tp_list += f"{tp['symbol']} ({tp_type}), "
+    if tp_list:
+        tp_list = tp_list.rstrip(", ")
+    else:
+        tp_list = "Aucun TP atteint"
 
     html = f'''<!doctype html>
 <html lang="fr">
@@ -1216,7 +1309,7 @@ async def trades_page():
         <div class="stat-card">
           <div style="font-size:13px;color:var(--muted);margin-bottom:8px">TP ATTEINTS</div>
           <div class="stat-value">{kpi['tp_hits']}</div>
-          <div style="font-size:13px;color:var(--success)">↗ Excellent</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:8px" title="{tp_list}">{tp_list[:50]}...</div>
         </div>
       </div>
       
