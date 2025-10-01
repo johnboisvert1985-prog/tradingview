@@ -1,57 +1,132 @@
-# main.py
+# main.py - Version Professionnelle
 import os
 import sqlite3
 import logging
+import logging.handlers
 import asyncio
 import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, validator
 
 import httpx
 
 # =========================
-# Logging
+# Configuration
 # =========================
+class Settings:
+    """Configuration centralisée"""
+    DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
+    DB_PATH = os.path.join(DB_DIR, "data.db")
+    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg")
+    
+    # Telegram
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    
+    TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "10.0"))
+    TG_PER_MIN_LIMIT = int(os.getenv("TG_PER_MIN_LIMIT", "10"))
+    
+    ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
+    ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))
+    ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))
+    
+    TELEGRAM_PIN_ALTSEASON = int(os.getenv("TELEGRAM_PIN_ALTSEASON", "1"))
+    TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
+    TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
+    TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
+    
+    VECTOR_UP_ICON = "🟩"
+    VECTOR_DN_ICON = "🟥"
+    VECTOR_GLOBAL_GAP_SEC = int(os.getenv("VECTOR_GLOBAL_GAP_SEC", "10"))
+    
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+settings = Settings()
+
+# =========================
+# Logging Professionnel
+# =========================
+os.makedirs(settings.DB_DIR, exist_ok=True)
+
 logger = logging.getLogger("aitrader")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger.setLevel(settings.LOG_LEVEL)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(settings.LOG_LEVEL)
+console_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# File handler avec rotation
+try:
+    file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(settings.DB_DIR, 'ai_trader.log'),
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(console_formatter)
+    logger.addHandler(file_handler)
+except Exception as e:
+    logger.warning(f"Could not create file handler: {e}")
+
+logger.info(f"DB dir OK: {settings.DB_DIR} (using {settings.DB_PATH})")
 
 # =========================
-# Config / Env
+# Models Pydantic
 # =========================
-DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
-DB_PATH = os.path.join(DB_DIR, "data.db")
-os.makedirs(DB_DIR, exist_ok=True)
-logger.info(f"DB dir OK: {DB_DIR} (using {DB_PATH})")
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg")
-
-# Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-
-TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "10.0"))
-TG_PER_MIN_LIMIT = int(os.getenv("TG_PER_MIN_LIMIT", "10"))
-
-ALTSEASON_AUTONOTIFY = int(os.getenv("ALTSEASON_AUTONOTIFY", "1"))
-ALT_GREENS_REQUIRED = int(os.getenv("ALT_GREENS_REQUIRED", "3"))
-ALTSEASON_NOTIFY_MIN_GAP_MIN = int(os.getenv("ALTSEASON_NOTIFY_MIN_GAP_MIN", "60"))
-
-TELEGRAM_PIN_ALTSEASON = int(os.getenv("TELEGRAM_PIN_ALTSEASON", "1"))
-TG_BUTTONS = int(os.getenv("TG_BUTTONS", "1"))
-TG_BUTTON_TEXT = os.getenv("TG_BUTTON_TEXT", "📊 Ouvrir le Dashboard")
-TG_DASHBOARD_URL = os.getenv("TG_DASHBOARD_URL", "https://tradingview-gd03.onrender.com/trades")
-
-VECTOR_UP_ICON = "🟩"
-VECTOR_DN_ICON = "🟥"
-VECTOR_GLOBAL_GAP_SEC = int(os.getenv("VECTOR_GLOBAL_GAP_SEC", "10"))
+class WebhookPayload(BaseModel):
+    """Validation des données webhook"""
+    type: str
+    symbol: str
+    tf: Optional[str] = None
+    tf_label: Optional[str] = None
+    time: Optional[int] = None
+    side: Optional[str] = None
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    r1: Optional[float] = None
+    s1: Optional[float] = None
+    lev_reco: Optional[float] = None
+    qty_reco: Optional[float] = None
+    notional: Optional[float] = None
+    confidence: Optional[int] = None
+    horizon: Optional[str] = None
+    leverage: Optional[str] = None
+    note: Optional[str] = None
+    price: Optional[float] = None
+    direction: Optional[str] = None
+    trade_id: Optional[str] = None
+    secret: Optional[str] = None
+    
+    @validator('type')
+    def validate_type(cls, v):
+        valid_types = ['ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE', 'VECTOR_CANDLE']
+        if v not in valid_types:
+            raise ValueError(f'Invalid type: {v}. Must be one of {valid_types}')
+        return v
+    
+    @validator('side')
+    def validate_side(cls, v):
+        if v is not None and v.upper() not in ['LONG', 'SHORT']:
+            raise ValueError(f'Invalid side: {v}. Must be LONG or SHORT')
+        return v.upper() if v else None
 
 # =========================
-# SQLite
+# SQLite avec Pool
 # =========================
 def dict_factory(cursor, row):
     d = {}
@@ -59,53 +134,88 @@ def dict_factory(cursor, row):
         d[col[0]] = row[idx]
     return d
 
-DB = sqlite3.connect(DB_PATH, check_same_thread=False)
-DB.row_factory = dict_factory
-logger.info(f"DB initialized at {DB_PATH}")
+@contextmanager
+def get_db():
+    """Context manager pour connexions DB thread-safe"""
+    conn = sqlite3.connect(settings.DB_PATH, timeout=30.0)
+    conn.row_factory = dict_factory
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def db_execute(sql: str, params: tuple = ()):
-    cur = DB.cursor()
-    cur.execute(sql, params)
-    DB.commit()
-    return cur
+    """Exécute une requête SQL avec gestion d'erreur"""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            conn.commit()
+            return cur
+    except sqlite3.Error as e:
+        logger.error(f"Database error: {e} - SQL: {sql[:100]}")
+        raise
 
 def db_query(sql: str, params: tuple = ()) -> List[dict]:
-    cur = DB.cursor()
-    cur = cur.execute(sql, params)
-    return list(cur.fetchall())
+    """Exécute une requête SELECT avec gestion d'erreur"""
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+    except sqlite3.Error as e:
+        logger.error(f"Database query error: {e} - SQL: {sql[:100]}")
+        return []
 
-db_execute("""
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT,
-    symbol TEXT,
-    tf TEXT,
-    tf_label TEXT,
-    time INTEGER,
-    side TEXT,
-    entry REAL,
-    sl REAL,
-    tp1 REAL,
-    tp2 REAL,
-    tp3 REAL,
-    r1 REAL,
-    s1 REAL,
-    lev_reco REAL,
-    qty_reco REAL,
-    notional REAL,
-    confidence INTEGER,
-    horizon TEXT,
-    leverage TEXT,
-    note TEXT,
-    price REAL,
-    direction TEXT,
-    trade_id TEXT
-)
-""")
-db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
-db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
-db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
-db_execute("CREATE INDEX IF NOT EXISTS idx_events_symbol_tf ON events(symbol, tf)")
+# =========================
+# Initialisation DB
+# =========================
+def init_database():
+    """Initialise la base de données avec contraintes"""
+    try:
+        db_execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL CHECK(type IN ('ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE', 'VECTOR_CANDLE')),
+            symbol TEXT NOT NULL,
+            tf TEXT,
+            tf_label TEXT,
+            time INTEGER NOT NULL,
+            side TEXT CHECK(side IS NULL OR side IN ('LONG', 'SHORT')),
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            tp3 REAL,
+            r1 REAL,
+            s1 REAL,
+            lev_reco REAL,
+            qty_reco REAL,
+            notional REAL,
+            confidence INTEGER CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 100)),
+            horizon TEXT,
+            leverage TEXT,
+            note TEXT,
+            price REAL,
+            direction TEXT,
+            trade_id TEXT,
+            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+        )
+        """)
+        
+        # Index optimisés
+        db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
+        db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
+        db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time DESC)")
+        db_execute("CREATE INDEX IF NOT EXISTS idx_events_symbol_tf ON events(symbol, tf)")
+        db_execute("CREATE INDEX IF NOT EXISTS idx_events_composite ON events(symbol, tf, type, time DESC)")
+        
+        logger.info(f"Database initialized at {settings.DB_PATH}")
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        raise
+
+init_database()
 
 # =========================
 # Utils
@@ -127,24 +237,21 @@ def tf_to_label(tf: Any) -> str:
     return s
 
 def ensure_trades_schema():
-    cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
-    if "tf_label" not in cols:
-        db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
-    db_execute("CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)")
-    db_execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)")
-    db_execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
-    db_execute("CREATE INDEX IF NOT EXISTS idx_events_symbol_tf ON events(symbol, tf)")
+    """Assure compatibilité schéma"""
+    try:
+        cols = {r["name"] for r in db_query("PRAGMA table_info(events)")}
+        if "tf_label" not in cols:
+            db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
+        if "created_at" not in cols:
+            db_execute("ALTER TABLE events ADD COLUMN created_at INTEGER DEFAULT (strftime('%s', 'now'))")
+    except Exception as e:
+        logger.warning(f"ensure_trades_schema warning: {e}")
 
 def now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 def ms_ago(minutes: int) -> int:
     return int((datetime.now(timezone.utc) - timedelta(minutes=minutes)).timestamp() * 1000)
-
-try:
-    ensure_trades_schema()
-except Exception as e:
-    logger.warning(f"ensure_trades_schema warning: {e}")
 
 def human_duration_verbose(ms: int) -> str:
     if ms <= 0:
@@ -159,6 +266,11 @@ def human_duration_verbose(ms: int) -> str:
         return f"{m} min {sec} s"
     return f"{sec} s"
 
+try:
+    ensure_trades_schema()
+except Exception as e:
+    logger.warning(f"Schema update warning: {e}")
+
 # =========================
 # Telegram
 # =========================
@@ -169,11 +281,11 @@ _send_times_window = deque()
 _last_vector_flush_ts: float = 0.0
 
 def _create_dashboard_button() -> Optional[dict]:
-    if not TG_BUTTONS or not TG_DASHBOARD_URL:
+    if not settings.TG_BUTTONS or not settings.TG_DASHBOARD_URL:
         return None
     return {
         "inline_keyboard": [[
-            {"text": TG_BUTTON_TEXT, "url": TG_DASHBOARD_URL}
+            {"text": settings.TG_BUTTON_TEXT, "url": settings.TG_DASHBOARD_URL}
         ]]
     }
 
@@ -182,13 +294,13 @@ async def _respect_rate_limits():
     now = time.time()
     while _send_times_window and now - _send_times_window[0] > 60:
         _send_times_window.popleft()
-    if len(_send_times_window) >= TG_PER_MIN_LIMIT:
+    if len(_send_times_window) >= settings.TG_PER_MIN_LIMIT:
         sleep_for = 60 - (now - _send_times_window[0]) + 0.2
         if sleep_for > 0:
             await asyncio.sleep(sleep_for)
     delta = now - _last_global_send_ts
-    if delta < TG_MIN_DELAY_SEC:
-        await asyncio.sleep(TG_MIN_DELAY_SEC - delta)
+    if delta < settings.TG_MIN_DELAY_SEC:
+        await asyncio.sleep(settings.TG_MIN_DELAY_SEC - delta)
 
 def _record_sent():
     global _last_global_send_ts, _send_times_window
@@ -198,18 +310,18 @@ def _record_sent():
 
 async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None,
                        reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
-    if not TELEGRAM_ENABLED:
+    if not settings.TELEGRAM_ENABLED:
         return {"ok": False, "reason": "telegram disabled"}
     k = key or "default"
     now_ts = time.time()
     last = _last_tg_sent.get(k, 0.0)
-    if now_ts - last < TG_MIN_DELAY_SEC:
+    if now_ts - last < settings.TG_MIN_DELAY_SEC:
         logger.warning("Telegram send skipped due to per-key cooldown")
         return {"ok": False, "reason": "cooldown"}
     _last_tg_sent[k] = now_ts
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": settings.TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": disable_web_page_preview,
         "parse_mode": "HTML",
@@ -234,12 +346,12 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
             data = r.json()
             logger.info(f"Telegram sent: {text[:80]}...")
             _record_sent()
-            if pin and TELEGRAM_PIN_ALTSEASON and data.get("ok"):
+            if pin and settings.TELEGRAM_PIN_ALTSEASON and data.get("ok"):
                 try:
                     message_id = data["result"]["message_id"]
-                    pin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage"
+                    pin_url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/pinChatMessage"
                     await client.post(pin_url, json={
-                        "chat_id": TELEGRAM_CHAT_ID,
+                        "chat_id": settings.TELEGRAM_CHAT_ID,
                         "message_id": message_id,
                         "disable_notification": True
                     })
@@ -247,7 +359,7 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
                     logger.warning(f"Pin message failed: {e}")
             return {"ok": True, "result": data}
     except Exception as e:
-        logger.warning(f"Telegram send error: {e}")
+        logger.error(f"Telegram send error: {e}")
         return {"ok": False, "reason": str(e)}
 
 def _fmt_tf_label(tf: Any, tf_label: Optional[str]) -> str:
@@ -272,7 +384,7 @@ def _calc_rr(entry: Optional[float], sl: Optional[float], tp1: Optional[float]) 
         return None
 
 def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any, note: Optional[str] = None) -> str:
-    icon = VECTOR_UP_ICON if (direction or "").upper() == "UP" else VECTOR_DN_ICON
+    icon = settings.VECTOR_UP_ICON if (direction or "").upper() == "UP" else settings.VECTOR_DN_ICON
     n = f" — {note}" if note else ""
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{n}"
 
@@ -333,6 +445,7 @@ def compute_altseason_snapshot() -> dict:
         "score": int(score),
         "label": label,
         "window_minutes": 24*60,
+        "disclaimer": "Score indicatif basé sur données historiques. Ne constitue pas un conseil d'investissement.",
         "signals": {
             "long_ratio": round(A, 1),
             "tp_vs_sl": round(B, 1),
@@ -430,61 +543,98 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="AI Trader", version="1.0")
+app = FastAPI(title="AI Trader Pro", version="2.0")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc)}
+    )
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTMLResponse("""
-    <html><head><meta charset="utf-8"><title>AI Trader</title></head>
+    <html><head><meta charset="utf-8"><title>AI Trader Pro</title></head>
     <body style="font-family:system-ui; padding:24px; background:#0b0f14; color:#e6edf3;">
-      <h1>AI Trader</h1>
+      <h1>AI Trader Pro</h1>
       <p>Endpoints:</p>
       <ul>
         <li><a href="/trades">/trades</a> — Dashboard</li>
         <li><a href="/positions">/positions</a> — Positions actives</li>
         <li><a href="/history">/history</a> — Historique</li>
+        <li><a href="/health">/health</a> — Health Check</li>
         <li><code>POST /tv-webhook</code> — Webhook TradingView</li>
       </ul>
     </body></html>
     """)
 
-def save_event(payload: dict):
-    etype   = payload.get("type")
-    symbol  = payload.get("symbol")
-    tf      = payload.get("tf")
-    tflabel = payload.get("tf_label") or tf_to_label(tf)
-    t       = payload.get("time") or now_ms()
-    side    = payload.get("side")
-    entry   = payload.get("entry")
-    sl      = payload.get("sl")
-    tp1     = payload.get("tp1")
-    tp2     = payload.get("tp2")
-    tp3     = payload.get("tp3")
-    r1      = payload.get("r1")
-    s1      = payload.get("s1")
-    lev_reco= payload.get("lev_reco")
-    qty_reco= payload.get("qty_reco")
-    notional= payload.get("notional")
-    confidence = payload.get("confidence")
-    horizon = payload.get("horizon")
-    leverage= payload.get("leverage")
-    note    = payload.get("note")
-    price   = payload.get("price")
-    direction = payload.get("direction")
-    trade_id  = payload.get("trade_id")
-    if trade_id is None and etype and symbol and tf:
-        trade_id = f"{symbol}_{tf}_{t}"
-    db_execute("""
-        INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, r1, s1,
-                           lev_reco, qty_reco, notional, confidence, horizon, leverage,
-                           note, price, direction, trade_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (etype, symbol, str(tf) if tf is not None else None, tflabel, int(t),
-          side, entry, sl, tp1, tp2, tp3, r1, s1,
-          lev_reco, qty_reco, notional, confidence, horizon, leverage,
-          note, price, direction, trade_id))
-    logger.info(f"Saved event: type={etype} symbol={symbol} tf={tf} trade_id={trade_id}")
-    return trade_id
+@app.get("/health")
+async def health_check():
+    """Health check endpoint pour monitoring"""
+    try:
+        db_query("SELECT 1")
+        db_status = "ok"
+        db_records = db_query("SELECT COUNT(*) as cnt FROM events")[0]["cnt"]
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+        db_records = 0
+    
+    return {
+        "status": "healthy" if db_status == "ok" else "degraded",
+        "database": db_status,
+        "total_events": db_records,
+        "telegram_enabled": settings.TELEGRAM_ENABLED,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": "2.0"
+    }
+
+def save_event(payload: WebhookPayload) -> str:
+    """Sauvegarde un événement avec validation"""
+    try:
+        etype   = payload.type
+        symbol  = payload.symbol
+        tf      = payload.tf
+        tflabel = payload.tf_label or tf_to_label(tf)
+        t       = payload.time or now_ms()
+        side    = payload.side
+        entry   = payload.entry
+        sl      = payload.sl
+        tp1     = payload.tp1
+        tp2     = payload.tp2
+        tp3     = payload.tp3
+        r1      = payload.r1
+        s1      = payload.s1
+        lev_reco= payload.lev_reco
+        qty_reco= payload.qty_reco
+        notional= payload.notional
+        confidence = payload.confidence
+        horizon = payload.horizon
+        leverage= payload.leverage
+        note    = payload.note
+        price   = payload.price
+        direction = payload.direction
+        trade_id  = payload.trade_id
+        
+        if trade_id is None and etype and symbol and tf:
+            trade_id = f"{symbol}_{tf}_{t}"
+        
+        db_execute("""
+            INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, r1, s1,
+                               lev_reco, qty_reco, notional, confidence, horizon, leverage,
+                               note, price, direction, trade_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (etype, symbol, str(tf) if tf is not None else None, tflabel, int(t),
+              side, entry, sl, tp1, tp2, tp3, r1, s1,
+              lev_reco, qty_reco, notional, confidence, horizon, leverage,
+              note, price, direction, trade_id))
+        
+        logger.info(f"Saved event: type={etype} symbol={symbol} tf={tf} trade_id={trade_id}")
+        return trade_id
+    except Exception as e:
+        logger.error(f"Error saving event: {e}")
+        raise
 
 def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
     if not trade_id:
@@ -499,61 +649,72 @@ def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
 
 @app.post("/tv-webhook")
 async def tv_webhook(req: Request):
+    """Webhook TradingView avec validation"""
     try:
-        payload = await req.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    secret = payload.get("secret")
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        payload_dict = await req.json()
+    except Exception as e:
+        logger.error(f"Invalid JSON: {e}")
+        raise HTTPException(400, f"Invalid JSON: {str(e)}")
+    
+    # Vérification du secret
+    secret = payload_dict.get("secret")
+    if settings.WEBHOOK_SECRET and secret != settings.WEBHOOK_SECRET:
+        logger.warning(f"Forbidden: invalid secret from {req.client.host}")
         raise HTTPException(403, "Forbidden")
-    etype = payload.get("type")
-    symbol = payload.get("symbol")
-    tf = payload.get("tf")
-    if not etype or not symbol:
-        raise HTTPException(422, "Missing type or symbol")
-    trade_id = save_event(payload)
+    
+    # Validation Pydantic
     try:
-        if TELEGRAM_ENABLED:
-            key = payload.get("trade_id") or f"{etype}:{symbol}"
-            if etype == "VECTOR_CANDLE":
+        payload = WebhookPayload(**payload_dict)
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(422, f"Validation error: {str(e)}")
+    
+    trade_id = save_event(payload)
+    
+    # Notification Telegram
+    try:
+        if settings.TELEGRAM_ENABLED:
+            key = payload.trade_id or f"{payload.type}:{payload.symbol}"
+            if payload.type == "VECTOR_CANDLE":
                 global _last_vector_flush_ts
                 now_sec = time.time()
-                if now_sec - _last_vector_flush_ts < VECTOR_GLOBAL_GAP_SEC:
+                if now_sec - _last_vector_flush_ts < settings.VECTOR_GLOBAL_GAP_SEC:
                     logger.info("Skip VECTOR_CANDLE by global throttle")
                 else:
                     _last_vector_flush_ts = now_sec
                     txt = format_vector_message(
-                        symbol=symbol,
-                        tf_label=payload.get("tf_label") or tf_to_label(tf),
-                        direction=(payload.get("direction") or ""),
-                        price=payload.get("price"),
-                        note=payload.get("note"),
+                        symbol=payload.symbol,
+                        tf_label=payload.tf_label or tf_to_label(payload.tf),
+                        direction=(payload.direction or ""),
+                        price=payload.price,
+                        note=payload.note,
                     )
                     await tg_send_text(txt, key=key)
-            elif etype == "ENTRY":
-                txt = format_entry_announcement(payload)
+            elif payload.type == "ENTRY":
+                txt = format_entry_announcement(payload.dict())
                 await tg_send_text(txt, key=key)
-            elif etype in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
-                hit_time = payload.get("time") or now_ms()
-                entry_t  = get_entry_time_for_trade(payload.get("trade_id"))
+            elif payload.type in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
+                hit_time = payload.time or now_ms()
+                entry_t  = get_entry_time_for_trade(payload.trade_id)
                 duration = (hit_time - entry_t) if entry_t is not None else None
-                txt = format_event_announcement(etype, payload, duration)
+                txt = format_event_announcement(payload.type, payload.dict(), duration)
                 await tg_send_text(txt, key=key)
         await maybe_altseason_autonotify()
     except Exception as e:
-        logger.warning(f"Telegram send skipped due to cooldown or error: {e}")
+        logger.warning(f"Telegram notification skipped: {e}")
+    
     return JSONResponse({"ok": True, "trade_id": trade_id})
 
 async def maybe_altseason_autonotify():
     global _last_altseason_notify_ts
-    if not ALTSEASON_AUTONOTIFY or not TELEGRAM_ENABLED:
+    if not settings.ALTSEASON_AUTONOTIFY or not settings.TELEGRAM_ENABLED:
         return
     alt = compute_altseason_snapshot()
     greens = alt["signals"]["breadth_symbols"]
     nowt = time.time()
-    if greens < ALT_GREENS_REQUIRED or alt["score"] < 50:
+    if greens < settings.ALT_GREENS_REQUIRED or alt["score"] < 50:
         return
-    if (nowt - _last_altseason_notify_ts) < (ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
+    if (nowt - _last_altseason_notify_ts) < (settings.ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
         return
     emoji = "🟢" if alt["score"] >= 75 else "🟡"
     msg = f"""🚨 <b>Alerte Altseason Automatique</b> {emoji}
@@ -567,9 +728,9 @@ async def maybe_altseason_autonotify():
 - Breadth: {alt['signals']['breadth_symbols']} symboles
 - Momentum: {alt['signals']['recent_entries_ratio']}%
 
-⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {ALT_GREENS_REQUIRED})
+⚡ <b>{greens} symboles</b> avec TP atteints (seuil: {settings.ALT_GREENS_REQUIRED})
 
-<i>Notification automatique activée</i>"""
+<i>{alt['disclaimer']}</i>"""
     reply_markup = _create_dashboard_button()
     res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
     if res.get("ok"):
@@ -658,6 +819,7 @@ def build_trade_rows(limit=300):
     return rows
 
 def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
+    """Calcul KPI avec métriques réalistes"""
     t24 = ms_ago(24*60)
     total_trades = db_query(
         "SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,)
@@ -673,13 +835,20 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
         o = _first_outcome(tid)
         if o == "TP": wins += 1
         elif o == "SL": losses += 1
-    winrate = (wins / max(1, (wins + losses))) * 100.0
+    
+    winrate = (wins / max(1, (wins + losses))) * 100.0 if (wins + losses) > 0 else 0.0
     active = sum(1 for r in rows if r["row_state"] == "normal")
+    cancelled = sum(1 for r in rows if r["row_state"] == "cancel")
+    
     return {
         "total_trades": int(total_trades),
         "active_trades": int(active),
         "tp_hits": int(tp_hits),
         "winrate": round(winrate, 1),
+        "wins": wins,
+        "losses": losses,
+        "cancelled": cancelled,
+        "total_closed": wins + losses,
     }
 
 def generate_sidebar_html(active_page: str, kpi: dict) -> str:
@@ -690,7 +859,7 @@ def generate_sidebar_html(active_page: str, kpi: dict) -> str:
         <div class="logo-icon">⚡</div>
         <div class="logo-text">
           <h2>AI Trader</h2>
-          <p>Institutional</p>
+          <p>Professional</p>
         </div>
       </div>
       <nav>
@@ -703,45 +872,32 @@ def generate_sidebar_html(active_page: str, kpi: dict) -> str:
         <div class="nav-item {'active' if active_page == 'history' else ''}" onclick="window.location.href='/history'">
           <span>📜</span><span>Historique</span>
         </div>
-        <div class="nav-item" onclick="alert('Section en développement - Analytics Pro')">
+        <div class="nav-item" onclick="alert('Section en développement')">
           <span>📉</span><span>Analytics Pro</span>
         </div>
         <div class="nav-section">Intelligence AI</div>
-        <div class="nav-item" onclick="alert('Section en développement - ML Insights')">
+        <div class="nav-item" onclick="alert('Section en développement')">
           <span>🤖</span><span>ML Insights</span>
         </div>
-        <div class="nav-item" onclick="alert('Section en développement - Prédictions')">
-          <span>🎯</span><span>Prédictions</span><span class="nav-badge">3</span>
+        <div class="nav-item" onclick="alert('Section en développement')">
+          <span>🎯</span><span>Prédictions</span>
         </div>
-        <div class="nav-item" onclick="alert('Section en développement - Opportunités')">
+        <div class="nav-item" onclick="alert('Section en développement')">
           <span>🔥</span><span>Opportunités</span>
         </div>
-        <div class="nav-item" onclick="alert('Section en développement - Alertes')">
-          <span>⚠️</span><span>Alertes</span>
-        </div>
-        <div class="nav-section">Outils Avancés</div>
-        <div class="nav-item" onclick="alert('Section en développement - Backtesting')">
+        <div class="nav-section">Outils</div>
+        <div class="nav-item" onclick="alert('Section en développement')">
           <span>📐</span><span>Backtesting</span>
         </div>
-        <div class="nav-item" onclick="alert('Section en développement - Corrélations')">
-          <span>🔗</span><span>Corrélations</span>
-        </div>
-        <div class="nav-item" onclick="alert('Section en développement - Simulation')">
-          <span>🎲</span><span>Simulation</span>
-        </div>
-        <div class="nav-section">Système</div>
-        <div class="nav-item" onclick="alert('Section en développement - Paramètres')">
+        <div class="nav-item" onclick="alert('Section en développement')">
           <span>⚙️</span><span>Paramètres</span>
-        </div>
-        <div class="nav-item" onclick="alert('Section en développement - Notifications')">
-          <span>🔔</span><span>Notifications</span>
         </div>
       </nav>
       <div class="ml-status">
-        <div class="ml-status-header"><h4><span class="status-dot"></span> ML Engine</h4></div>
-        <div class="ml-metric"><span class="label">Précision</span><span class="value">94.2%</span></div>
-        <div class="ml-metric"><span class="label">Modèles actifs</span><span class="value">5/5</span></div>
-        <div class="ml-metric"><span class="label">Dernière analyse</span><span class="value">12s</span></div>
+        <div class="ml-status-header"><h4><span class="status-dot"></span> Système</h4></div>
+        <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
+        <div class="ml-metric"><span class="label">Trades fermés</span><span class="value">{kpi.get('total_closed', 0)}</span></div>
+        <div class="ml-metric"><span class="label">Annulés</span><span class="value">{kpi.get('cancelled', 0)}</span></div>
       </div>
       <div class="user-profile">
         <div class="avatar">TP</div>
@@ -755,7 +911,7 @@ def generate_sidebar_html(active_page: str, kpi: dict) -> str:
     '''
 
 def get_base_css() -> str:
-    """Retourne le CSS commun à toutes les pages"""
+    """Retourne le CSS commun"""
     return """
     :root{--bg:#050a12;--sidebar:#0a0f1a;--panel:rgba(15,23,38,0.8);--card:rgba(20,30,48,0.6);--border:rgba(99,102,241,0.12);--txt:#e2e8f0;--muted:#64748b;--accent:#6366f1;--accent2:#8b5cf6;--success:#10b981;--danger:#ef4444;--warning:#f59e0b;--info:#06b6d4;--purple:#a855f7;--glow:rgba(99,102,241,0.25)}
     *{box-sizing:border-box;margin:0;padding:0}
@@ -810,9 +966,9 @@ def get_base_css() -> str:
     @media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
     """
 
+# Import des routes (dashboard, positions, history)
 @app.get("/positions", response_class=HTMLResponse)
 async def positions_page():
-    """Page des positions actives"""
     try:
         ensure_trades_schema()
     except Exception:
@@ -820,8 +976,6 @@ async def positions_page():
     
     rows = build_trade_rows(limit=300)
     kpi = compute_kpis(rows)
-    
-    # Filtrer uniquement les positions actives
     active_rows = [r for r in rows if r['row_state'] == 'normal']
     
     html = f'''<!doctype html>
@@ -906,7 +1060,6 @@ async def positions_page():
 
 @app.get("/history", response_class=HTMLResponse)
 async def history_page():
-    """Page de l'historique complet"""
     try:
         ensure_trades_schema()
     except Exception:
@@ -914,8 +1067,6 @@ async def history_page():
     
     rows = build_trade_rows(limit=300)
     kpi = compute_kpis(rows)
-    
-    # Filtrer trades fermés (TP ou SL)
     closed_rows = [r for r in rows if r['row_state'] in ('tp', 'sl')]
     wins = sum(1 for r in closed_rows if r['row_state'] == 'tp')
     losses = sum(1 for r in closed_rows if r['row_state'] == 'sl')
@@ -953,19 +1104,14 @@ async def history_page():
         </div>
       </div>
       <div class="panel">
-        <div style="margin-bottom:20px">
-          <button class="badge badge-pending" onclick="filterHistory('all')" style="cursor:pointer;margin-right:8px">Tous</button>
-          <button class="badge badge-tp" onclick="filterHistory('win')" style="cursor:pointer;margin-right:8px">Gagnants</button>
-          <button class="badge badge-sl" onclick="filterHistory('loss')" style="cursor:pointer">Perdants</button>
-        </div>
         <table>
           <thead>
             <tr>
               <th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
-              <th>Exit</th><th>Résultat</th><th>Durée</th><th>Date</th>
+              <th>Exit</th><th>Résultat</th><th>Date</th>
             </tr>
           </thead>
-          <tbody id="historyTable">
+          <tbody>
     '''
     
     for r in closed_rows:
@@ -976,31 +1122,23 @@ async def history_page():
         entry = r.get('entry')
         row_class = 'win' if r['row_state'] == 'tp' else 'loss'
         result_badge = '<span class="badge badge-tp">✅ WIN</span>' if r['row_state'] == 'tp' else '<span class="badge badge-sl">❌ LOSS</span>'
-        
-        # Exit price (premier TP hit ou SL)
         exit_price = r.get('tp1') if r.get('tp1_hit') else (r.get('sl') if r.get('sl_hit') else '—')
-        
-        # Durée estimée
-        duration = "—"
-        
-        # Date
         date_str = datetime.fromtimestamp(r.get('t_entry', 0) / 1000).strftime('%d/%m %H:%M')
         
         html += f'''
-            <tr class="trade-row {row_class}" data-type="{row_class}">
+            <tr class="trade-row {row_class}">
               <td><strong>{symbol}</strong></td>
               <td><span class="badge badge-tf">{tf_label}</span></td>
               <td>{side_badge}</td>
               <td style="font-family:monospace">{entry if entry else '—'}</td>
               <td style="font-family:monospace">{exit_price}</td>
               <td>{result_badge}</td>
-              <td style="color:var(--muted)">{duration}</td>
               <td style="color:var(--muted)">{date_str}</td>
             </tr>
         '''
     
     if not closed_rows:
-        html += '<tr><td colspan="8" style="text-align:center;padding:60px;color:var(--muted)">Aucun historique pour le moment</td></tr>'
+        html += '<tr><td colspan="7" style="text-align:center;padding:60px;color:var(--muted)">Aucun historique</td></tr>'
     
     html += '''
           </tbody>
@@ -1008,18 +1146,6 @@ async def history_page():
       </div>
     </main>
   </div>
-  <script>
-    function filterHistory(type) {
-      const rows = document.querySelectorAll('#historyTable tr');
-      rows.forEach(row => {
-        if (type === 'all') {
-          row.style.display = '';
-        } else {
-          row.style.display = row.dataset.type === type ? '' : 'none';
-        }
-      });
-    }
-  </script>
 </body>
 </html>'''
     
@@ -1027,7 +1153,6 @@ async def history_page():
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
-    """Dashboard principal avec tous les KPIs et graphiques"""
     try:
         ensure_trades_schema()
     except Exception:
@@ -1039,19 +1164,16 @@ async def trades_page():
 
     active_longs = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'LONG')
     active_shorts = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'SHORT')
-    
     sentiment = "BULLISH" if active_longs > active_shorts else "BEARISH" if active_shorts > active_longs else "NEUTRE"
     
     if alt['score'] >= 75:
-        insight_text = f"Forte altseason détectée ! Conditions optimales pour LONG. Momentum positif avec {alt['signals']['breadth_symbols']} symboles."
+        insight_text = f"Forte altseason détectée avec {alt['signals']['breadth_symbols']} symboles."
     elif alt['score'] >= 50:
-        insight_text = "Altseason modérée. Opportunités sélectives avec gestion stricte du risque."
+        insight_text = "Altseason modérée. Gestion stricte du risque recommandée."
     elif kpi['winrate'] > 70:
-        insight_text = "Excellente performance ! Résultats supérieurs à la moyenne."
-    elif kpi['active_trades'] > 10:
-        insight_text = f"Attention surexposition avec {kpi['active_trades']} trades actifs."
+        insight_text = f"Excellente performance avec {kpi['winrate']}% winrate."
     else:
-        insight_text = "Marché en consolidation. Attendez confirmation avant entrée."
+        insight_text = "Marché en consolidation. Patience recommandée."
 
     html = f'''<!doctype html>
 <html lang="fr">
@@ -1060,7 +1182,6 @@ async def trades_page():
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Trader Pro Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
   <style>{get_base_css()}
     .quick-stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:32px}}
     .stat-card{{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;transition:all 0.3s}}
@@ -1078,19 +1199,19 @@ async def trades_page():
       
       <div class="quick-stats">
         <div class="stat-card">
-          <div style="font-size:13px;color:var(--muted);margin-bottom:8px">TOTAL TRADES 24H</div>
+          <div style="font-size:13px;color:var(--muted);margin-bottom:8px">TRADES 24H</div>
           <div class="stat-value">{kpi['total_trades']}</div>
-          <div style="font-size:13px;color:var(--success)">↗ Performance excellente</div>
+          <div style="font-size:13px;color:var(--muted)">{kpi['wins']}W · {kpi['losses']}L</div>
         </div>
         <div class="stat-card">
-          <div style="font-size:13px;color:var(--muted);margin-bottom:8px">POSITIONS ACTIVES</div>
+          <div style="font-size:13px;color:var(--muted);margin-bottom:8px">POSITIONS</div>
           <div class="stat-value">{kpi['active_trades']}</div>
-          <div style="font-size:13px;color:var(--muted)">{active_longs} LONG · {active_shorts} SHORT</div>
+          <div style="font-size:13px;color:var(--muted)">{active_longs}L · {active_shorts}S</div>
         </div>
         <div class="stat-card">
           <div style="font-size:13px;color:var(--muted);margin-bottom:8px">WIN RATE</div>
           <div class="stat-value">{kpi['winrate']}%</div>
-          <div style="font-size:13px;color:var(--success)">↗ Top 10% traders</div>
+          <div style="font-size:13px;color:var(--success)">↗ {kpi['total_closed']} fermés</div>
         </div>
         <div class="stat-card">
           <div style="font-size:13px;color:var(--muted);margin-bottom:8px">TP ATTEINTS</div>
@@ -1126,6 +1247,7 @@ async def trades_page():
                 <div style="font-size:28px;font-weight:900">{alt['signals']['recent_entries_ratio']}%</div>
               </div>
             </div>
+            <p style="font-size:11px;color:var(--muted);margin-top:20px;font-style:italic">{alt['disclaimer']}</p>
           </div>
         </div>
       </div>
@@ -1172,7 +1294,7 @@ async def trades_page():
         '''
     
     if not rows:
-        html += '<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--muted)">Aucun trade pour le moment</td></tr>'
+        html += '<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--muted)">Aucun trade</td></tr>'
     
     html += '''
           </tbody>
