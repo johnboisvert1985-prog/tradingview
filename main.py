@@ -157,7 +157,8 @@ def human_duration_verbose(ms: int) -> str:
         return f"{h} h {m} min"
     if m > 0:
         return f"{m} min {sec} s"
-    return f"{sec} s"                                                                 
+    return f"{sec} s"
+
 # =========================
 # Telegram
 # =========================
@@ -425,7 +426,8 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
             x += f"\n{d_txt}"
         return x
     return f"ℹ️ {etype} — {base}" + (f"\n{d_txt}" if d_txt else "")
-    # =========================
+
+# =========================
 # FastAPI
 # =========================
 app = FastAPI(title="AI Trader", version="1.0")
@@ -600,12 +602,12 @@ def _first_outcome(trade_id: str) -> Optional[str]:
     return "TP" if t.startswith("TP") else ("SL" if t == "SL_HIT" else None)
 
 def _cancelled_by_opposite(entry_row: dict) -> bool:
-    symbol = entry_row.get("symbol"); tf = entry_row.get("tf")
-    side = (entry_row.get("side") or "").upper(); t = int(entry_row.get("time") or 0)
-    if not symbol or tf is None or side not in ("def _cancelled_by_opposite(entry_row: dict) -> bool:
-    symbol = entry_row.get("symbol"); tf = entry_row.get("tf")
-    side = (entry_row.get("side") or "").upper(); t = int(entry_row.get("time") or 0)
-    if not symbol or tf is None or side not in ("LONG", "SHORT"): return False
+    symbol = entry_row.get("symbol")
+    tf = entry_row.get("tf")
+    side = (entry_row.get("side") or "").upper()
+    t = int(entry_row.get("time") or 0)
+    if not symbol or tf is None or side not in ("LONG", "SHORT"):
+        return False
     opposite = "SHORT" if side == "LONG" else "LONG"
     r = db_query("""
       SELECT 1 FROM events
@@ -807,7 +809,8 @@ def get_base_css() -> str:
     @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
     @media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
     """
-    @app.get("/positions", response_class=HTMLResponse)
+
+@app.get("/positions", response_class=HTMLResponse)
 async def positions_page():
     """Page des positions actives"""
     try:
@@ -1021,7 +1024,8 @@ async def history_page():
 </html>'''
     
     return HTMLResponse(content=html)
-    @app.get("/trades", response_class=HTMLResponse)
+
+@app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
     """Dashboard principal avec tous les KPIs et graphiques"""
     try:
@@ -1187,4 +1191,3 @@ async def trades_page():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
-
