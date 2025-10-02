@@ -825,5 +825,272 @@ async def maybe_altseason_autonotify():
     if res.get("ok"):
         _last_altseason_notify_ts = nowt
 
-# Continue with all the page routes (analytics, positions, history, trades)...
-# (Le code HTML continue après mais je dois le couper ici pour respecter la limite de caractères)
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_page():
+    try:
+        ensure_trades_schema()
+    except:
+        pass
+    rows = build_trade_rows(limit=1000)
+    kpi = compute_kpis(rows)
+    tf_data = {}
+    for tf in ["15", "60", "240", "1440"]:
+        tf_rows = [r for r in rows if str(r.get('tf', '')).startswith(str(tf))]
+        wins = sum(1 for r in tf_rows if r['row_state'] == 'tp')
+        losses = sum(1 for r in tf_rows if r['row_state'] == 'sl')
+        tf_data[tf] = {"wins": wins, "losses": losses, "total": wins + losses}
+    symbol_data = {}
+    for row in rows:
+        sym = row.get('symbol', 'UNKNOWN')
+        if sym not in symbol_data:
+            symbol_data[sym] = {"wins": 0, "losses": 0}
+        if row['row_state'] == 'tp':
+            symbol_data[sym]['wins'] += 1
+        elif row['row_state'] == 'sl':
+            symbol_data[sym]['losses'] += 1
+    top_symbols = sorted(symbol_data.items(), key=lambda x: x[1]['wins'], reverse=True)[:10]
+    
+    html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Analytics - AI Trader Pro</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>{get_base_css()}</style></head><body><div class="app">{generate_sidebar_html('analytics', kpi)}
+    <main class="main"><h1 style="font-size:36px;font-weight:900;margin-bottom:32px">📊 Analytics Avancées</h1>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:32px">
+    <div class="chart-container"><h3 style="margin-bottom:24px;font-size:18px;font-weight:800">Performance par Timeframe</h3>'''
+    
+    for tf, data in tf_data.items():
+        total = data['total']
+        winrate = (data['wins'] / total * 100) if total > 0 else 0
+        width = min(winrate, 100)
+        html += f'<div class="bar"><div class="bar-label">{tf}m</div><div class="bar-track"><div class="bar-fill" style="width:{width}%"></div></div><div class="bar-value">{winrate:.1f}%</div></div>'
+    
+    html += '</div><div class="chart-container"><h3 style="margin-bottom:24px;font-size:18px;font-weight:800">Top 10 Symboles</h3>'
+    
+    for symbol, data in top_symbols:
+        total = data['wins'] + data['losses']
+        winrate = (data['wins'] / total * 100) if total > 0 else 0
+        width = min(winrate, 100)
+        html += f'<div class="bar"><div class="bar-label">{symbol}</div><div class="bar-track"><div class="bar-fill" style="width:{width}%"></div></div><div class="bar-value">{data["wins"]}W/{data["losses"]}L</div></div>'
+    
+    expectancy = round((kpi['wins'] * 1.5 - kpi['losses']) / max(1, kpi['total_closed']), 2)
+    profit_factor = round(kpi['wins'] / max(1, kpi['losses']), 2)
+    exp_color = 'var(--success)' if expectancy > 0 else 'var(--danger)'
+    pf_color = 'var(--success)' if profit_factor > 1 else 'var(--danger)'
+    
+    html += f'''</div></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px">
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">EXPECTANCY</div>
+    <div style="font-size:36px;font-weight:900;color:{exp_color}">{expectancy}R</div>
+    <div style="font-size:13px;color:var(--muted)">(Wins×1.5 - Losses) / Total</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">PROFIT FACTOR</div>
+    <div style="font-size:36px;font-weight:900;color:{pf_color}">{profit_factor}</div>
+    <div style="font-size:13px;color:var(--muted)">Wins / Losses ratio</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">TRADES TOTAL</div>
+    <div style="font-size:36px;font-weight:900">{kpi['total_closed']}</div>
+    <div style="font-size:13px;color:var(--muted)">{kpi['cancelled']} annulés</div></div>
+    </div></main></div></body></html>'''
+    return HTMLResponse(content=html)
+
+@app.get("/positions", response_class=HTMLResponse)
+async def positions_page():
+    try:
+        ensure_trades_schema()
+    except:
+        pass
+    rows = build_trade_rows(limit=300)
+    kpi = compute_kpis(rows)
+    active_rows = [r for r in rows if r['row_state'] == 'normal']
+    longs = sum(1 for r in active_rows if r.get('side','').upper() == 'LONG')
+    shorts = sum(1 for r in active_rows if r.get('side','').upper() == 'SHORT')
+    
+    html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Positions - AI Trader Pro</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>{get_base_css()}</style></head><body><div class="app">{generate_sidebar_html('positions', kpi)}
+    <main class="main"><h1 style="font-size:36px;font-weight:900;margin-bottom:32px">📈 Positions Actives</h1>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:32px">
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">TOTAL ACTIF</div>
+    <div style="font-size:36px;font-weight:900">{len(active_rows)}</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">LONG</div>
+    <div style="font-size:36px;font-weight:900;color:var(--success)">{longs}</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">SHORT</div>
+    <div style="font-size:36px;font-weight:900;color:var(--danger)">{shorts}</div></div></div>
+    <div class="panel"><table><thead><tr><th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
+    <th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Temps</th></tr></thead><tbody>'''
+    
+    for r in active_rows:
+        symbol = r.get('symbol', '')
+        tf_label = r.get('tf_label', '')
+        side = (r.get('side') or '').upper()
+        side_badge = '<span class="badge badge-long">📈 LONG</span>' if side == 'LONG' else '<span class="badge badge-short">📉 SHORT</span>'
+        entry = r.get('entry')
+        elapsed = human_duration_verbose(now_ms() - r.get('t_entry', now_ms()))
+        def tp_badge(val):
+            return f'<span class="badge badge-pending">🎯 {val}</span>' if val else '<span class="badge badge-pending">—</span>'
+        sl_badge = f'<span class="badge badge-pending">❌ {r.get("sl")}</span>' if r.get('sl') else '<span class="badge badge-pending">—</span>'
+        html += f'''<tr class="trade-row active"><td><strong>{symbol}</strong></td><td><span class="badge badge-tf">{tf_label}</span></td>
+        <td>{side_badge}</td><td style="font-family:monospace;font-weight:700">{entry if entry else '—'}</td>
+        <td>{tp_badge(r.get('tp1'))}</td><td>{tp_badge(r.get('tp2'))}</td><td>{tp_badge(r.get('tp3'))}</td>
+        <td>{sl_badge}</td><td style="color:var(--muted)">{elapsed}</td></tr>'''
+    
+    if not active_rows:
+        html += '<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--muted)">✨ Aucune position active</td></tr>'
+    html += '</tbody></table></div></main></div></body></html>'
+    return HTMLResponse(content=html)
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page():
+    try:
+        ensure_trades_schema()
+    except:
+        pass
+    rows = build_trade_rows(limit=300)
+    kpi = compute_kpis(rows)
+    closed_rows = [r for r in rows if r['row_state'] in ('tp', 'sl')]
+    
+    html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Historique - AI Trader Pro</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>{get_base_css()}</style></head><body><div class="app">{generate_sidebar_html('history', kpi)}
+    <main class="main"><h1 style="font-size:36px;font-weight:900;margin-bottom:32px">📜 Historique Complet</h1>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:32px">
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">TOTAL</div>
+    <div style="font-size:36px;font-weight:900">{len(closed_rows)}</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">GAGNANTS</div>
+    <div style="font-size:36px;font-weight:900;color:var(--success)">{kpi['wins']}</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">PERDANTS</div>
+    <div style="font-size:36px;font-weight:900;color:var(--danger)">{kpi['losses']}</div></div>
+    <div class="panel"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">WIN RATE</div>
+    <div style="font-size:36px;font-weight:900;color:var(--success)">{kpi['winrate']}%</div></div></div>
+    <div class="panel"><table><thead><tr><th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th>
+    <th>Exit</th><th>Résultat</th><th>Date</th></tr></thead><tbody>'''
+    
+    for r in closed_rows:
+        symbol = r.get('symbol', '')
+        tf_label = r.get('tf_label', '')
+        side = (r.get('side') or '').upper()
+        side_badge = '<span class="badge badge-long">LONG</span>' if side == 'LONG' else '<span class="badge badge-short">SHORT</span>'
+        entry = r.get('entry')
+        row_class = 'win' if r['row_state'] == 'tp' else 'loss'
+        result_badge = '<span class="badge badge-tp">✅ WIN</span>' if r['row_state'] == 'tp' else '<span class="badge badge-sl">❌ LOSS</span>'
+        exit_price = r.get('tp1') if r.get('tp1_hit') else (r.get('sl') if r.get('sl_hit') else '—')
+        date_str = datetime.fromtimestamp(r.get('t_entry', 0) / 1000).strftime('%d/%m %H:%M')
+        html += f'''<tr class="trade-row {row_class}"><td><strong>{symbol}</strong></td>
+        <td><span class="badge badge-tf">{tf_label}</span></td><td>{side_badge}</td>
+        <td style="font-family:monospace">{entry if entry else '—'}</td><td style="font-family:monospace">{exit_price}</td>
+        <td>{result_badge}</td><td style="color:var(--muted)">{date_str}</td></tr>'''
+    
+    if not closed_rows:
+        html += '<tr><td colspan="7" style="text-align:center;padding:60px;color:var(--muted)">✨ Aucun historique</td></tr>'
+    html += '</tbody></table></div></main></div></body></html>'
+    return HTMLResponse(content=html)
+
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page():
+    try:
+        ensure_trades_schema()
+    except:
+        pass
+    alt = compute_altseason_snapshot()
+    rows = build_trade_rows(limit=300)
+    kpi = compute_kpis(rows)
+    active_longs = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'LONG')
+    active_shorts = sum(1 for r in rows if r['row_state'] == 'normal' and r.get('side','').upper() == 'SHORT')
+    sentiment = "BULLISH" if active_longs > active_shorts else "BEARISH" if active_shorts > active_longs else "NEUTRE"
+    symbols_text = ", ".join(alt["symbols_with_tp"][:10])
+    if len(alt["symbols_with_tp"]) > 10:
+        symbols_text += f" +{len(alt['symbols_with_tp'])-10} autres"
+    if alt['score'] >= 75:
+        insight_text = f"Forte altseason. Symboles: {symbols_text}"
+    elif alt['score'] >= 50:
+        insight_text = f"Altseason modérée. Symboles: {symbols_text}"
+    elif kpi['winrate'] > 70:
+        insight_text = f"Excellente performance {kpi['winrate']}%"
+    else:
+        insight_text = "Marché en consolidation"
+    tp_list = ""
+    for tp in kpi.get('tp_details', [])[:10]:
+        tp_type = tp['type'].replace('_HIT', '')
+        tp_list += f"{tp['symbol']} ({tp_type}), "
+    tp_list = tp_list.rstrip(", ") if tp_list else "Aucun TP"
+    
+    html = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dashboard - AI Trader Pro</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>{get_base_css()}
+    .quick-stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-bottom:32px}}
+    .stat-card{{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;transition:all 0.3s}}
+    .stat-card:hover{{transform:translateY(-8px);box-shadow:0 20px 60px rgba(0,0,0,0.5)}}
+    .stat-value{{font-size:42px;font-weight:900;margin:12px 0}}
+    .market-intel{{background:linear-gradient(135deg,rgba(99,102,241,0.08),rgba(139,92,246,0.08));border:1px solid rgba(99,102,241,0.25);border-radius:24px;padding:36px;margin-bottom:32px}}
+    .ai-score{{width:180px;height:180px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--purple));display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:56px;font-weight:900;color:#000;box-shadow:0 20px 60px var(--glow)}}
+    </style></head><body><div class="app">{generate_sidebar_html('dashboard', kpi)}
+    <main class="main"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:32px">
+    <h1 style="font-size:36px;font-weight:900;margin:0">⚡ Performance Intelligence</h1>
+    <button onclick="resetDatabase()" class="btn btn-danger">🗑️ Reset Database</button></div>
+    <div class="quick-stats"><div class="stat-card"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">TRADES 24H</div>
+    <div class="stat-value">{kpi['total_trades']}</div><div style="font-size:13px;color:var(--muted)">{kpi['wins']}W · {kpi['losses']}L</div></div>
+    <div class="stat-card"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">POSITIONS</div>
+    <div class="stat-value">{kpi['active_trades']}</div><div style="font-size:13px;color:var(--muted)">{active_longs}L · {active_shorts}S</div></div>
+    <div class="stat-card"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">WIN RATE</div>
+    <div class="stat-value">{kpi['winrate']}%</div><div style="font-size:13px;color:var(--success)">↗ {kpi['total_closed']} fermés</div></div>
+    <div class="stat-card"><div style="font-size:13px;color:var(--muted);margin-bottom:8px">TP ATTEINTS</div>
+    <div class="stat-value">{kpi['tp_hits']}</div><div style="font-size:11px;color:var(--muted);margin-top:8px">{tp_list[:50]}...</div></div></div>
+    <div class="market-intel"><div style="display:grid;grid-template-columns:auto 1fr;gap:48px;align-items:center">
+    <div class="ai-score"><div>{alt['score']}</div><div style="font-size:14px;font-weight:800;color:rgba(0,0,0,0.7)">/100</div></div>
+    <div><h2 style="font-size:32px;font-weight:900;margin-bottom:10px">{alt['label']}</h2>
+    <p style="color:var(--muted);margin-bottom:28px">Sentiment: {sentiment} · {insight_text}</p>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:20px">
+    <div class="panel" style="padding:20px"><div style="font-size:12px;color:var(--muted);margin-bottom:8px">LONG RATIO</div>
+    <div style="font-size:28px;font-weight:900">{alt['signals']['long_ratio']}%</div></div>
+    <div class="panel" style="padding:20px"><div style="font-size:12px;color:var(--muted);margin-bottom:8px">TP SUCCESS</div>
+    <div style="font-size:28px;font-weight:900">{alt['signals']['tp_vs_sl']}%</div></div>
+    <div class="panel" style="padding:20px"><div style="font-size:12px;color:var(--muted);margin-bottom:8px">BREADTH</div>
+    <div style="font-size:28px;font-weight:900">{alt['signals']['breadth_symbols']}</div></div>
+    <div class="panel" style="padding:20px"><div style="font-size:12px;color:var(--muted);margin-bottom:8px">MOMENTUM</div>
+    <div style="font-size:28px;font-weight:900">{alt['signals']['recent_entries_ratio']}%</div></div></div>
+    <p style="font-size:11px;color:var(--muted);margin-top:20px;font-style:italic">{alt['disclaimer']}</p></div></div></div>
+    <div class="panel"><h3 style="font-size:20px;font-weight:800;margin-bottom:20px">Trades Récents</h3>
+    <table><thead><tr><th>Symbole</th><th>TF</th><th>Side</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Status</th></tr></thead><tbody>'''
+    
+    for r in rows[:20]:
+        row_class = {'tp': 'win', 'sl': 'loss', 'cancel': 'active', 'normal': 'active'}.get(r.get('row_state', 'normal'), 'active')
+        symbol = r.get('symbol', '')
+        tf_label = r.get('tf_label', '')
+        side = (r.get('side') or '').upper()
+        side_badge = '<span class="badge badge-long">LONG</span>' if side == 'LONG' else '<span class="badge badge-short">SHORT</span>' if side == 'SHORT' else '<span class="badge badge-pending">—</span>'
+        entry = r.get('entry')
+        def tp_badge(val, hit):
+            if val is None:
+                return '<span class="badge badge-pending">—</span>'
+            return f'<span class="badge badge-tp">✅ {val}</span>' if hit else f'<span class="badge badge-pending">🎯 {val}</span>'
+        sl_badge = f'<span class="badge badge-sl">⛔ {r.get("sl")}</span>' if r.get('sl') and r.get('sl_hit') else f'<span class="badge badge-pending">❌ {r.get("sl")}</span>' if r.get('sl') else '<span class="badge badge-pending">—</span>'
+        status = '<span class="badge badge-tp">TP Hit</span>' if row_class == 'win' else '<span class="badge badge-sl">SL Hit</span>' if row_class == 'loss' else '<span class="badge badge-pending">Active</span>'
+        html += f'''<tr class="trade-row {row_class}"><td><strong>{symbol}</strong></td>
+        <td><span class="badge badge-tf">{tf_label}</span></td><td>{side_badge}</td>
+        <td style="font-family:monospace;font-weight:700">{entry if entry else '—'}</td>
+        <td>{tp_badge(r.get('tp1'), r.get('tp1_hit', False))}</td>
+        <td>{tp_badge(r.get('tp2'), r.get('tp2_hit', False))}</td>
+        <td>{tp_badge(r.get('tp3'), r.get('tp3_hit', False))}</td>
+        <td>{sl_badge}</td><td>{status}</td></tr>'''
+    
+    if not rows:
+        html += '<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--muted)">✨ Aucun trade</td></tr>'
+    
+    html += '''</tbody></table></div></main></div>
+    <script>
+    async function resetDatabase(){
+    if(!confirm('⚠️ ATTENTION: Effacer TOUTES les données?\\n\\nBackup automatique.\\n\\nContinuer?'))return;
+    if(!confirm('Êtes-vous VRAIMENT sûr?'))return;
+    const secret=prompt('Secret webhook:');
+    if(!secret)return;
+    try{
+    const res=await fetch('/api/reset-database',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret})});
+    const data=await res.json();
+    if(res.ok&&data.ok){alert('✅ Reset OK!\\nBackup: '+data.backup);location.reload();}
+    else{alert('❌ Erreur: '+(data.message||'Secret invalide'));}
+    }catch(e){alert('❌ Erreur réseau: '+e.message);console.error(e);}
+    }
+    </script></body></html>'''
+    return HTMLResponse(content=html)
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting AI Trader Pro v2.1...")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
