@@ -782,6 +782,19 @@ async def tv_webhook(req: Request):
             elif payload.type in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
                 hit_time = payload.time or now_ms()
                 entry_t = get_entry_time_for_trade(payload.trade_id)
+                
+                # FALLBACK: Si pas trouvé avec trade_id, cherche par symbol+tf
+                if not entry_t and payload.symbol and payload.tf:
+                    logger.info(f"Fallback: searching ENTRY for {payload.symbol} {payload.tf}")
+                    r = db_query("""
+                        SELECT MIN(time) AS t FROM events 
+                        WHERE symbol=? AND tf=? AND type='ENTRY' 
+                        ORDER BY time DESC LIMIT 1
+                    """, (payload.symbol, str(payload.tf)))
+                    if r and r[0].get("t"):
+                        entry_t = int(r[0]["t"])
+                        logger.info(f"Fallback: found ENTRY at {entry_t}")
+                
                 duration = (hit_time - entry_t) if entry_t else None
                 txt = format_event_announcement(payload.type, payload.dict(), duration)
                 await tg_send_text(txt, key=key, reply_markup=reply_markup)
