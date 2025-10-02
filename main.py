@@ -783,59 +783,64 @@ async def tv_webhook(req: Request):
                 hit_time = payload.time or now_ms()
                 entry_t = get_entry_time_for_trade(payload.trade_id)
                 
+                # Stratégie de fallback améliorée si trade_id ne fonctionne pas
                 if not entry_t and payload.symbol and payload.tf:
                     symbol = payload.symbol
                     tf = str(payload.tf)
-                    symbol_base = symbol.replace('.P', '').replace('.PERP', '')
+                    side = payload.side
                     
-                    logger.info(f"=== DIAGNOSTIC ENTRY SEARCH ===")
-                    logger.info(f"Looking for: symbol={symbol}, tf={tf}, trade_id={payload.trade_id}")
-                    
-                    all_entries = db_query("SELECT COUNT(*) as cnt FROM events WHERE type='ENTRY'")
-                    logger.info(f"Total ENTRY in DB: {all_entries[0]['cnt'] if all_entries else 0}")
-                    
-                    recent = db_query("""
-                        SELECT symbol, tf, time FROM events 
-                        WHERE type='ENTRY' 
-                        ORDER BY time DESC LIMIT 5
-                    """)
-                    logger.info(f"Recent ENTRY: {recent}")
-                    
-                    r = db_query("""
+                    # Essai 1: Chercher par symbol + tf + side exact
+                    query = """
                         SELECT time FROM events 
-                        WHERE symbol=? AND tf=? AND type='ENTRY' 
-                        ORDER BY time DESC LIMIT 1
-                    """, (symbol, tf))
+                        WHERE symbol=? AND tf=? AND type='ENTRY'
+                    """
+                    params = [symbol, tf]
                     
+                    if side:
+                        query += " AND side=?"
+                        params.append(side)
+                    
+                    query += " ORDER BY time DESC LIMIT 1"
+                    
+                    r = db_query(query, tuple(params))
                     if r and r[0].get("time"):
                         entry_t = int(r[0]["time"])
-                        logger.info(f"SUCCESS Essai 1: {entry_t}")
+                        logger.info(f"Found ENTRY by symbol+tf+side: {entry_t}")
                     else:
-                        logger.info(f"FAIL Essai 1: {symbol} + {tf}")
-                        
+                        # Essai 2: Sans le side
                         r = db_query("""
                             SELECT time FROM events 
                             WHERE symbol=? AND tf=? AND type='ENTRY' 
                             ORDER BY time DESC LIMIT 1
-                        """, (symbol_base, tf))
+                        """, (symbol, tf))
                         
                         if r and r[0].get("time"):
                             entry_t = int(r[0]["time"])
-                            logger.info(f"SUCCESS Essai 2: {entry_t}")
+                            logger.info(f"Found ENTRY by symbol+tf: {entry_t}")
                         else:
-                            logger.info(f"FAIL Essai 2: {symbol_base} + {tf}")
+                            # Essai 3: Variants du symbol (.P, .PERP, etc)
+                            symbol_variants = [
+                                symbol,
+                                symbol.replace('.P', ''),
+                                symbol.replace('.PERP', ''),
+                                symbol + '.P',
+                                symbol + '.PERP'
+                            ]
                             
-                            r = db_query("""
-                                SELECT symbol, tf, time FROM events 
-                                WHERE (symbol LIKE ? OR symbol LIKE ?) AND type='ENTRY' 
-                                ORDER BY time DESC LIMIT 1
-                            """, (f"{symbol}%", f"{symbol_base}%"))
+                            for sym_var in symbol_variants:
+                                r = db_query("""
+                                    SELECT time FROM events 
+                                    WHERE symbol=? AND tf=? AND type='ENTRY' 
+                                    ORDER BY time DESC LIMIT 1
+                                """, (sym_var, tf))
+                                
+                                if r and r[0].get("time"):
+                                    entry_t = int(r[0]["time"])
+                                    logger.info(f"Found ENTRY with symbol variant '{sym_var}': {entry_t}")
+                                    break
                             
-                            if r and r[0].get("time"):
-                                entry_t = int(r[0]["time"])
-                                logger.info(f"SUCCESS Essai 3: symbol={r[0]['symbol']}, tf={r[0]['tf']}, time={entry_t}")
-                            else:
-                                logger.error(f"TOTAL FAILURE: NO ENTRY FOUND FOR {symbol} / {symbol_base}")
+                            if not entry_t:
+                                logger.error(f"NO ENTRY FOUND for {symbol} tf={tf} side={side}")
                 
                 duration = (hit_time - entry_t) if entry_t else None
                 txt = format_event_announcement(payload.type, payload.dict(), duration)
