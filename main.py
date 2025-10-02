@@ -669,9 +669,9 @@ def get_base_css() -> str:
     tbody td{padding:22px 28px;font-size:14px}
     .trade-row{position:relative}
     .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
-    .trade-row.win::before{background:var(--success);box-shadow:0 0 16px var(--success)}
-    .trade-row.loss::before{background:var(--danger);box-shadow:0 0 16px var(--danger)}
-    .trade-row.active::before{background:var(--info);box-shadow:0 0 16px var(--info)}
+    .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
+    .trade-row.sl::before{background:var(--danger);box-shadow:0 0 16px var(--danger)}
+    .trade-row.normal::before{background:var(--info);box-shadow:0 0 16px var(--info)}
     .btn{padding:12px 24px;border:none;border-radius:12px;font-weight:700;cursor:pointer;transition:all 0.3s;font-size:14px}
     .btn-danger{background:var(--danger);color:white}
     .btn-danger:hover{background:#dc2626;transform:translateY(-2px);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
@@ -783,7 +783,6 @@ async def tv_webhook(req: Request):
                 hit_time = payload.time or now_ms()
                 entry_t = get_entry_time_for_trade(payload.trade_id)
                 
-                # DIAGNOSTICS ET FALLBACK ULTRA-ROBUSTE
                 if not entry_t and payload.symbol and payload.tf:
                     symbol = payload.symbol
                     tf = str(payload.tf)
@@ -792,11 +791,9 @@ async def tv_webhook(req: Request):
                     logger.info(f"=== DIAGNOSTIC ENTRY SEARCH ===")
                     logger.info(f"Looking for: symbol={symbol}, tf={tf}, trade_id={payload.trade_id}")
                     
-                    # Voir combien d'ENTRY existent en tout
                     all_entries = db_query("SELECT COUNT(*) as cnt FROM events WHERE type='ENTRY'")
                     logger.info(f"Total ENTRY in DB: {all_entries[0]['cnt'] if all_entries else 0}")
                     
-                    # Voir les ENTRY récentes
                     recent = db_query("""
                         SELECT symbol, tf, time FROM events 
                         WHERE type='ENTRY' 
@@ -804,7 +801,6 @@ async def tv_webhook(req: Request):
                     """)
                     logger.info(f"Recent ENTRY: {recent}")
                     
-                    # Essai 1: symbole exact
                     r = db_query("""
                         SELECT time FROM events 
                         WHERE symbol=? AND tf=? AND type='ENTRY' 
@@ -817,7 +813,6 @@ async def tv_webhook(req: Request):
                     else:
                         logger.info(f"FAIL Essai 1: {symbol} + {tf}")
                         
-                        # Essai 2: symbole base
                         r = db_query("""
                             SELECT time FROM events 
                             WHERE symbol=? AND tf=? AND type='ENTRY' 
@@ -830,7 +825,6 @@ async def tv_webhook(req: Request):
                         else:
                             logger.info(f"FAIL Essai 2: {symbol_base} + {tf}")
                             
-                            # Essai 3: n'importe quel symbole similaire
                             r = db_query("""
                                 SELECT symbol, tf, time FROM events 
                                 WHERE (symbol LIKE ? OR symbol LIKE ?) AND type='ENTRY' 
@@ -886,8 +880,304 @@ async def maybe_altseason_autonotify():
     if res.get("ok"):
         _last_altseason_notify_ts = nowt
 
-# Les autres routes (analytics, positions, history, trades) continuent avec le même code...
-# [Code HTML pages identique, non répété ici pour économiser l'espace - utilisez le code de la version précédente]
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page():
+    rows = build_trade_rows()
+    kpi = compute_kpis(rows)
+    alt = compute_altseason_snapshot()
+    
+    table_rows = ""
+    for r in rows:
+        state_class = r["row_state"]
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        
+        status_html = ""
+        if r["tp1_hit"]:
+            status_html += '<span class="badge badge-tp">TP1 ✓</span> '
+        if r["tp2_hit"]:
+            status_html += '<span class="badge badge-tp">TP2 ✓</span> '
+        if r["tp3_hit"]:
+            status_html += '<span class="badge badge-tp">TP3 ✓</span> '
+        if r["sl_hit"]:
+            status_html += '<span class="badge badge-sl">SL ✗</span>'
+        if not status_html:
+            status_html = '<span class="badge badge-pending">En cours</span>'
+        
+        table_rows += f'''
+        <tr class="trade-row {state_class}">
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{tf_badge}</td>
+            <td>{side_badge}</td>
+            <td>{r["entry"] or "N/A"}</td>
+            <td>{r["tp1"] or "N/A"}</td>
+            <td>{r["sl"] or "N/A"}</td>
+            <td>{status_html}</td>
+        </tr>'''
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <div class="app">
+        {generate_sidebar_html("dashboard", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px;background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Dashboard Trading</h1>
+                <p style="color:var(--muted)">Vue d'ensemble de vos positions et performances</p>
+            </header>
+            
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:32px">
+                <div class="panel" style="background:linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TRADES (24H)</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--success)">{kpi['total_trades']}</div>
+                </div>
+                <div class="panel" style="background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">POSITIONS ACTIVES</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--accent)">{kpi['active_trades']}</div>
+                </div>
+                <div class="panel" style="background:linear-gradient(135deg,rgba(245,158,11,0.1),rgba(251,191,36,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TP ATTEINTS</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--warning)">{kpi['tp_hits']}</div>
+                </div>
+                <div class="panel" style="background:linear-gradient(135deg,rgba(168,85,247,0.1),rgba(217,70,239,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">WIN RATE</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--purple)">{kpi['winrate']}%</div>
+                </div>
+            </div>
+
+            <div class="panel" style="margin-bottom:24px">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:16px">🌊 Altseason Index</h2>
+                <div style="display:flex;align-items:center;gap:24px;margin-bottom:16px">
+                    <div style="flex:1">
+                        <div style="font-size:48px;font-weight:900;color:var(--accent)">{alt['score']}/100</div>
+                        <div style="color:var(--muted);font-size:14px">{alt['label']}</div>
+                    </div>
+                    <div style="flex:2">
+                        <div style="background:rgba(100,116,139,0.1);height:20px;border-radius:10px;overflow:hidden">
+                            <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));width:{alt['score']}%;transition:width 0.3s"></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--muted);font-style:italic">{alt['disclaimer']}</div>
+            </div>
+
+            <div class="panel">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📊 Tous les Trades</h2>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Symbole</th>
+                                <th>TF</th>
+                                <th>Side</th>
+                                <th>Entry</th>
+                                <th>TP1</th>
+                                <th>SL</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/positions", response_class=HTMLResponse)
+async def positions_page():
+    rows = [r for r in build_trade_rows() if r["row_state"] == "normal"]
+    kpi = compute_kpis(rows)
+    
+    table_rows = ""
+    for r in rows:
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        
+        table_rows += f'''
+        <tr class="trade-row normal">
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{tf_badge}</td>
+            <td>{side_badge}</td>
+            <td>{r["entry"] or "N/A"}</td>
+            <td>{r["tp1"] or "N/A"} / {r["tp2"] or "N/A"} / {r["tp3"] or "N/A"}</td>
+            <td>{r["sl"] or "N/A"}</td>
+        </tr>'''
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Positions Actives - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <div class="app">
+        {generate_sidebar_html("positions", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📈 Positions Actives</h1>
+                <p style="color:var(--muted)">{len(rows)} position(s) en cours</p>
+            </header>
+            
+            <div class="panel">
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Symbole</th>
+                                <th>TF</th>
+                                <th>Side</th>
+                                <th>Entry</th>
+                                <th>TP Targets</th>
+                                <th>Stop Loss</th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page():
+    rows = [r for r in build_trade_rows() if r["row_state"] in ("tp", "sl", "cancel")]
+    kpi = compute_kpis(rows)
+    
+    table_rows = ""
+    for r in rows:
+        result = "WIN" if r["row_state"] == "tp" else ("LOSS" if r["row_state"] == "sl" else "ANNULÉ")
+        result_class = r["row_state"]
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        
+        table_rows += f'''
+        <tr class="trade-row {result_class}">
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{r["tf_label"]}</td>
+            <td>{side_badge}</td>
+            <td>{r["entry"] or "N/A"}</td>
+            <td><span class="badge badge-{result_class}">{result}</span></td>
+        </tr>'''
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historique - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <div class="app">
+        {generate_sidebar_html("history", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📜 Historique</h1>
+                <p style="color:var(--muted)">{len(rows)} trade(s) terminé(s)</p>
+            </header>
+            
+            <div class="panel">
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Symbole</th>
+                                <th>TF</th>
+                                <th>Side</th>
+                                <th>Entry</th>
+                                <th>Résultat</th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_page():
+    rows = build_trade_rows()
+    kpi = compute_kpis(rows)
+    alt = compute_altseason_snapshot()
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <div class="app">
+        {generate_sidebar_html("analytics", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📊 Analytics</h1>
+                <p style="color:var(--muted)">Analyse détaillée de vos performances</p>
+            </header>
+            
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics</h3>
+                <div class="bar">
+                    <div class="bar-label">Win Rate</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{kpi['winrate']}%"></div></div>
+                    <div class="bar-value">{kpi['winrate']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">LONG Ratio</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['long_ratio']}%"></div></div>
+                    <div class="bar-value">{alt['signals']['long_ratio']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">TP vs SL</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['tp_vs_sl']}%"></div></div>
+                    <div class="bar-value">{alt['signals']['tp_vs_sl']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">Altseason</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['score']}%"></div></div>
+                    <div class="bar-value">{alt['score']}/100</div>
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px">
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Trades (24h)</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Total:</span> <strong>{kpi['total_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Actifs:</span> <strong style="color:var(--accent)">{kpi['active_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Clôturés:</span> <strong>{kpi['total_closed']}</strong></div>
+                </div>
+                
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Résultats</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Wins:</span> <strong style="color:var(--success)">{kpi['wins']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Losses:</span> <strong style="color:var(--danger)">{kpi['losses']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
+                </div>
+            </div>
+        </main>
+    </div>
+</body>
+</html>'''
+    return HTMLResponse(html)
 
 if __name__ == "__main__":
     import uvicorn
