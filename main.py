@@ -914,8 +914,10 @@ async def trades_page():
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
             <td>{side_badge}</td>
-            <td>{r["entry"] or "N/A"}</td>
+            <td><strong style="color:var(--info)">{r["entry"] or "N/A"}</strong></td>
             <td>{r["tp1"] or "N/A"}</td>
+            <td>{r["tp2"] or "N/A"}</td>
+            <td>{r["tp3"] or "N/A"}</td>
             <td>{r["sl"] or "N/A"}</td>
             <td>{status_html}</td>
         </tr>'''
@@ -983,6 +985,8 @@ async def trades_page():
                                 <th>Side</th>
                                 <th>Entry</th>
                                 <th>TP1</th>
+                                <th>TP2</th>
+                                <th>TP3</th>
                                 <th>SL</th>
                                 <th>Status</th>
                             </tr>
