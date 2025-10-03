@@ -661,6 +661,7 @@ def get_base_css() -> str:
     .badge-tp{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}
     .badge-pending{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
     .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
+    .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
     .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
     table{width:100%;border-collapse:collapse}
     thead th{padding:18px 28px;text-align:left;font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border)}
@@ -881,6 +882,9 @@ async def maybe_altseason_autonotify():
     if res.get("ok"):
         _last_altseason_notify_ts = nowt
 
+# CONTINUATION DANS LE PROCHAIN MESSAGE - FICHIER TROP LONG
+# SUITE DU FICHIER main.py - À COPIER APRÈS LA PREMIÈRE PARTIE
+
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
     rows = build_trade_rows()
@@ -888,7 +892,7 @@ async def trades_page():
     alt = compute_altseason_snapshot()
     
     table_rows = ""
-    for r in rows:
+    for idx, r in enumerate(rows, start=1):
         state_class = r["row_state"]
         side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
         tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
@@ -911,8 +915,33 @@ async def trades_page():
         tp3_val = r["tp3"] or "N/A"
         sl_val = r["sl"] or "N/A"
         
+        pl_html = "N/A"
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--danger)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">{pl_pct:.2f}%</span>'
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--success)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">+{pl_pct:.2f}%</span>'
+            except:
+                pass
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
+        
         table_rows += f'''
-        <tr class="trade-row {state_class}">
+        <tr class="trade-row {state_class}" data-symbol="{r["symbol"]}" data-side="{r["side"]}" data-tf="{r["tf_label"]}" data-date="{r.get('t_entry', 0)}">
+            <td><strong>#{idx}</strong></td>
+            <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
             <td>{side_badge}</td>
@@ -921,6 +950,7 @@ async def trades_page():
             <td>{tp2_val}</td>
             <td>{tp3_val}</td>
             <td>{sl_val}</td>
+            <td>{pl_html}</td>
             <td>{status_html}</td>
         </tr>'''
     
@@ -930,9 +960,24 @@ async def trades_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard - AI Trader Pro</title>
-    <style>{get_base_css()}</style>
+    <style>{get_base_css()}
+    .search-bar{{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}}
+    .search-bar:focus{{outline:none;border-color:var(--accent)}}
+    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+    .theme-toggle:hover{{transform:scale(1.1)}}
+    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+    .sortable{{cursor:pointer;user-select:none;position:relative}}
+    .sortable:hover{{color:var(--accent)}}
+    .sortable::after{{content:'⇅';margin-left:8px;opacity:0.3}}
+    .sortable.asc::after{{content:'↑';opacity:1}}
+    .sortable.desc::after{{content:'↓';opacity:1}}
+    .refresh-indicator{{position:fixed;top:20px;right:20px;padding:8px 16px;background:var(--success);color:white;border-radius:8px;font-size:12px;font-weight:700;opacity:0;transition:opacity 0.3s;z-index:1000}}
+    .refresh-indicator.show{{opacity:1}}
+    </style>
 </head>
 <body>
+    <div class="refresh-indicator" id="refreshIndicator">Mise à jour...</div>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Changer le thème">🌓</button>
     <div class="app">
         {generate_sidebar_html("dashboard", kpi)}
         <main class="main">
@@ -977,20 +1022,26 @@ async def trades_page():
             </div>
 
             <div class="panel">
-                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📊 Tous les Trades</h2>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+                    <h2 style="font-size:20px;font-weight:800">📊 Tous les Trades</h2>
+                    <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Rechercher une crypto...">
+                </div>
                 <div style="overflow-x:auto">
-                    <table>
+                    <table id="tradesTable">
                         <thead>
                             <tr>
-                                <th>Symbole</th>
-                                <th>TF</th>
-                                <th>Side</th>
+                                <th class="sortable" data-column="num">Numéro</th>
+                                <th class="sortable" data-column="date">Date</th>
+                                <th class="sortable" data-column="crypto">Crypto</th>
+                                <th class="sortable" data-column="tf">TimeFrame</th>
+                                <th class="sortable" data-column="side">Status</th>
                                 <th>Entry</th>
                                 <th>TP1</th>
                                 <th>TP2</th>
                                 <th>TP3</th>
                                 <th>SL</th>
-                                <th>Status</th>
+                                <th class="sortable" data-column="pl">P&L</th>
+                                <th>Validation</th>
                             </tr>
                         </thead>
                         <tbody>{table_rows}</tbody>
@@ -999,6 +1050,108 @@ async def trades_page():
             </div>
         </main>
     </div>
+    <audio id="notificationSound" preload="auto">
+        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
+    </audio>
+    <script>
+    let sortColumn = '';
+    let sortDirection = 'asc';
+    
+    document.querySelectorAll('.sortable').forEach(header => {{
+        header.addEventListener('click', function() {{
+            const column = this.dataset.column;
+            const tbody = document.querySelector('#tradesTable tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            if (sortColumn === column) {{
+                sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+            }} else {{
+                sortColumn = column;
+                sortDirection = 'asc';
+            }}
+            
+            document.querySelectorAll('.sortable').forEach(h => h.className = 'sortable');
+            this.className = 'sortable ' + sortDirection;
+            
+            rows.sort((a, b) => {{
+                let aVal, bVal;
+                if (column === 'num') {{
+                    aVal = parseInt(a.cells[0].textContent.replace('#', ''));
+                    bVal = parseInt(b.cells[0].textContent.replace('#', ''));
+                }} else if (column === 'date') {{
+                    aVal = parseInt(a.dataset.date);
+                    bVal = parseInt(b.dataset.date);
+                }} else if (column === 'crypto') {{
+                    aVal = a.dataset.symbol;
+                    bVal = b.dataset.symbol;
+                }} else if (column === 'tf') {{
+                    aVal = a.dataset.tf;
+                    bVal = b.dataset.tf;
+                }} else if (column === 'side') {{
+                    aVal = a.dataset.side;
+                    bVal = b.dataset.side;
+                }} else if (column === 'pl') {{
+                    aVal = parseFloat(a.cells[10].textContent.replace('%', '')) || 0;
+                    bVal = parseFloat(b.cells[10].textContent.replace('%', '')) || 0;
+                }}
+                
+                if (sortDirection === 'asc') {{
+                    return aVal > bVal ? 1 : -1;
+                }} else {{
+                    return aVal < bVal ? 1 : -1;
+                }}
+            }});
+            
+            rows.forEach(row => tbody.appendChild(row));
+        }});
+    }});
+    
+    document.getElementById('searchInput').addEventListener('input', function(e) {{
+        const searchTerm = e.target.value.toLowerCase();
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        
+        rows.forEach(row => {{
+            const symbol = row.dataset.symbol.toLowerCase();
+            if (symbol.includes(searchTerm)) {{
+                row.style.display = '';
+            }} else {{
+                row.style.display = 'none';
+            }}
+        }});
+    }});
+    
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    
+    let lastDataHash = '';
+    setInterval(async function() {{
+        try {{
+            const response = await fetch('/trades');
+            const html = await response.text();
+            const newHash = html.length;
+            
+            if (lastDataHash && newHash !== lastDataHash) {{
+                const indicator = document.getElementById('refreshIndicator');
+                indicator.classList.add('show');
+                setTimeout(() => indicator.classList.remove('show'), 2000);
+                
+                const audio = document.getElementById('notificationSound');
+                audio.play().catch(e => console.log('Audio play failed:', e));
+                
+                setTimeout(() => location.reload(), 2000);
+            }}
+            lastDataHash = newHash;
+        }} catch (e) {{
+            console.log('Refresh check failed:', e);
+        }}
+    }}, 30000);
+    </script>
 </body>
 </html>'''
     return HTMLResponse(html)
@@ -1009,18 +1162,30 @@ async def positions_page():
     kpi = compute_kpis(rows)
     
     table_rows = ""
-    for r in rows:
+    for idx, r in enumerate(rows, start=1):
         side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
         tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
         
+        entry_val = r["entry"] or "N/A"
+        tp1_val = r["tp1"] or "N/A"
+        tp2_val = r["tp2"] or "N/A"
+        tp3_val = r["tp3"] or "N/A"
+        sl_val = r["sl"] or "N/A"
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
+        
         table_rows += f'''
         <tr class="trade-row normal">
+            <td><strong>#{idx}</strong></td>
+            <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
             <td>{side_badge}</td>
-            <td>{r["entry"] or "N/A"}</td>
-            <td>{r["tp1"] or "N/A"} / {r["tp2"] or "N/A"} / {r["tp3"] or "N/A"}</td>
-            <td>{r["sl"] or "N/A"}</td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
         </tr>'''
     
     html = f'''<!DOCTYPE html>
@@ -1029,9 +1194,14 @@ async def positions_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Positions Actives - AI Trader Pro</title>
-    <style>{get_base_css()}</style>
+    <style>{get_base_css()}
+    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+    .theme-toggle:hover{{transform:scale(1.1)}}
+    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+    </style>
 </head>
 <body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
     <div class="app">
         {generate_sidebar_html("positions", kpi)}
         <main class="main">
@@ -1045,20 +1215,33 @@ async def positions_page():
                     <table>
                         <thead>
                             <tr>
-                                <th>Symbole</th>
-                                <th>TF</th>
-                                <th>Side</th>
+                                <th>Numéro</th>
+                                <th>Date</th>
+                                <th>Crypto</th>
+                                <th>TimeFrame</th>
+                                <th>Status</th>
                                 <th>Entry</th>
-                                <th>TP Targets</th>
-                                <th>Stop Loss</th>
+                                <th>TP1</th>
+                                <th>TP2</th>
+                                <th>TP3</th>
+                                <th>SL</th>
                             </tr>
                         </thead>
-                        <tbody>{table_rows if table_rows else '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'}</tbody>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'}</tbody>
                     </table>
                 </div>
             </div>
         </main>
     </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    </script>
 </body>
 </html>'''
     return HTMLResponse(html)
@@ -1069,18 +1252,56 @@ async def history_page():
     kpi = compute_kpis(rows)
     
     table_rows = ""
-    for r in rows:
+    for idx, r in enumerate(rows, start=1):
         result = "WIN" if r["row_state"] == "tp" else ("LOSS" if r["row_state"] == "sl" else "ANNULÉ")
         result_class = r["row_state"]
         side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        result_badge = f'<span class="badge badge-{result_class}">{result}</span>'
+        
+        entry_val = r["entry"] or "N/A"
+        tp1_val = r["tp1"] or "N/A"
+        tp2_val = r["tp2"] or "N/A"
+        tp3_val = r["tp3"] or "N/A"
+        sl_val = r["sl"] or "N/A"
+        
+        pl_html = "N/A"
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--danger)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">{pl_pct:.2f}%</span>'
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--success)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">+{pl_pct:.2f}%</span>'
+            except:
+                pass
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
         
         table_rows += f'''
         <tr class="trade-row {result_class}">
+            <td><strong>#{idx}</strong></td>
+            <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
-            <td>{r["tf_label"]}</td>
+            <td>{tf_badge}</td>
             <td>{side_badge}</td>
-            <td>{r["entry"] or "N/A"}</td>
-            <td><span class="badge badge-{result_class}">{result}</span></td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
+            <td>{pl_html}</td>
+            <td>{result_badge}</td>
         </tr>'''
     
     html = f'''<!DOCTYPE html>
@@ -1089,9 +1310,14 @@ async def history_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Historique - AI Trader Pro</title>
-    <style>{get_base_css()}</style>
+    <style>{get_base_css()}
+    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+    .theme-toggle:hover{{transform:scale(1.1)}}
+    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+    </style>
 </head>
 <body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
     <div class="app">
         {generate_sidebar_html("history", kpi)}
         <main class="main">
@@ -1105,19 +1331,35 @@ async def history_page():
                     <table>
                         <thead>
                             <tr>
-                                <th>Symbole</th>
-                                <th>TF</th>
-                                <th>Side</th>
+                                <th>Numéro</th>
+                                <th>Date</th>
+                                <th>Crypto</th>
+                                <th>TimeFrame</th>
+                                <th>Status</th>
                                 <th>Entry</th>
+                                <th>TP1</th>
+                                <th>TP2</th>
+                                <th>TP3</th>
+                                <th>SL</th>
+                                <th>P&L</th>
                                 <th>Résultat</th>
                             </tr>
                         </thead>
-                        <tbody>{table_rows if table_rows else '<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'}</tbody>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'}</tbody>
                     </table>
                 </div>
             </div>
         </main>
     </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    </script>
 </body>
 </html>'''
     return HTMLResponse(html)
@@ -1128,15 +1370,94 @@ async def analytics_page():
     kpi = compute_kpis(rows)
     alt = compute_altseason_snapshot()
     
+    crypto_stats = {}
+    for r in rows:
+        symbol = r["symbol"]
+        if symbol not in crypto_stats:
+            crypto_stats[symbol] = {
+                "total": 0, "wins": 0, "losses": 0, "pending": 0,
+                "tp1": 0, "tp2": 0, "tp3": 0, "sl": 0,
+                "total_pl": 0.0, "trades": []
+            }
+        
+        crypto_stats[symbol]["total"] += 1
+        crypto_stats[symbol]["trades"].append(r)
+        
+        if r["row_state"] == "tp":
+            crypto_stats[symbol]["wins"] += 1
+        elif r["row_state"] == "sl":
+            crypto_stats[symbol]["losses"] += 1
+        elif r["row_state"] == "normal":
+            crypto_stats[symbol]["pending"] += 1
+        
+        if r["tp1_hit"]:
+            crypto_stats[symbol]["tp1"] += 1
+        if r["tp2_hit"]:
+            crypto_stats[symbol]["tp2"] += 1
+        if r["tp3_hit"]:
+            crypto_stats[symbol]["tp3"] += 1
+        if r["sl_hit"]:
+            crypto_stats[symbol]["sl"] += 1
+        
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    crypto_stats[symbol]["total_pl"] += pl_pct
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    crypto_stats[symbol]["total_pl"] += pl_pct
+            except:
+                pass
+    
+    for symbol in crypto_stats:
+        stats = crypto_stats[symbol]
+        total_closed = stats["wins"] + stats["losses"]
+        stats["winrate"] = (stats["wins"] / total_closed * 100) if total_closed > 0 else 0
+    
+    sorted_cryptos = sorted(crypto_stats.items(), key=lambda x: x[1]["total"], reverse=True)[:20]
+    
+    crypto_rows = ""
+    for idx, (symbol, stats) in enumerate(sorted_cryptos, start=1):
+        winrate_color = "var(--success)" if stats["winrate"] >= 50 else "var(--danger)"
+        pl_color = "var(--success)" if stats["total_pl"] >= 0 else "var(--danger)"
+        pl_sign = "+" if stats["total_pl"] >= 0 else ""
+        
+        crypto_rows += f'''
+        <tr class="trade-row">
+            <td><strong>#{idx}</strong></td>
+            <td><strong>{symbol}</strong></td>
+            <td>{stats["total"]}</td>
+            <td style="color:var(--success)">{stats["wins"]}</td>
+            <td style="color:var(--danger)">{stats["losses"]}</td>
+            <td style="color:var(--info)">{stats["pending"]}</td>
+            <td style="color:{winrate_color};font-weight:700">{stats["winrate"]:.1f}%</td>
+            <td style="color:{pl_color};font-weight:700">{pl_sign}{stats["total_pl"]:.2f}%</td>
+            <td><span class="badge badge-tp">{stats["tp1"]}</span> <span class="badge badge-tp">{stats["tp2"]}</span> <span class="badge badge-tp">{stats["tp3"]}</span></td>
+            <td><span class="badge badge-sl">{stats["sl"]}</span></td>
+        </tr>'''
+    
     html = f'''<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Analytics - AI Trader Pro</title>
-    <style>{get_base_css()}</style>
+    <style>{get_base_css()}
+    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+    .theme-toggle:hover{{transform:scale(1.1)}}
+    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+    </style>
 </head>
 <body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
     <div class="app">
         {generate_sidebar_html("analytics", kpi)}
         <main class="main">
@@ -1146,7 +1467,7 @@ async def analytics_page():
             </header>
             
             <div class="chart-container">
-                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics</h3>
+                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics Globales</h3>
                 <div class="bar">
                     <div class="bar-label">Win Rate</div>
                     <div class="bar-track"><div class="bar-fill" style="width:{kpi['winrate']}%"></div></div>
@@ -1169,7 +1490,7 @@ async def analytics_page():
                 </div>
             </div>
 
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:32px">
                 <div class="panel">
                     <h3 style="margin-bottom:16px;font-weight:800">Trades (24h)</h3>
                     <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Total:</span> <strong>{kpi['total_trades']}</strong></div>
@@ -1184,8 +1505,40 @@ async def analytics_page():
                     <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
                 </div>
             </div>
+            
+            <div class="panel">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📈 Statistiques par Crypto (Top 20)</h2>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rang</th>
+                                <th>Crypto</th>
+                                <th>Total Trades</th>
+                                <th>Wins</th>
+                                <th>Losses</th>
+                                <th>En cours</th>
+                                <th>Win Rate</th>
+                                <th>P&L Total</th>
+                                <th>TP (1/2/3)</th>
+                                <th>SL</th>
+                            </tr>
+                        </thead>
+                        <tbody>{crypto_rows if crypto_rows else '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
         </main>
     </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    </script>
 </body>
 </html>'''
     return HTMLResponse(html)
