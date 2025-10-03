@@ -783,13 +783,11 @@ async def tv_webhook(req: Request):
                 hit_time = payload.time or now_ms()
                 entry_t = get_entry_time_for_trade(payload.trade_id)
                 
-                # Stratégie de fallback améliorée si trade_id ne fonctionne pas
                 if not entry_t and payload.symbol and payload.tf:
                     symbol = payload.symbol
                     tf = str(payload.tf)
                     side = payload.side
                     
-                    # Essai 1: Chercher par symbol + tf + side exact
                     query = """
                         SELECT time FROM events 
                         WHERE symbol=? AND tf=? AND type='ENTRY'
@@ -807,7 +805,6 @@ async def tv_webhook(req: Request):
                         entry_t = int(r[0]["time"])
                         logger.info(f"Found ENTRY by symbol+tf+side: {entry_t}")
                     else:
-                        # Essai 2: Sans le side
                         r = db_query("""
                             SELECT time FROM events 
                             WHERE symbol=? AND tf=? AND type='ENTRY' 
@@ -818,7 +815,6 @@ async def tv_webhook(req: Request):
                             entry_t = int(r[0]["time"])
                             logger.info(f"Found ENTRY by symbol+tf: {entry_t}")
                         else:
-                            # Essai 3: Variants du symbol (.P, .PERP, etc)
                             symbol_variants = [
                                 symbol,
                                 symbol.replace('.P', ''),
@@ -909,16 +905,22 @@ async def trades_page():
         if not status_html:
             status_html = '<span class="badge badge-pending">En cours</span>'
         
+        entry_val = r["entry"] or "N/A"
+        tp1_val = r["tp1"] or "N/A"
+        tp2_val = r["tp2"] or "N/A"
+        tp3_val = r["tp3"] or "N/A"
+        sl_val = r["sl"] or "N/A"
+        
         table_rows += f'''
         <tr class="trade-row {state_class}">
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
             <td>{side_badge}</td>
-            <td><strong style="color:var(--info)">{r["entry"] or "N/A"}</strong></td>
-            <td>{r["tp1"] or "N/A"}</td>
-            <td>{r["tp2"] or "N/A"}</td>
-            <td>{r["tp3"] or "N/A"}</td>
-            <td>{r["sl"] or "N/A"}</td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
             <td>{status_html}</td>
         </tr>'''
     
