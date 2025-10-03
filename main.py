@@ -663,11 +663,23 @@ def get_base_css() -> str:
     .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
     .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
     .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
-    table{width:100%;border-collapse:collapse}
-    thead th{padding:18px 28px;text-align:left;font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border)}
+    table{width:100%;border-collapse:collapse;table-layout:fixed}
+    thead th{padding:14px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
     tbody tr:hover{background:rgba(99,102,241,0.08)}
-    tbody td{padding:22px 28px;font-size:14px}
+    tbody td{padding:16px 12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    thead th:nth-child(1), tbody td:nth-child(1){width:60px}
+    thead th:nth-child(2), tbody td:nth-child(2){width:130px}
+    thead th:nth-child(3), tbody td:nth-child(3){width:110px}
+    thead th:nth-child(4), tbody td:nth-child(4){width:80px}
+    thead th:nth-child(5), tbody td:nth-child(5){width:90px}
+    thead th:nth-child(6), tbody td:nth-child(6){width:95px}
+    thead th:nth-child(7), tbody td:nth-child(7){width:95px}
+    thead th:nth-child(8), tbody td:nth-child(8){width:95px}
+    thead th:nth-child(9), tbody td:nth-child(9){width:95px}
+    thead th:nth-child(10), tbody td:nth-child(10){width:95px}
+    thead th:nth-child(11), tbody td:nth-child(11){width:85px}
+    thead th:nth-child(12), tbody td:nth-child(12){width:140px}
     .trade-row{position:relative}
     .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
     .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
@@ -882,9 +894,6 @@ async def maybe_altseason_autonotify():
     if res.get("ok"):
         _last_altseason_notify_ts = nowt
 
-# CONTINUATION DANS LE PROCHAIN MESSAGE - FICHIER TROP LONG
-# SUITE DU FICHIER main.py - À COPIER APRÈS LA PREMIÈRE PARTIE
-
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
     rows = build_trade_rows()
@@ -1051,7 +1060,7 @@ async def trades_page():
         </main>
     </div>
     <audio id="notificationSound" preload="auto">
-        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
+        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
     </audio>
     <script>
     let sortColumn = '';
@@ -1547,3 +1556,4 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting AI Trader Pro v2.1...")
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
+
