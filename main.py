@@ -727,18 +727,17 @@ thead th{padding:14px 10px;text-align:left;font-size:11px;font-weight:800;color:
 tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
 tbody tr:hover{background:rgba(99,102,241,0.08)}
 tbody td{padding:14px 10px;font-size:13px;white-space:nowrap;vertical-align:middle}
-thead th:nth-child(1), tbody td:nth-child(1){width:60px;min-width:60px;max-width:60px}
-thead th:nth-child(2), tbody td:nth-child(2){width:140px;min-width:140px;max-width:140px}
-thead th:nth-child(3), tbody td:nth-child(3){width:110px;min-width:110px;max-width:110px}
-thead th:nth-child(4), tbody td:nth-child(4){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(5), tbody td:nth-child(5){width:80px;min-width:80px;max-width:80px}
+thead th:nth-child(1), tbody td:nth-child(1){width:140px;min-width:140px;max-width:140px}
+thead th:nth-child(2), tbody td:nth-child(2){width:110px;min-width:110px;max-width:110px}
+thead th:nth-child(3), tbody td:nth-child(3){width:90px;min-width:90px;max-width:90px}
+thead th:nth-child(4), tbody td:nth-child(4){width:80px;min-width:80px;max-width:80px}
+thead th:nth-child(5), tbody td:nth-child(5){width:90px;min-width:90px;max-width:90px}
 thead th:nth-child(6), tbody td:nth-child(6){width:90px;min-width:90px;max-width:90px}
 thead th:nth-child(7), tbody td:nth-child(7){width:90px;min-width:90px;max-width:90px}
 thead th:nth-child(8), tbody td:nth-child(8){width:90px;min-width:90px;max-width:90px}
 thead th:nth-child(9), tbody td:nth-child(9){width:90px;min-width:90px;max-width:90px}
 thead th:nth-child(10), tbody td:nth-child(10){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(11), tbody td:nth-child(11){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(12), tbody td:nth-child(12){width:auto}
+thead th:nth-child(11), tbody td:nth-child(11){width:auto}
 .trade-row{position:relative}
 .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
 .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
@@ -1013,7 +1012,6 @@ async def trades_page():
         
         table_rows += f'''
         <tr class="trade-row {state_class}" data-symbol="{r["symbol"]}" data-side="{r["side"]}" data-tf="{r["tf_label"]}" data-date="{r.get('t_entry', 0)}">
-            <td><strong>#{idx}</strong></td>
             <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
@@ -1103,7 +1101,6 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     <table id="tradesTable">
                         <thead>
                             <tr>
-                                <th class="sortable" data-column="num">Numéro</th>
                                 <th class="sortable" data-column="date">Date</th>
                                 <th class="sortable" data-column="crypto">Crypto</th>
                                 <th class="sortable" data-column="tf">TimeFrame</th>
@@ -1150,10 +1147,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
             
             rows.sort((a, b) => {{
                 let aVal, bVal;
-                if (column === 'num') {{
-                    aVal = parseInt(a.cells[0].textContent.replace('#', ''));
-                    bVal = parseInt(b.cells[0].textContent.replace('#', ''));
-                }} else if (column === 'date') {{
+                if (column === 'date') {{
                     aVal = parseInt(a.dataset.date);
                     bVal = parseInt(b.dataset.date);
                 }} else if (column === 'crypto') {{
@@ -1166,8 +1160,8 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     aVal = a.dataset.side;
                     bVal = b.dataset.side;
                 }} else if (column === 'pl') {{
-                    aVal = parseFloat(a.cells[10].textContent.replace('%', '')) || 0;
-                    bVal = parseFloat(b.cells[10].textContent.replace('%', '')) || 0;
+                    aVal = parseFloat(a.cells[9].textContent.replace('%', '')) || 0;
+                    bVal = parseFloat(b.cells[9].textContent.replace('%', '')) || 0;
                 }}
                 
                 if (sortDirection === 'asc') {{
@@ -1251,7 +1245,6 @@ async def positions_page():
         
         table_rows += f'''
         <tr class="trade-row normal">
-            <td><strong>#{idx}</strong></td>
             <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
@@ -1290,7 +1283,6 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     <table>
                         <thead>
                             <tr>
-                                <th>Numéro</th>
                                 <th>Date</th>
                                 <th>Crypto</th>
                                 <th>TimeFrame</th>
@@ -1302,7 +1294,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                                 <th>SL</th>
                             </tr>
                         </thead>
-                        <tbody>{table_rows if table_rows else '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'}</tbody>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'}</tbody>
                     </table>
                 </div>
             </div>
@@ -1365,7 +1357,6 @@ async def history_page():
         
         table_rows += f'''
         <tr class="trade-row {result_class}">
-            <td><strong>#{idx}</strong></td>
             <td>{date_str}</td>
             <td><strong>{r["symbol"]}</strong></td>
             <td>{tf_badge}</td>
@@ -1406,7 +1397,6 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     <table>
                         <thead>
                             <tr>
-                                <th>Numéro</th>
                                 <th>Date</th>
                                 <th>Crypto</th>
                                 <th>TimeFrame</th>
@@ -1420,7 +1410,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                                 <th>Résultat</th>
                             </tr>
                         </thead>
-                        <tbody>{table_rows if table_rows else '<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'}</tbody>
+                        <tbody>{table_rows if table_rows else '<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'}</tbody>
                     </table>
                 </div>
             </div>
