@@ -722,11 +722,35 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
 .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
 .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
-table{width:100%;border-collapse:collapse}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
 thead th{padding:16px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap}
 tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
 tbody tr:hover{background:rgba(99,102,241,0.08)}
-tbody td{padding:18px 12px;font-size:13px;white-space:nowrap}
+tbody td{padding:18px 12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+thead th:nth-child(1){width:5%}
+thead th:nth-child(2){width:12%}
+thead th:nth-child(3){width:10%}
+thead th:nth-child(4){width:8%}
+thead th:nth-child(5){width:8%}
+thead th:nth-child(6){width:8%}
+thead th:nth-child(7){width:8%}
+thead th:nth-child(8){width:8%}
+thead th:nth-child(9){width:8%}
+thead th:nth-child(10){width:8%}
+thead th:nth-child(11){width:7%}
+thead th:nth-child(12){width:10%}
+tbody td:nth-child(1){width:5%}
+tbody td:nth-child(2){width:12%}
+tbody td:nth-child(3){width:10%}
+tbody td:nth-child(4){width:8%}
+tbody td:nth-child(5){width:8%}
+tbody td:nth-child(6){width:8%}
+tbody td:nth-child(7){width:8%}
+tbody td:nth-child(8){width:8%}
+tbody td:nth-child(9){width:8%}
+tbody td:nth-child(10){width:8%}
+tbody td:nth-child(11){width:7%}
+tbody td:nth-child(12){width:10%}
 .trade-row{position:relative}
 .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
 .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
@@ -970,11 +994,11 @@ async def trades_page():
         if not status_html:
             status_html = '<span class="badge badge-pending">En cours</span>'
         
-        entry_val = r["entry"] or "N/A"
-        tp1_val = r["tp1"] or "N/A"
-        tp2_val = r["tp2"] or "N/A"
-        tp3_val = r["tp3"] or "N/A"
-        sl_val = r["sl"] or "N/A"
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
+        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
+        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
         
         pl_html = "N/A"
         if r["entry"] and r["row_state"] in ("tp", "sl"):
@@ -1229,11 +1253,11 @@ async def positions_page():
         side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
         tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
         
-        entry_val = r["entry"] or "N/A"
-        tp1_val = r["tp1"] or "N/A"
-        tp2_val = r["tp2"] or "N/A"
-        tp3_val = r["tp3"] or "N/A"
-        sl_val = r["sl"] or "N/A"
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
+        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
+        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
         
         date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
         
@@ -1322,11 +1346,11 @@ async def history_page():
         tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
         result_badge = f'<span class="badge badge-{result_class}">{result}</span>'
         
-        entry_val = r["entry"] or "N/A"
-        tp1_val = r["tp1"] or "N/A"
-        tp2_val = r["tp2"] or "N/A"
-        tp3_val = r["tp3"] or "N/A"
-        sl_val = r["sl"] or "N/A"
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
+        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
+        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
         
         pl_html = "N/A"
         if r["entry"] and r["row_state"] in ("tp", "sl"):
