@@ -722,22 +722,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
 .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
 .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
-table{width:100%;border-collapse:collapse;table-layout:auto}
-thead th{padding:14px 10px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:middle}
+table{width:100%;border-collapse:collapse}
+thead th{padding:16px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap}
 tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
 tbody tr:hover{background:rgba(99,102,241,0.08)}
-tbody td{padding:14px 10px;font-size:13px;white-space:nowrap;vertical-align:middle}
-thead th:nth-child(1), tbody td:nth-child(1){width:140px;min-width:140px;max-width:140px}
-thead th:nth-child(2), tbody td:nth-child(2){width:110px;min-width:110px;max-width:110px}
-thead th:nth-child(3), tbody td:nth-child(3){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(4), tbody td:nth-child(4){width:80px;min-width:80px;max-width:80px}
-thead th:nth-child(5), tbody td:nth-child(5){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(6), tbody td:nth-child(6){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(7), tbody td:nth-child(7){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(8), tbody td:nth-child(8){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(9), tbody td:nth-child(9){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(10), tbody td:nth-child(10){width:90px;min-width:90px;max-width:90px}
-thead th:nth-child(11), tbody td:nth-child(11){width:auto}
+tbody td{padding:16px 12px;font-size:13px;white-space:nowrap}
 .trade-row{position:relative}
 .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
 .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
