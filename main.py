@@ -55,7 +55,8 @@ logger.addHandler(console_handler)
 try:
     file_handler = logging.handlers.RotatingFileHandler(
         os.path.join(settings.DB_DIR, 'ai_trader.log'),
-        maxBytes=10*1024*1024, backupCount=5
+        maxBytes=10*1024*1024,
+        backupCount=5
     )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
@@ -91,14 +92,14 @@ class WebhookPayload(BaseModel):
     direction: Optional[str] = None
     trade_id: Optional[str] = None
     secret: Optional[str] = None
-    
+
     @validator('type')
     def validate_type(cls, v):
         valid = ['ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE', 'VECTOR_CANDLE']
         if v not in valid:
             raise ValueError(f'Type invalide: {v}')
         return v
-    
+
     @validator('side')
     def validate_side(cls, v):
         if v and v.upper() not in ['LONG', 'SHORT']:
@@ -142,33 +143,33 @@ def db_query(sql: str, params: tuple = ()) -> List[dict]:
 def init_database():
     try:
         db_execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            tf TEXT,
-            tf_label TEXT,
-            time INTEGER NOT NULL,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            r1 REAL,
-            s1 REAL,
-            lev_reco REAL,
-            qty_reco REAL,
-            notional REAL,
-            confidence INTEGER,
-            horizon TEXT,
-            leverage TEXT,
-            note TEXT,
-            price REAL,
-            direction TEXT,
-            trade_id TEXT,
-            created_at INTEGER DEFAULT (strftime('%s', 'now'))
-        )
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                tf TEXT,
+                tf_label TEXT,
+                time INTEGER NOT NULL,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                r1 REAL,
+                s1 REAL,
+                lev_reco REAL,
+                qty_reco REAL,
+                notional REAL,
+                confidence INTEGER,
+                horizon TEXT,
+                leverage TEXT,
+                note TEXT,
+                price REAL,
+                direction TEXT,
+                trade_id TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
         """)
         indices = [
             "CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)",
@@ -268,8 +269,7 @@ def _record_sent():
     _last_global_send_ts = ts
     _send_times_window.append(ts)
 
-async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None,
-                       reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
+async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None, reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
     if not settings.TELEGRAM_ENABLED:
         return {"ok": False, "reason": "disabled"}
     k = key or "default"
@@ -279,8 +279,7 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
         return {"ok": False, "reason": "cooldown"}
     _last_tg_sent[k] = now_ts
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, 
-               "disable_web_page_preview": disable_web_page_preview, "parse_mode": "HTML"}
+    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": disable_web_page_preview, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     await _respect_rate_limits()
@@ -304,8 +303,7 @@ async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Op
                 try:
                     mid = data["result"]["message_id"]
                     pin_url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/pinChatMessage"
-                    await client.post(pin_url, json={"chat_id": settings.TELEGRAM_CHAT_ID, 
-                                                     "message_id": mid, "disable_notification": True})
+                    await client.post(pin_url, json={"chat_id": settings.TELEGRAM_CHAT_ID, "message_id": mid, "disable_notification": True})
                 except:
                     pass
             return {"ok": True, "result": data}
@@ -345,44 +343,53 @@ def compute_altseason_snapshot() -> dict:
     row = db_query("""
         SELECT SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
                SUM(CASE WHEN side='SHORT' THEN 1 ELSE 0 END) AS short_n
-        FROM events WHERE type='ENTRY' AND time>=?
+        FROM events
+        WHERE type='ENTRY' AND time>=?
     """, (t24,))
     long_n = (row[0]["long_n"] if row else 0) or 0
     short_n = (row[0]["short_n"] if row else 0) or 0
+    
     def _pct(x, y):
         try:
             return 0.0 if y == 0 else 100.0 * float(x or 0) / float(y or 0)
         except:
             return 0.0
+    
     A = _pct(long_n, long_n + short_n)
     row = db_query("""
         WITH tp AS (SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?),
-        sl AS (SELECT COUNT(*) AS n FROM events WHERE type='SL_HIT' AND time>=?)
+             sl AS (SELECT COUNT(*) AS n FROM events WHERE type='SL_HIT' AND time>=?)
         SELECT tp.n AS tp_n, sl.n AS sl_n FROM tp, sl
     """, (t24, t24))
     tp_n = (row[0]["tp_n"] if row else 0) or 0
     sl_n = (row[0]["sl_n"] if row else 0) or 0
     B = _pct(tp_n, tp_n + sl_n)
+    
     symbols_with_tp = db_query("SELECT DISTINCT symbol FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=? ORDER BY symbol", (t24,))
     symbol_list = [r["symbol"] for r in symbols_with_tp]
     sym_gain = len(symbol_list)
     C = float(min(100.0, sym_gain * 2.0))
+    
     t90 = ms_ago(90)
     row = db_query("""
-        WITH w AS (SELECT SUM(CASE WHEN time>=? THEN 1 ELSE 0 END) AS recent_n, COUNT(*) AS total_n
-        FROM events WHERE type='ENTRY' AND time>=?)
+        WITH w AS (SELECT SUM(CASE WHEN time>=? THEN 1 ELSE 0 END) AS recent_n,
+                          COUNT(*) AS total_n
+                   FROM events WHERE type='ENTRY' AND time>=?)
         SELECT recent_n, total_n FROM w
     """, (t90, t24))
     recent_n = (row[0]["recent_n"] if row else 0) or 0
     total_n = (row[0]["total_n"] if row else 0) or 0
     D = _pct(recent_n, total_n)
+    
     score = round((A + B + C + D) / 4.0)
     label = "Altseason (forte)" if score >= 75 else ("Altseason (modérée)" if score >= 50 else "Marché neutre/faible")
+    
     return {
-        "score": int(score), "label": label, "window_minutes": 24*60,
+        "score": int(score),
+        "label": label,
+        "window_minutes": 24*60,
         "disclaimer": "Score indicatif. Ne constitue pas un conseil.",
-        "signals": {"long_ratio": round(A, 1), "tp_vs_sl": round(B, 1), 
-                   "breadth_symbols": int(sym_gain), "recent_entries_ratio": round(D, 1)},
+        "signals": {"long_ratio": round(A, 1), "tp_vs_sl": round(B, 1), "breadth_symbols": int(sym_gain), "recent_entries_ratio": round(D, 1)},
         "symbols_with_tp": symbol_list
     }
 
@@ -428,6 +435,7 @@ def format_entry_announcement(payload: dict) -> str:
     note = (payload.get("note") or "").strip()
     rr = _calc_rr(entry, sl, tp1)
     rr_text = f" (R/R: {rr:.2f})" if rr else ""
+    
     lines = []
     if tp1:
         lines.append(f"🎯 TP1: {tp1}{rr_text}")
@@ -437,13 +445,21 @@ def format_entry_announcement(payload: dict) -> str:
         lines.append(f"🎯 TP3: {tp3}")
     if sl:
         lines.append(f"❌ SL: {sl}")
+    
     conf_line = build_confidence_line(payload)
     tip_line = "💡 Astuce: après TP1, placez SL au BE." if tp1 else ""
     entry_text = f"<b>Entry: {entry}</b>" if entry else "Entry: N/A"
+    
     msg = [
-        "🚨 <b>NOUVELLE POSITION</b>", f"📊 {symbol} {tf_lbl}",
+        "🚨 <b>NOUVELLE POSITION</b>",
+        f"📊 {symbol} {tf_lbl}",
         f"{side_i['emoji']} {side_i['label']} | {entry_text}",
-        f"⚡ Leverage: {leverage}" if leverage else "", "", *lines, "", conf_line, tip_line
+        f"⚡ Leverage: {leverage}" if leverage else "",
+        "",
+        *lines,
+        "",
+        conf_line,
+        tip_line
     ]
     if note:
         msg.append(f"📝 {note}")
@@ -455,15 +471,18 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
     side_i = _fmt_side(payload.get("side"))
     base = f"{symbol} {tf_lbl}"
     d_txt = f"⏱ Temps écoulé : {human_duration_verbose(duration_ms)}" if duration_ms and duration_ms > 0 else "⏱ Temps écoulé : N/A"
+    
     if etype in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
         tick = {"TP1_HIT": "TP1", "TP2_HIT": "TP2", "TP3_HIT": "TP3"}[etype]
         price = payload.get("price") or payload.get("tp1") or payload.get("tp2") or payload.get("tp3") or ""
         price_txt = f" @ {price}" if price else ""
         return f"✅ <b>{tick} ATTEINT</b>{price_txt}\n📊 {base}\n{side_i['emoji']} {side_i['label']}\n{d_txt}"
+    
     if etype == "SL_HIT":
         price = payload.get("price") or payload.get("sl") or ""
         price_txt = f" @ {price}" if price else ""
         return f"🛑 <b>SL TOUCHÉ</b>{price_txt}\n📊 {base}\n{side_i['emoji']} {side_i['label']}\n{d_txt}"
+    
     if etype == "CLOSE":
         note = payload.get("note") or ""
         x = f"📪 <b>TRADE CLÔTURÉ</b>\n📊 {base}\n{side_i['emoji']} {side_i['label']}"
@@ -471,6 +490,7 @@ def format_event_announcement(etype: str, payload: dict, duration_ms: Optional[i
             x += f"\n📝 {note}"
         x += f"\n{d_txt}"
         return x
+    
     return f"ℹ️ {etype} — {base}\n{d_txt}"
 
 # TRADE ANALYSIS
@@ -497,8 +517,7 @@ def _cancelled_by_opposite(entry_row: dict) -> bool:
     if not symbol or tf is None or side not in ("LONG", "SHORT"):
         return False
     opposite = "SHORT" if side == "LONG" else "LONG"
-    r = db_query("SELECT 1 FROM events WHERE type='ENTRY' AND symbol=? AND tf=? AND time>? AND UPPER(COALESCE(side,''))=? LIMIT 1", 
-                 (symbol, str(tf), t, opposite))
+    r = db_query("SELECT 1 FROM events WHERE type='ENTRY' AND symbol=? AND tf=? AND time>? AND UPPER(COALESCE(side,''))=? LIMIT 1", (symbol, str(tf), t, opposite))
     return bool(r)
 
 def build_trade_rows(limit=300):
@@ -516,6 +535,7 @@ def build_trade_rows(limit=300):
         sl_hit = bool(hm.get("SL_HIT"))
         closed = bool(hm.get("CLOSE"))
         cancelled = _cancelled_by_opposite(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
+        
         if sl_hit:
             state = "sl"
         elif tp1_hit or tp2_hit or tp3_hit:
@@ -524,11 +544,24 @@ def build_trade_rows(limit=300):
             state = "cancel"
         else:
             state = "normal"
+        
         rows.append({
-            "trade_id": e["trade_id"], "symbol": e["symbol"], "tf": e.get("tf"), "tf_label": tf_label,
-            "side": e["side"], "entry": e["entry"], "tp1": e["tp1"], "tp2": e["tp2"], "tp3": e["tp3"],
-            "sl": e["sl"], "tp1_hit": tp1_hit, "tp2_hit": tp2_hit, "tp3_hit": tp3_hit, "sl_hit": sl_hit,
-            "row_state": state, "t_entry": item["t_entry"]
+            "trade_id": e["trade_id"],
+            "symbol": e["symbol"],
+            "tf": e.get("tf"),
+            "tf_label": tf_label,
+            "side": e["side"],
+            "entry": e["entry"],
+            "tp1": e["tp1"],
+            "tp2": e["tp2"],
+            "tp3": e["tp3"],
+            "sl": e["sl"],
+            "tp1_hit": tp1_hit,
+            "tp2_hit": tp2_hit,
+            "tp3_hit": tp3_hit,
+            "sl_hit": sl_hit,
+            "row_state": state,
+            "t_entry": item["t_entry"]
         })
     return rows
 
@@ -537,6 +570,7 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
     total_trades = db_query("SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,))[0]["n"] or 0
     tp_hits = db_query("SELECT COUNT(*) AS n FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?", (t24,))[0]["n"] or 0
     tp_details = db_query("SELECT DISTINCT symbol, type, time FROM events WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=? ORDER BY time DESC", (t24,))
+    
     trade_ids = [r["trade_id"] for r in db_query("SELECT DISTINCT trade_id FROM events WHERE type='ENTRY' AND time>=?", (t24,))]
     wins = losses = 0
     for tid in trade_ids:
@@ -545,13 +579,21 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
             wins += 1
         elif o == "SL":
             losses += 1
+    
     winrate = (wins / max(1, wins + losses)) * 100.0 if wins + losses > 0 else 0.0
     active = sum(1 for r in rows if r["row_state"] == "normal")
     cancelled = sum(1 for r in rows if r["row_state"] == "cancel")
+    
     return {
-        "total_trades": int(total_trades), "active_trades": int(active), "tp_hits": int(tp_hits),
-        "tp_details": tp_details, "winrate": round(winrate, 1), "wins": wins, "losses": losses,
-        "cancelled": cancelled, "total_closed": wins + losses
+        "total_trades": int(total_trades),
+        "active_trades": int(active),
+        "tp_hits": int(tp_hits),
+        "tp_details": tp_details,
+        "winrate": round(winrate, 1),
+        "wins": wins,
+        "losses": losses,
+        "cancelled": cancelled,
+        "total_closed": wins + losses
     }
 
 def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
@@ -568,17 +610,34 @@ def save_event(payload: WebhookPayload) -> str:
         if not trade_id and payload.type and payload.symbol and payload.tf:
             t = payload.time or now_ms()
             trade_id = f"{payload.symbol}_{payload.tf}_{t}"
+        
         db_execute("""
-            INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, r1, s1,
-                               lev_reco, qty_reco, notional, confidence, horizon, leverage, note, price, direction, trade_id)
+            INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, r1, s1, lev_reco, qty_reco, notional, confidence, horizon, leverage, note, price, direction, trade_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            payload.type, payload.symbol, str(payload.tf) if payload.tf else None,
-            payload.tf_label or tf_to_label(payload.tf), int(payload.time or now_ms()),
-            payload.side, payload.entry, payload.sl, payload.tp1, payload.tp2, payload.tp3,
-            payload.r1, payload.s1, payload.lev_reco, payload.qty_reco, payload.notional,
-            payload.confidence, payload.horizon, payload.leverage, payload.note,
-            payload.price, payload.direction, trade_id
+            payload.type,
+            payload.symbol,
+            str(payload.tf) if payload.tf else None,
+            payload.tf_label or tf_to_label(payload.tf),
+            int(payload.time or now_ms()),
+            payload.side,
+            payload.entry,
+            payload.sl,
+            payload.tp1,
+            payload.tp2,
+            payload.tp3,
+            payload.r1,
+            payload.s1,
+            payload.lev_reco,
+            payload.qty_reco,
+            payload.notional,
+            payload.confidence,
+            payload.horizon,
+            payload.leverage,
+            payload.note,
+            payload.price,
+            payload.direction,
+            trade_id
         ))
         logger.info(f"Event saved: {payload.type} {payload.symbol}")
         return trade_id
@@ -590,113 +649,101 @@ def save_event(payload: WebhookPayload) -> str:
 def generate_sidebar_html(active_page: str, kpi: dict) -> str:
     return f'''
     <aside class="sidebar">
-      <div class="logo">
-        <div class="logo-icon">⚡</div>
-        <div class="logo-text"><h2>AI Trader</h2><p>Professional</p></div>
-      </div>
-      <nav>
-        <div class="nav-item {'active' if active_page == 'dashboard' else ''}" onclick="window.location.href='/trades'">
-          <span>📊</span><span>Dashboard</span>
+        <div class="logo">
+            <div class="logo-icon">⚡</div>
+            <div class="logo-text"><h2>AI Trader</h2><p>Professional</p></div>
         </div>
-        <div class="nav-item {'active' if active_page == 'positions' else ''}" onclick="window.location.href='/positions'">
-          <span>📈</span><span>Positions</span><span class="nav-badge">{kpi.get('active_trades', 0)}</span>
+        <nav>
+            <div class="nav-item {'active' if active_page == 'dashboard' else ''}" onclick="window.location.href='/trades'">
+                <span>📊</span><span>Dashboard</span>
+            </div>
+            <div class="nav-item {'active' if active_page == 'positions' else ''}" onclick="window.location.href='/positions'">
+                <span>📈</span><span>Positions</span><span class="nav-badge">{kpi.get('active_trades', 0)}</span>
+            </div>
+            <div class="nav-item {'active' if active_page == 'history' else ''}" onclick="window.location.href='/history'">
+                <span>📜</span><span>Historique</span>
+            </div>
+            <div class="nav-item {'active' if active_page == 'analytics' else ''}" onclick="window.location.href='/analytics'">
+                <span>📊</span><span>Analytics</span>
+            </div>
+        </nav>
+        <div class="ml-status">
+            <div class="ml-status-header"><h4><span class="status-dot"></span> Performance</h4></div>
+            <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
+            <div class="ml-metric"><span class="label">Wins/Losses</span><span class="value">{kpi.get('wins', 0)}/{kpi.get('losses', 0)}</span></div>
+            <div class="ml-metric"><span class="label">TP Atteints</span><span class="value">{kpi.get('tp_hits', 0)}</span></div>
         </div>
-        <div class="nav-item {'active' if active_page == 'history' else ''}" onclick="window.location.href='/history'">
-          <span>📜</span><span>Historique</span>
+        <div class="user-profile">
+            <div class="avatar">TP</div>
+            <div class="user-info"><div class="name">Trader Pro</div><div class="status"><span class="status-dot"></span> En ligne</div></div>
+            <div style="margin-left:auto">⚙️</div>
         </div>
-        <div class="nav-item {'active' if active_page == 'analytics' else ''}" onclick="window.location.href='/analytics'">
-          <span>📊</span><span>Analytics</span>
-        </div>
-      </nav>
-      <div class="ml-status">
-        <div class="ml-status-header"><h4><span class="status-dot"></span> Performance</h4></div>
-        <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
-        <div class="ml-metric"><span class="label">Wins/Losses</span><span class="value">{kpi.get('wins', 0)}/{kpi.get('losses', 0)}</span></div>
-        <div class="ml-metric"><span class="label">TP Atteints</span><span class="value">{kpi.get('tp_hits', 0)}</span></div>
-      </div>
-      <div class="user-profile">
-        <div class="avatar">TP</div>
-        <div class="user-info"><div class="name">Trader Pro</div><div class="status"><span class="status-dot"></span> En ligne</div></div>
-        <div style="margin-left:auto">⚙️</div>
-      </div>
     </aside>
     '''
 
 def get_base_css() -> str:
     return """
-    :root{--bg:#050a12;--sidebar:#0a0f1a;--panel:rgba(15,23,38,0.8);--card:rgba(20,30,48,0.6);--border:rgba(99,102,241,0.12);--txt:#e2e8f0;--muted:#64748b;--accent:#6366f1;--accent2:#8b5cf6;--success:#10b981;--danger:#ef4444;--warning:#f59e0b;--info:#06b6d4;--purple:#a855f7;--glow:rgba(99,102,241,0.25)}
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#050a12;color:var(--txt);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
-    body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 15% 25%, rgba(99,102,241,0.08) 0%, transparent 45%),radial-gradient(circle at 85% 75%, rgba(139,92,246,0.06) 0%, transparent 45%);pointer-events:none}
-    .app{display:flex;min-height:100vh;position:relative;z-index:1}
-    .sidebar{width:300px;background:linear-gradient(180deg, rgba(10,15,26,0.98) 0%, rgba(10,15,26,0.95) 100%);backdrop-filter:blur(40px);border-right:1px solid var(--border);padding:28px 20px;display:flex;flex-direction:column;position:fixed;height:100vh;z-index:100;box-shadow:4px 0 40px rgba(0,0,0,0.5)}
-    .logo{display:flex;align-items:center;gap:14px;margin-bottom:36px;padding-bottom:24px;border-bottom:1px solid var(--border)}
-    .logo-icon{width:48px;height:48px;background:linear-gradient(135deg, var(--accent), var(--purple));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 8px 32px var(--glow);position:relative}
-    .logo-icon::before{content:'';position:absolute;inset:-3px;background:inherit;border-radius:16px;filter:blur(16px);opacity:0.6;z-index:-1}
-    .logo-text h2{font-size:22px;font-weight:900;background:linear-gradient(135deg, var(--accent), var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-0.5px}
-    .logo-text p{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:1px}
-    .nav-item{display:flex;align-items:center;gap:14px;padding:13px 18px;border-radius:14px;color:var(--muted);cursor:pointer;transition:all 0.3s;margin-bottom:6px;font-size:14px;font-weight:600;position:relative}
-    .nav-item::before{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:var(--accent);transform:scaleY(0);transition:transform 0.3s}
-    .nav-item:hover, .nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent);transform:translateX(6px)}
-    .nav-item.active::before{transform:scaleY(1)}
-    .nav-badge{margin-left:auto;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;background:rgba(239,68,68,0.15);color:var(--danger)}
-    .ml-status{background:linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));border:1px solid rgba(99,102,241,0.2);border-radius:14px;padding:16px;margin:20px 0}
-    .ml-status-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-    .ml-status-header h4{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
-    .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
-    .ml-metric{display:flex;justify-content:space-between;font-size:12px;margin:8px 0}
-    .ml-metric .label{color:var(--muted)}
-    .ml-metric .value{font-weight:700;color:var(--success)}
-    .user-profile{margin-top:auto;padding-top:24px;border-top:1px solid var(--border);display:flex;align-items:center;gap:14px;padding:20px 16px;border-radius:14px;background:rgba(30,35,48,0.4);cursor:pointer;transition:all 0.3s}
-    .user-profile:hover{background:rgba(30,35,48,0.6);transform:translateY(-2px)}
-    .avatar{width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg, var(--accent), var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;box-shadow:0 4px 16px var(--glow)}
-    .user-info{flex:1}
-    .user-info .name{font-size:14px;font-weight:700;margin-bottom:2px}
-    .user-info .status{font-size:11px;color:var(--success);display:flex;align-items:center;gap:6px}
-    .main{flex:1;margin-left:300px;padding:32px 40px;max-width:100%}
-    .panel{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;padding:32px}
-    .badge{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:10px;font-size:12px;font-weight:800;backdrop-filter:blur(10px)}
-    .badge-long{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}
-    .badge-short{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
-    .badge-tp{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}
-    .badge-pending{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
-    .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
-    .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
-    .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
-    table{width:100%;border-collapse:collapse;table-layout:fixed}
-    thead th{padding:14px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
-    tbody tr:hover{background:rgba(99,102,241,0.08)}
-    tbody td{padding:16px 12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    thead th:nth-child(1), tbody td:nth-child(1){width:60px}
-    thead th:nth-child(2), tbody td:nth-child(2){width:130px}
-    thead th:nth-child(3), tbody td:nth-child(3){width:110px}
-    thead th:nth-child(4), tbody td:nth-child(4){width:80px}
-    thead th:nth-child(5), tbody td:nth-child(5){width:90px}
-    thead th:nth-child(6), tbody td:nth-child(6){width:95px}
-    thead th:nth-child(7), tbody td:nth-child(7){width:95px}
-    thead th:nth-child(8), tbody td:nth-child(8){width:95px}
-    thead th:nth-child(9), tbody td:nth-child(9){width:95px}
-    thead th:nth-child(10), tbody td:nth-child(10){width:95px}
-    thead th:nth-child(11), tbody td:nth-child(11){width:85px}
-    thead th:nth-child(12), tbody td:nth-child(12){width:140px}
-    .trade-row{position:relative}
-    .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
-    .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
-    .trade-row.sl::before{background:var(--danger);box-shadow:0 0 16px var(--danger)}
-    .trade-row.normal::before{background:var(--info);box-shadow:0 0 16px var(--info)}
-    .btn{padding:12px 24px;border:none;border-radius:12px;font-weight:700;cursor:pointer;transition:all 0.3s;font-size:14px}
-    .btn-danger{background:var(--danger);color:white}
-    .btn-danger:hover{background:#dc2626;transform:translateY(-2px);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
-    @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
-    @media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
-    .chart-container{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;margin-bottom:20px}
-    .bar{display:flex;align-items:center;gap:12px;margin:10px 0}
-    .bar-label{width:100px;font-size:13px;font-weight:600}
-    .bar-track{flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden}
-    .bar-fill{height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s}
-    .bar-value{min-width:60px;text-align:right;font-weight:700;font-size:14px}
-    """
+:root{--bg:#050a12;--sidebar:#0a0f1a;--panel:rgba(15,23,38,0.8);--card:rgba(20,30,48,0.6);--border:rgba(99,102,241,0.12);--txt:#e2e8f0;--muted:#64748b;--accent:#6366f1;--accent2:#8b5cf6;--success:#10b981;--danger:#ef4444;--warning:#f59e0b;--info:#06b6d4;--purple:#a855f7;--glow:rgba(99,102,241,0.25)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#050a12;color:var(--txt);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 15% 25%, rgba(99,102,241,0.08) 0%, transparent 45%),radial-gradient(circle at 85% 75%, rgba(139,92,246,0.06) 0%, transparent 45%);pointer-events:none}
+.app{display:flex;min-height:100vh;position:relative;z-index:1}
+.sidebar{width:300px;background:linear-gradient(180deg, rgba(10,15,26,0.98) 0%, rgba(10,15,26,0.95) 100%);backdrop-filter:blur(40px);border-right:1px solid var(--border);padding:28px 20px;display:flex;flex-direction:column;position:fixed;height:100vh;z-index:100;box-shadow:4px 0 40px rgba(0,0,0,0.5)}
+.logo{display:flex;align-items:center;gap:14px;margin-bottom:36px;padding-bottom:24px;border-bottom:1px solid var(--border)}
+.logo-icon{width:48px;height:48px;background:linear-gradient(135deg, var(--accent), var(--purple));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 8px 32px var(--glow);position:relative}
+.logo-icon::before{content:'';position:absolute;inset:-3px;background:inherit;border-radius:16px;filter:blur(16px);opacity:0.6;z-index:-1}
+.logo-text h2{font-size:22px;font-weight:900;background:linear-gradient(135deg, var(--accent), var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-0.5px}
+.logo-text p{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:1px}
+.nav-item{display:flex;align-items:center;gap:14px;padding:13px 18px;border-radius:14px;color:var(--muted);cursor:pointer;transition:all 0.3s;margin-bottom:6px;font-size:14px;font-weight:600;position:relative}
+.nav-item::before{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:var(--accent);transform:scaleY(0);transition:transform 0.3s}
+.nav-item:hover, .nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent);transform:translateX(6px)}
+.nav-item.active::before{transform:scaleY(1)}
+.nav-badge{margin-left:auto;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;background:rgba(239,68,68,0.15);color:var(--danger)}
+.ml-status{background:linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));border:1px solid rgba(99,102,241,0.2);border-radius:14px;padding:16px;margin:20px 0}
+.ml-status-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.ml-status-header h4{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 12px var(--success);animation:pulse 2s infinite}
+.ml-metric{display:flex;justify-content:space-between;font-size:12px;margin:8px 0}
+.ml-metric .label{color:var(--muted)}
+.ml-metric .value{font-weight:700;color:var(--success)}
+.user-profile{margin-top:auto;padding-top:24px;border-top:1px solid var(--border);display:flex;align-items:center;gap:14px;padding:20px 16px;border-radius:14px;background:rgba(30,35,48,0.4);cursor:pointer;transition:all 0.3s}
+.user-profile:hover{background:rgba(30,35,48,0.6);transform:translateY(-2px)}
+.avatar{width:42px;height:42px;border-radius:50%;background:linear-gradient(135deg, var(--accent), var(--purple));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;box-shadow:0 4px 16px var(--glow)}
+.user-info{flex:1}
+.user-info .name{font-size:14px;font-weight:700;margin-bottom:2px}
+.user-info .status{font-size:11px;color:var(--success);display:flex;align-items:center;gap:6px}
+.main{flex:1;margin-left:300px;padding:32px 40px;max-width:100%}
+.panel{background:var(--card);backdrop-filter:blur(30px);border:1px solid var(--border);border-radius:20px;padding:32px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:10px;font-size:12px;font-weight:800;backdrop-filter:blur(10px)}
+.badge-long{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}
+.badge-short{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
+.badge-tp{background:rgba(16,185,129,0.15);color:var(--success);border:1px solid rgba(16,185,129,0.35)}
+.badge-pending{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
+.badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
+.badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
+.badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
+table{width:100%;border-collapse:collapse}
+thead th{padding:16px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap}
+tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
+tbody tr:hover{background:rgba(99,102,241,0.08)}
+tbody td{padding:18px 12px;font-size:13px;white-space:nowrap}
+.trade-row{position:relative}
+.trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
+.trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
+.trade-row.sl::before{background:var(--danger);box-shadow:0 0 16px var(--danger)}
+.trade-row.normal::before{background:var(--info);box-shadow:0 0 16px var(--info)}
+.btn{padding:12px 24px;border:none;border-radius:12px;font-weight:700;cursor:pointer;transition:all 0.3s;font-size:14px}
+.btn-danger{background:var(--danger);color:white}
+.btn-danger:hover{background:#dc2626;transform:translateY(-2px);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+@media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
+.chart-container{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;margin-bottom:20px}
+.bar{display:flex;align-items:center;gap:12px;margin:10px 0}
+.bar-label{width:100px;font-size:13px;font-weight:600}
+.bar-track{flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden}
+.bar-fill{height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s}
+.bar-value{min-width:60px;text-align:right;font-weight:700;font-size:14px}
+"""
 
 # FASTAPI APP
 app = FastAPI(title="AI Trader Pro Enhanced", version="2.1")
@@ -743,11 +790,11 @@ async def export_csv():
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8"><title>AI Trader Pro</title>
-    <style>body{font-family:system-ui;padding:40px;background:#0b0f14;color:#e6edf3}h1{color:#6366f1}a{color:#8b5cf6}</style></head>
-    <body><h1>AI Trader Pro v2.1</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
-    <li><a href="/trades">📊 Dashboard</a></li><li><a href="/positions">📈 Positions</a></li>
-    <li><a href="/history">📜 Historique</a></li><li><a href="/analytics">📊 Analytics</a></li>
-    <li><a href="/health">🏥 Health</a></li><li><a href="/api/export-csv">📥 Export CSV</a></li></ul></body></html>""")
+<style>body{font-family:system-ui;padding:40px;background:#0b0f14;color:#e6edf3}h1{color:#6366f1}a{color:#8b5cf6}</style></head>
+<body><h1>AI Trader Pro v2.1</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
+<li><a href="/trades">📊 Dashboard</a></li><li><a href="/positions">📈 Positions</a></li>
+<li><a href="/history">📜 Historique</a></li><li><a href="/analytics">📊 Analytics</a></li>
+<li><a href="/health">🏥 Health</a></li><li><a href="/api/export-csv">📥 Export CSV</a></li></ul></body></html>""")
 
 @app.get("/health")
 async def health_check():
@@ -758,9 +805,7 @@ async def health_check():
     except Exception as e:
         db_status = f"error: {e}"
         db_records = 0
-    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status,
-            "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, 
-            "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.1"}
+    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.1"}
 
 @app.post("/tv-webhook")
 async def tv_webhook(req: Request):
@@ -768,14 +813,18 @@ async def tv_webhook(req: Request):
         payload_dict = await req.json()
     except Exception as e:
         raise HTTPException(400, f"Invalid JSON: {e}")
+    
     secret = payload_dict.get("secret")
     if settings.WEBHOOK_SECRET and secret != settings.WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
+    
     try:
         payload = WebhookPayload(**payload_dict)
     except Exception as e:
         raise HTTPException(422, f"Validation error: {e}")
+    
     trade_id = save_event(payload)
+    
     try:
         if settings.TELEGRAM_ENABLED:
             key = payload.trade_id or f"{payload.type}:{payload.symbol}"
@@ -786,12 +835,13 @@ async def tv_webhook(req: Request):
                 now_sec = time.time()
                 if now_sec - _last_vector_flush_ts >= settings.VECTOR_GLOBAL_GAP_SEC:
                     _last_vector_flush_ts = now_sec
-                    txt = format_vector_message(payload.symbol, payload.tf_label or tf_to_label(payload.tf),
-                                               payload.direction or "", payload.price, payload.note)
+                    txt = format_vector_message(payload.symbol, payload.tf_label or tf_to_label(payload.tf), payload.direction or "", payload.price, payload.note)
                     await tg_send_text(txt, key=key, reply_markup=reply_markup)
+            
             elif payload.type == "ENTRY":
                 txt = format_entry_announcement(payload.dict())
                 await tg_send_text(txt, key=key, reply_markup=reply_markup)
+            
             elif payload.type in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
                 hit_time = payload.time or now_ms()
                 entry_t = get_entry_time_for_trade(payload.trade_id)
@@ -800,30 +850,26 @@ async def tv_webhook(req: Request):
                     symbol = payload.symbol
                     tf = str(payload.tf)
                     side = payload.side
-                    
                     query = """
-                        SELECT time FROM events 
+                        SELECT time FROM events
                         WHERE symbol=? AND tf=? AND type='ENTRY'
                     """
                     params = [symbol, tf]
-                    
                     if side:
                         query += " AND side=?"
                         params.append(side)
-                    
                     query += " ORDER BY time DESC LIMIT 1"
-                    
                     r = db_query(query, tuple(params))
+                    
                     if r and r[0].get("time"):
                         entry_t = int(r[0]["time"])
                         logger.info(f"Found ENTRY by symbol+tf+side: {entry_t}")
                     else:
                         r = db_query("""
-                            SELECT time FROM events 
-                            WHERE symbol=? AND tf=? AND type='ENTRY' 
+                            SELECT time FROM events
+                            WHERE symbol=? AND tf=? AND type='ENTRY'
                             ORDER BY time DESC LIMIT 1
                         """, (symbol, tf))
-                        
                         if r and r[0].get("time"):
                             entry_t = int(r[0]["time"])
                             logger.info(f"Found ENTRY by symbol+tf: {entry_t}")
@@ -835,45 +881,50 @@ async def tv_webhook(req: Request):
                                 symbol + '.P',
                                 symbol + '.PERP'
                             ]
-                            
                             for sym_var in symbol_variants:
                                 r = db_query("""
-                                    SELECT time FROM events 
-                                    WHERE symbol=? AND tf=? AND type='ENTRY' 
+                                    SELECT time FROM events
+                                    WHERE symbol=? AND tf=? AND type='ENTRY'
                                     ORDER BY time DESC LIMIT 1
                                 """, (sym_var, tf))
-                                
                                 if r and r[0].get("time"):
                                     entry_t = int(r[0]["time"])
                                     logger.info(f"Found ENTRY with symbol variant '{sym_var}': {entry_t}")
                                     break
-                            
-                            if not entry_t:
-                                logger.error(f"NO ENTRY FOUND for {symbol} tf={tf} side={side}")
+                    
+                    if not entry_t:
+                        logger.error(f"NO ENTRY FOUND for {symbol} tf={tf} side={side}")
                 
                 duration = (hit_time - entry_t) if entry_t else None
                 txt = format_event_announcement(payload.type, payload.dict(), duration)
                 await tg_send_text(txt, key=key, reply_markup=reply_markup)
-        await maybe_altseason_autonotify()
+            
+            await maybe_altseason_autonotify()
     except Exception as e:
         logger.warning(f"TG skip: {e}")
+    
     return JSONResponse({"ok": True, "trade_id": trade_id})
 
 async def maybe_altseason_autonotify():
     global _last_altseason_notify_ts
     if not settings.ALTSEASON_AUTONOTIFY or not settings.TELEGRAM_ENABLED:
         return
+    
     alt = compute_altseason_snapshot()
     greens = alt["signals"]["breadth_symbols"]
     nowt = time.time()
+    
     if greens < settings.ALT_GREENS_REQUIRED or alt["score"] < 50:
         return
+    
     if (nowt - _last_altseason_notify_ts) < (settings.ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
         return
+    
     emoji = "🟢" if alt["score"] >= 75 else "🟡"
     symbols_list = ", ".join(alt["symbols_with_tp"][:15])
     if len(alt["symbols_with_tp"]) > 15:
         symbols_list += f" +{len(alt['symbols_with_tp'])-15} autres"
+    
     msg = f"""🚨 <b>Alerte Altseason</b> {emoji}
 
 📊 Score: <b>{alt['score']}/100</b>
@@ -889,6 +940,7 @@ async def maybe_altseason_autonotify():
 {symbols_list}
 
 <i>{alt['disclaimer']}</i>"""
+    
     reply_markup = _create_dashboard_button()
     res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
     if res.get("ok"):
@@ -970,18 +1022,18 @@ async def trades_page():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard - AI Trader Pro</title>
     <style>{get_base_css()}
-    .search-bar{{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}}
-    .search-bar:focus{{outline:none;border-color:var(--accent)}}
-    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-    .theme-toggle:hover{{transform:scale(1.1)}}
-    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-    .sortable{{cursor:pointer;user-select:none;position:relative}}
-    .sortable:hover{{color:var(--accent)}}
-    .sortable::after{{content:'⇅';margin-left:8px;opacity:0.3}}
-    .sortable.asc::after{{content:'↑';opacity:1}}
-    .sortable.desc::after{{content:'↓';opacity:1}}
-    .refresh-indicator{{position:fixed;top:20px;right:20px;padding:8px 16px;background:var(--success);color:white;border-radius:8px;font-size:12px;font-weight:700;opacity:0;transition:opacity 0.3s;z-index:1000}}
-    .refresh-indicator.show{{opacity:1}}
+.search-bar{{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}}
+.search-bar:focus{{outline:none;border-color:var(--accent)}}
+.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+.theme-toggle:hover{{transform:scale(1.1)}}
+body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+.sortable{{cursor:pointer;user-select:none;position:relative}}
+.sortable:hover{{color:var(--accent)}}
+.sortable::after{{content:'⇅';margin-left:8px;opacity:0.3}}
+.sortable.asc::after{{content:'↑';opacity:1}}
+.sortable.desc::after{{content:'↓';opacity:1}}
+.refresh-indicator{{position:fixed;top:20px;right:20px;padding:8px 16px;background:var(--success);color:white;border-radius:8px;font-size:12px;font-weight:700;opacity:0;transition:opacity 0.3s;z-index:1000}}
+.refresh-indicator.show{{opacity:1}}
     </style>
 </head>
 <body>
@@ -1059,13 +1111,15 @@ async def trades_page():
             </div>
         </main>
     </div>
+    
     <audio id="notificationSound" preload="auto">
-        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
+        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
     </audio>
+
     <script>
     let sortColumn = '';
     let sortDirection = 'asc';
-    
+
     document.querySelectorAll('.sortable').forEach(header => {{
         header.addEventListener('click', function() {{
             const column = this.dataset.column;
@@ -1114,7 +1168,7 @@ async def trades_page():
             rows.forEach(row => tbody.appendChild(row));
         }});
     }});
-    
+
     document.getElementById('searchInput').addEventListener('input', function(e) {{
         const searchTerm = e.target.value.toLowerCase();
         const rows = document.querySelectorAll('#tradesTable tbody tr');
@@ -1128,16 +1182,16 @@ async def trades_page():
             }}
         }});
     }});
-    
+
     function toggleTheme() {{
         document.body.classList.toggle('light-mode');
         localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
     }}
-    
+
     if (localStorage.getItem('theme') === 'light') {{
         document.body.classList.add('light-mode');
     }}
-    
+
     let lastDataHash = '';
     setInterval(async function() {{
         try {{
@@ -1204,9 +1258,9 @@ async def positions_page():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Positions Actives - AI Trader Pro</title>
     <style>{get_base_css()}
-    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-    .theme-toggle:hover{{transform:scale(1.1)}}
-    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+.theme-toggle:hover{{transform:scale(1.1)}}
+body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
     </style>
 </head>
 <body>
@@ -1320,9 +1374,9 @@ async def history_page():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Historique - AI Trader Pro</title>
     <style>{get_base_css()}
-    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-    .theme-toggle:hover{{transform:scale(1.1)}}
-    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+.theme-toggle:hover{{transform:scale(1.1)}}
+body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
     </style>
 </head>
 <body>
@@ -1384,9 +1438,16 @@ async def analytics_page():
         symbol = r["symbol"]
         if symbol not in crypto_stats:
             crypto_stats[symbol] = {
-                "total": 0, "wins": 0, "losses": 0, "pending": 0,
-                "tp1": 0, "tp2": 0, "tp3": 0, "sl": 0,
-                "total_pl": 0.0, "trades": []
+                "total": 0,
+                "wins": 0,
+                "losses": 0,
+                "pending": 0,
+                "tp1": 0,
+                "tp2": 0,
+                "tp3": 0,
+                "sl": 0,
+                "total_pl": 0.0,
+                "trades": []
             }
         
         crypto_stats[symbol]["total"] += 1
@@ -1437,123 +1498,4 @@ async def analytics_page():
     for idx, (symbol, stats) in enumerate(sorted_cryptos, start=1):
         winrate_color = "var(--success)" if stats["winrate"] >= 50 else "var(--danger)"
         pl_color = "var(--success)" if stats["total_pl"] >= 0 else "var(--danger)"
-        pl_sign = "+" if stats["total_pl"] >= 0 else ""
-        
-        crypto_rows += f'''
-        <tr class="trade-row">
-            <td><strong>#{idx}</strong></td>
-            <td><strong>{symbol}</strong></td>
-            <td>{stats["total"]}</td>
-            <td style="color:var(--success)">{stats["wins"]}</td>
-            <td style="color:var(--danger)">{stats["losses"]}</td>
-            <td style="color:var(--info)">{stats["pending"]}</td>
-            <td style="color:{winrate_color};font-weight:700">{stats["winrate"]:.1f}%</td>
-            <td style="color:{pl_color};font-weight:700">{pl_sign}{stats["total_pl"]:.2f}%</td>
-            <td><span class="badge badge-tp">{stats["tp1"]}</span> <span class="badge badge-tp">{stats["tp2"]}</span> <span class="badge badge-tp">{stats["tp3"]}</span></td>
-            <td><span class="badge badge-sl">{stats["sl"]}</span></td>
-        </tr>'''
-    
-    html = f'''<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Analytics - AI Trader Pro</title>
-    <style>{get_base_css()}
-    .theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-    .theme-toggle:hover{{transform:scale(1.1)}}
-    body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-    </style>
-</head>
-<body>
-    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
-    <div class="app">
-        {generate_sidebar_html("analytics", kpi)}
-        <main class="main">
-            <header style="margin-bottom:32px">
-                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📊 Analytics</h1>
-                <p style="color:var(--muted)">Analyse détaillée de vos performances</p>
-            </header>
-            
-            <div class="chart-container">
-                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics Globales</h3>
-                <div class="bar">
-                    <div class="bar-label">Win Rate</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{kpi['winrate']}%"></div></div>
-                    <div class="bar-value">{kpi['winrate']}%</div>
-                </div>
-                <div class="bar">
-                    <div class="bar-label">LONG Ratio</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['long_ratio']}%"></div></div>
-                    <div class="bar-value">{alt['signals']['long_ratio']}%</div>
-                </div>
-                <div class="bar">
-                    <div class="bar-label">TP vs SL</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['tp_vs_sl']}%"></div></div>
-                    <div class="bar-value">{alt['signals']['tp_vs_sl']}%</div>
-                </div>
-                <div class="bar">
-                    <div class="bar-label">Altseason</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['score']}%"></div></div>
-                    <div class="bar-value">{alt['score']}/100</div>
-                </div>
-            </div>
-
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:32px">
-                <div class="panel">
-                    <h3 style="margin-bottom:16px;font-weight:800">Trades (24h)</h3>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Total:</span> <strong>{kpi['total_trades']}</strong></div>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Actifs:</span> <strong style="color:var(--accent)">{kpi['active_trades']}</strong></div>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Clôturés:</span> <strong>{kpi['total_closed']}</strong></div>
-                </div>
-                
-                <div class="panel">
-                    <h3 style="margin-bottom:16px;font-weight:800">Résultats</h3>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Wins:</span> <strong style="color:var(--success)">{kpi['wins']}</strong></div>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Losses:</span> <strong style="color:var(--danger)">{kpi['losses']}</strong></div>
-                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
-                </div>
-            </div>
-            
-            <div class="panel">
-                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📈 Statistiques par Crypto (Top 20)</h2>
-                <div style="overflow-x:auto">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Rang</th>
-                                <th>Crypto</th>
-                                <th>Total Trades</th>
-                                <th>Wins</th>
-                                <th>Losses</th>
-                                <th>En cours</th>
-                                <th>Win Rate</th>
-                                <th>P&L Total</th>
-                                <th>TP (1/2/3)</th>
-                                <th>SL</th>
-                            </tr>
-                        </thead>
-                        <tbody>{crypto_rows if crypto_rows else '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'}</tbody>
-                    </table>
-                </div>
-            </div>
-        </main>
-    </div>
-    <script>
-    function toggleTheme() {{
-        document.body.classList.toggle('light-mode');
-        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
-    }}
-    if (localStorage.getItem('theme') === 'light') {{
-        document.body.classList.add('light-mode');
-    }}
-    </script>
-</body>
-</html>'''
-    return HTMLResponse(html)
-
-if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starting AI Trader Pro v2.1...")
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
-
+        pl_sign = "+" if
