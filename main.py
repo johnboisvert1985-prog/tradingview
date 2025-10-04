@@ -1498,4 +1498,121 @@ async def analytics_page():
     for idx, (symbol, stats) in enumerate(sorted_cryptos, start=1):
         winrate_color = "var(--success)" if stats["winrate"] >= 50 else "var(--danger)"
         pl_color = "var(--success)" if stats["total_pl"] >= 0 else "var(--danger)"
-        pl_sign = "+" if
+        pl_sign = "+" if stats["total_pl"] >= 0 else ""
+        
+        crypto_rows += f'''
+        <tr class="trade-row">
+            <td><strong>#{idx}</strong></td>
+            <td><strong>{symbol}</strong></td>
+            <td>{stats["total"]}</td>
+            <td style="color:var(--success)">{stats["wins"]}</td>
+            <td style="color:var(--danger)">{stats["losses"]}</td>
+            <td style="color:var(--info)">{stats["pending"]}</td>
+            <td style="color:{winrate_color};font-weight:700">{stats["winrate"]:.1f}%</td>
+            <td style="color:{pl_color};font-weight:700">{pl_sign}{stats["total_pl"]:.2f}%</td>
+            <td><span class="badge badge-tp">{stats["tp1"]}</span> <span class="badge badge-tp">{stats["tp2"]}</span> <span class="badge badge-tp">{stats["tp3"]}</span></td>
+            <td><span class="badge badge-sl">{stats["sl"]}</span></td>
+        </tr>'''
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics - AI Trader Pro</title>
+    <style>{get_base_css()}
+.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+.theme-toggle:hover{{transform:scale(1.1)}}
+body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
+    </style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
+    <div class="app">
+        {generate_sidebar_html("analytics", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📊 Analytics</h1>
+                <p style="color:var(--muted)">Analyse détaillée de vos performances</p>
+            </header>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics Globales</h3>
+                <div class="bar">
+                    <div class="bar-label">Win Rate</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{kpi['winrate']}%"></div></div>
+                    <div class="bar-value">{kpi['winrate']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">LONG Ratio</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['long_ratio']}%"></div></div>
+                    <div class="bar-value">{alt['signals']['long_ratio']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">TP vs SL</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['tp_vs_sl']}%"></div></div>
+                    <div class="bar-value">{alt['signals']['tp_vs_sl']}%</div>
+                </div>
+                <div class="bar">
+                    <div class="bar-label">Altseason</div>
+                    <div class="bar-track"><div class="bar-fill" style="width:{alt['score']}%"></div></div>
+                    <div class="bar-value">{alt['score']}/100</div>
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:32px">
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Trades (24h)</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Total:</span> <strong>{kpi['total_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Actifs:</span> <strong style="color:var(--accent)">{kpi['active_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Clôturés:</span> <strong>{kpi['total_closed']}</strong></div>
+                </div>
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Résultats</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Wins:</span> <strong style="color:var(--success)">{kpi['wins']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Losses:</span> <strong style="color:var(--danger)">{kpi['losses']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📈 Statistiques par Crypto (Top 20)</h2>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rang</th>
+                                <th>Crypto</th>
+                                <th>Total Trades</th>
+                                <th>Wins</th>
+                                <th>Losses</th>
+                                <th>En cours</th>
+                                <th>Win Rate</th>
+                                <th>P&L Total</th>
+                                <th>TP (1/2/3)</th>
+                                <th>SL</th>
+                            </tr>
+                        </thead>
+                        <tbody>{crypto_rows if crypto_rows else '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    </script>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting AI Trader Pro v2.1...")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
