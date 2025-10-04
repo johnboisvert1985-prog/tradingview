@@ -1346,11 +1346,11 @@ async def history_page():
         tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
         result_badge = f'<span class="badge badge-{result_class}">{result}</span>'
         
-        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
-        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
-        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
-        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
-        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
+        entry_val = r["entry"] or "N/A"
+        tp1_val = r["tp1"] or "N/A"
+        tp2_val = r["tp2"] or "N/A"
+        tp3_val = r["tp3"] or "N/A"
+        sl_val = r["sl"] or "N/A"
         
         pl_html = "N/A"
         if r["entry"] and r["row_state"] in ("tp", "sl"):
