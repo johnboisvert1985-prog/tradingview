@@ -1,5 +1,5 @@
-# main.py - AI Trader Pro v2.1 Final Enhanced
-# Professional Trading Dashboard with Telegram Integration
+# main.py - AI Trader Pro v2.2 Enhanced
+# Professional Trading Dashboard with Advanced Features
 # Python 3.8+
 
 import os
@@ -64,7 +64,7 @@ try:
 except Exception as e:
     logger.warning(f"Could not create file handler: {e}")
 
-logger.info(f"AI Trader Pro v2.1 Enhanced - DB: {settings.DB_PATH}")
+logger.info(f"AI Trader Pro v2.2 Enhanced - DB: {settings.DB_PATH}")
 
 # PYDANTIC MODELS
 class WebhookPayload(BaseModel):
@@ -520,8 +520,8 @@ def _cancelled_by_opposite(entry_row: dict) -> bool:
     r = db_query("SELECT 1 FROM events WHERE type='ENTRY' AND symbol=? AND tf=? AND time>? AND UPPER(COALESCE(side,''))=? LIMIT 1", (symbol, str(tf), t, opposite))
     return bool(r)
 
-def build_trade_rows(limit=300):
-    base = db_query("SELECT e.trade_id, MAX(e.time) AS t_entry FROM events e WHERE e.type='ENTRY' GROUP BY e.trade_id ORDER BY t_entry DESC LIMIT ?", (limit,))
+def build_trade_rows(limit=300, offset=0):
+    base = db_query("SELECT e.trade_id, MAX(e.time) AS t_entry FROM events e WHERE e.type='ENTRY' GROUP BY e.trade_id ORDER BY t_entry DESC LIMIT ? OFFSET ?", (limit, offset))
     rows = []
     for item in base:
         e = _latest_entry_for_trade(item["trade_id"])
@@ -565,6 +565,10 @@ def build_trade_rows(limit=300):
         })
     return rows
 
+def count_total_trades() -> int:
+    result = db_query("SELECT COUNT(DISTINCT trade_id) AS total FROM events WHERE type='ENTRY'")
+    return result[0]["total"] if result else 0
+
 def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
     t24 = ms_ago(24*60)
     total_trades = db_query("SELECT COUNT(DISTINCT trade_id) AS n FROM events WHERE type='ENTRY' AND time>=?", (t24,))[0]["n"] or 0
@@ -594,6 +598,52 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
         "losses": losses,
         "cancelled": cancelled,
         "total_closed": wins + losses
+    }
+
+def get_chart_data() -> dict:
+    t30d = ms_ago(30*24*60)
+    
+    # Daily wins/losses
+    daily_data = db_query("""
+        WITH RECURSIVE dates(d) AS (
+            SELECT date('now', '-29 days')
+            UNION ALL
+            SELECT date(d, '+1 day') FROM dates WHERE d < date('now')
+        ),
+        daily_wins AS (
+            SELECT date(time/1000, 'unixepoch') as day, COUNT(*) as wins
+            FROM events 
+            WHERE type IN ('TP1_HIT','TP2_HIT','TP3_HIT') AND time>=?
+            GROUP BY day
+        ),
+        daily_losses AS (
+            SELECT date(time/1000, 'unixepoch') as day, COUNT(*) as losses
+            FROM events 
+            WHERE type='SL_HIT' AND time>=?
+            GROUP BY day
+        )
+        SELECT dates.d as date, 
+               COALESCE(daily_wins.wins, 0) as wins,
+               COALESCE(daily_losses.losses, 0) as losses
+        FROM dates
+        LEFT JOIN daily_wins ON dates.d = daily_wins.day
+        LEFT JOIN daily_losses ON dates.d = daily_losses.day
+        ORDER BY dates.d
+    """, (t30d, t30d))
+    
+    # Top cryptos by trade count
+    top_cryptos = db_query("""
+        SELECT symbol, COUNT(DISTINCT trade_id) as count
+        FROM events
+        WHERE type='ENTRY' AND time>=?
+        GROUP BY symbol
+        ORDER BY count DESC
+        LIMIT 10
+    """, (t30d,))
+    
+    return {
+        "daily": daily_data,
+        "top_cryptos": top_cryptos
     }
 
 def get_entry_time_for_trade(trade_id: Optional[str]) -> Optional[int]:
@@ -647,38 +697,44 @@ def save_event(payload: WebhookPayload) -> str:
 
 # HTML COMPONENTS
 def generate_sidebar_html(active_page: str, kpi: dict) -> str:
+    new_trades_badge = f'<span class="new-badge" id="newTradesBadge" style="display:none">0</span>' if active_page == 'dashboard' else ''
+    
     return f'''
-    <aside class="sidebar">
-        <div class="logo">
-            <div class="logo-icon">⚡</div>
-            <div class="logo-text"><h2>AI Trader</h2><p>Professional</p></div>
-        </div>
-        <nav>
-            <div class="nav-item {'active' if active_page == 'dashboard' else ''}" onclick="window.location.href='/trades'">
-                <span>📊</span><span>Dashboard</span>
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-overlay" id="sidebarOverlay"></div>
+        <div class="sidebar-content">
+            <div class="logo">
+                <div class="logo-icon">⚡</div>
+                <div class="logo-text"><h2>AI Trader</h2><p>Professional</p></div>
             </div>
-            <div class="nav-item {'active' if active_page == 'positions' else ''}" onclick="window.location.href='/positions'">
-                <span>📈</span><span>Positions</span><span class="nav-badge">{kpi.get('active_trades', 0)}</span>
+            <nav>
+                <div class="nav-item {'active' if active_page == 'dashboard' else ''}" onclick="window.location.href='/trades'">
+                    <span>📊</span><span>Dashboard</span>{new_trades_badge}
+                </div>
+                <div class="nav-item {'active' if active_page == 'positions' else ''}" onclick="window.location.href='/positions'">
+                    <span>📈</span><span>Positions</span><span class="nav-badge">{kpi.get('active_trades', 0)}</span>
+                </div>
+                <div class="nav-item {'active' if active_page == 'history' else ''}" onclick="window.location.href='/history'">
+                    <span>📜</span><span>Historique</span>
+                </div>
+                <div class="nav-item {'active' if active_page == 'analytics' else ''}" onclick="window.location.href='/analytics'">
+                    <span>📊</span><span>Analytics</span>
+                </div>
+            </nav>
+            <div class="ml-status">
+                <div class="ml-status-header"><h4><span class="status-dot"></span> Performance</h4></div>
+                <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
+                <div class="ml-metric"><span class="label">Wins/Losses</span><span class="value">{kpi.get('wins', 0)}/{kpi.get('losses', 0)}</span></div>
+                <div class="ml-metric"><span class="label">TP Atteints</span><span class="value">{kpi.get('tp_hits', 0)}</span></div>
             </div>
-            <div class="nav-item {'active' if active_page == 'history' else ''}" onclick="window.location.href='/history'">
-                <span>📜</span><span>Historique</span>
+            <div class="user-profile">
+                <div class="avatar">TP</div>
+                <div class="user-info"><div class="name">Trader Pro</div><div class="status"><span class="status-dot"></span> En ligne</div></div>
+                <div style="margin-left:auto">⚙️</div>
             </div>
-            <div class="nav-item {'active' if active_page == 'analytics' else ''}" onclick="window.location.href='/analytics'">
-                <span>📊</span><span>Analytics</span>
-            </div>
-        </nav>
-        <div class="ml-status">
-            <div class="ml-status-header"><h4><span class="status-dot"></span> Performance</h4></div>
-            <div class="ml-metric"><span class="label">Win Rate</span><span class="value">{kpi.get('winrate', 0)}%</span></div>
-            <div class="ml-metric"><span class="label">Wins/Losses</span><span class="value">{kpi.get('wins', 0)}/{kpi.get('losses', 0)}</span></div>
-            <div class="ml-metric"><span class="label">TP Atteints</span><span class="value">{kpi.get('tp_hits', 0)}</span></div>
-        </div>
-        <div class="user-profile">
-            <div class="avatar">TP</div>
-            <div class="user-info"><div class="name">Trader Pro</div><div class="status"><span class="status-dot"></span> En ligne</div></div>
-            <div style="margin-left:auto">⚙️</div>
         </div>
     </aside>
+    <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()">☰</button>
     '''
 
 def get_base_css() -> str:
@@ -688,7 +744,9 @@ def get_base_css() -> str:
 body{background:#050a12;color:var(--txt);font-family:'Inter',system-ui,sans-serif;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle at 15% 25%, rgba(99,102,241,0.08) 0%, transparent 45%),radial-gradient(circle at 85% 75%, rgba(139,92,246,0.06) 0%, transparent 45%);pointer-events:none}
 .app{display:flex;min-height:100vh;position:relative;z-index:1}
-.sidebar{width:300px;background:linear-gradient(180deg, rgba(10,15,26,0.98) 0%, rgba(10,15,26,0.95) 100%);backdrop-filter:blur(40px);border-right:1px solid var(--border);padding:28px 20px;display:flex;flex-direction:column;position:fixed;height:100vh;z-index:100;box-shadow:4px 0 40px rgba(0,0,0,0.5)}
+.sidebar{width:300px;background:linear-gradient(180deg, rgba(10,15,26,0.98) 0%, rgba(10,15,26,0.95) 100%);backdrop-filter:blur(40px);border-right:1px solid var(--border);position:fixed;height:100vh;z-index:100;box-shadow:4px 0 40px rgba(0,0,0,0.5);transition:transform 0.3s}
+.sidebar-content{padding:28px 20px;display:flex;flex-direction:column;height:100%}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:-1}
 .logo{display:flex;align-items:center;gap:14px;margin-bottom:36px;padding-bottom:24px;border-bottom:1px solid var(--border)}
 .logo-icon{width:48px;height:48px;background:linear-gradient(135deg, var(--accent), var(--purple));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:28px;box-shadow:0 8px 32px var(--glow);position:relative}
 .logo-icon::before{content:'';position:absolute;inset:-3px;background:inherit;border-radius:16px;filter:blur(16px);opacity:0.6;z-index:-1}
@@ -698,7 +756,9 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .nav-item::before{content:'';position:absolute;left:0;top:0;width:3px;height:100%;background:var(--accent);transform:scaleY(0);transition:transform 0.3s}
 .nav-item:hover, .nav-item.active{background:rgba(99,102,241,0.12);color:var(--accent);transform:translateX(6px)}
 .nav-item.active::before{transform:scaleY(1)}
-.nav-badge{margin-left:auto;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800;background:rgba(239,68,68,0.15);color:var(--danger)}
+.nav-badge, .new-badge{margin-left:auto;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:800}
+.nav-badge{background:rgba(239,68,68,0.15);color:var(--danger)}
+.new-badge{background:var(--accent);color:white;animation:pulse 2s infinite}
 .ml-status{background:linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));border:1px solid rgba(99,102,241,0.2);border-radius:14px;padding:16px;margin:20px 0}
 .ml-status-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .ml-status-header h4{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px}
@@ -739,22 +799,38 @@ tbody tr:hover{background:rgba(99,102,241,0.08)}
 .btn-danger{background:var(--danger);color:white}
 .btn-danger:hover{background:#dc2626;transform:translateY(-2px);box-shadow:0 8px 24px rgba(239,68,68,0.4)}
 @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
-@media(max-width:1200px){.main{margin-left:0;padding:24px}.sidebar{transform:translateX(-100%)}}
-.chart-container{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;margin-bottom:20px}
-.bar{display:flex;align-items:center;gap:12px;margin:10px 0}
-.bar-label{width:100px;font-size:13px;font-weight:600}
-.bar-track{flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden}
-.bar-fill{height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s}
-.bar-value{min-width:60px;text-align:right;font-weight:700;font-size:14px}
+.chart-container{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:32px;margin-bottom:20px;min-height:300px}
+.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:20px}
+.pagination button{padding:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--txt);cursor:pointer;transition:all 0.3s}
+.pagination button:hover:not(:disabled){background:var(--accent);color:white}
+.pagination button:disabled{opacity:0.5;cursor:not-allowed}
+.pagination span{color:var(--muted);font-size:14px}
+.error-toast{position:fixed;top:80px;right:20px;background:var(--danger);color:white;padding:16px 24px;border-radius:12px;box-shadow:0 8px 32px rgba(239,68,68,0.4);z-index:1000;animation:slideIn 0.3s;max-width:400px}
+.error-toast.success{background:var(--success);box-shadow:0 8px 32px rgba(16,185,129,0.4)}
+@keyframes slideIn{from{transform:translateX(400px);opacity:0}to{transform:translateX(0);opacity:1}}
+.tooltip{position:relative;display:inline-block}
+.tooltip .tooltiptext{visibility:hidden;background:var(--panel);color:var(--txt);text-align:left;border-radius:8px;padding:10px;position:absolute;z-index:1;bottom:125%;left:50%;margin-left:-100px;width:200px;opacity:0;transition:opacity 0.3s;border:1px solid var(--border);font-size:12px;line-height:1.4}
+.tooltip:hover .tooltiptext{visibility:visible;opacity:1}
+.menu-toggle{display:none;position:fixed;top:20px;left:20px;z-index:101;width:48px;height:48px;background:var(--accent);border:none;border-radius:12px;color:white;font-size:24px;cursor:pointer;box-shadow:0 4px 20px var(--glow)}
+@media(max-width:1200px){
+.sidebar{transform:translateX(-100%)}
+.sidebar.open{transform:translateX(0)}
+.sidebar.open .sidebar-overlay{display:block}
+.main{margin-left:0;padding:24px}
+.menu-toggle{display:flex;align-items:center;justify-content:center}
+table{font-size:11px}
+thead th, tbody td{padding:12px 8px}
+thead tr, tbody tr{grid-template-columns:120px 100px 80px 90px 90px 90px 90px 90px 90px 90px 1fr}
+}
 """
 
 # FASTAPI APP
-app = FastAPI(title="AI Trader Pro Enhanced", version="2.1")
+app = FastAPI(title="AI Trader Pro Enhanced", version="2.2")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Error on {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"error": str(exc)})
+    return JSONResponse(status_code=500, content={"error": str(exc), "type": "server_error"})
 
 @app.post("/api/reset-database")
 async def reset_database(req: Request):
@@ -778,6 +854,37 @@ async def reset_database(req: Request):
     except Exception as e:
         raise HTTPException(500, str(e))
 
+@app.get("/api/trades-data")
+async def get_trades_data(page: int = 1, per_page: int = 50):
+    try:
+        offset = (page - 1) * per_page
+        rows = build_trade_rows(limit=per_page, offset=offset)
+        total = count_total_trades()
+        total_pages = (total + per_page - 1) // per_page
+        
+        return {
+            "ok": True,
+            "trades": rows,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "total_pages": total_pages
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting trades: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/charts-data")
+async def get_charts_data():
+    try:
+        data = get_chart_data()
+        return {"ok": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error getting chart data: {e}")
+        return {"ok": False, "error": str(e)}
+
 @app.get("/api/export-csv")
 async def export_csv():
     rows = build_trade_rows(limit=10000)
@@ -794,7 +901,7 @@ async def export_csv():
 async def root():
     return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8"><title>AI Trader Pro</title>
 <style>body{font-family:system-ui;padding:40px;background:#0b0f14;color:#e6edf3}h1{color:#6366f1}a{color:#8b5cf6}</style></head>
-<body><h1>AI Trader Pro v2.1</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
+<body><h1>AI Trader Pro v2.2</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
 <li><a href="/trades">📊 Dashboard</a></li><li><a href="/positions">📈 Positions</a></li>
 <li><a href="/history">📜 Historique</a></li><li><a href="/analytics">📊 Analytics</a></li>
 <li><a href="/health">🏥 Health</a></li><li><a href="/api/export-csv">📥 Export CSV</a></li></ul></body></html>""")
@@ -808,7 +915,7 @@ async def health_check():
     except Exception as e:
         db_status = f"error: {e}"
         db_records = 0
-    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.1"}
+    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.2"}
 
 @app.post("/tv-webhook")
 async def tv_webhook(req: Request):
@@ -951,9 +1058,10 @@ async def maybe_altseason_autonotify():
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
-    rows = build_trade_rows()
+    rows = build_trade_rows(limit=50)
     kpi = compute_kpis(rows)
     alt = compute_altseason_snapshot()
+    total_trades = count_total_trades()
     
     table_rows = ""
     for idx, r in enumerate(rows, start=1):
@@ -999,6 +1107,21 @@ async def trades_page():
                     pl_html = f'<span style="color:{pl_color};font-weight:700">+{pl_pct:.2f}%</span>'
             except:
                 pass
+        elif r["row_state"] == "normal" and r["entry"]:
+            # P&L temps réel pour trades en cours
+            try:
+                entry_price = float(r["entry"])
+                current_price = entry_price
+                if r["tp1"]:
+                    current_price = (float(r["tp1"]) + entry_price) / 2
+                pl_pct = ((current_price - entry_price) / entry_price) * 100
+                if r["side"] == "SHORT":
+                    pl_pct = -pl_pct
+                pl_color = "var(--success)" if pl_pct >= 0 else "var(--danger)"
+                pl_sign = "+" if pl_pct >= 0 else ""
+                pl_html = f'<span style="color:{pl_color};font-weight:700;opacity:0.7" class="tooltip" title="P&L estimé en cours">{pl_sign}{pl_pct:.2f}%*</span>'
+            except:
+                pass
         
         date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
         
@@ -1023,10 +1146,11 @@ async def trades_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard - AI Trader Pro</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>{get_base_css()}
 .search-bar{{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}}
 .search-bar:focus{{outline:none;border-color:var(--accent)}}
-.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
+.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:999;transition:all 0.3s}}
 .theme-toggle:hover{{transform:scale(1.1)}}
 body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
 .sortable{{cursor:pointer;user-select:none;position:relative}}
@@ -1034,12 +1158,9 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 .sortable::after{{content:'⇅';margin-left:8px;opacity:0.3}}
 .sortable.asc::after{{content:'↑';opacity:1}}
 .sortable.desc::after{{content:'↓';opacity:1}}
-.refresh-indicator{{position:fixed;top:20px;right:20px;padding:8px 16px;background:var(--success);color:white;border-radius:8px;font-size:12px;font-weight:700;opacity:0;transition:opacity 0.3s;z-index:1000}}
-.refresh-indicator.show{{opacity:1}}
     </style>
 </head>
 <body>
-    <div class="refresh-indicator" id="refreshIndicator">Mise à jour...</div>
     <button class="theme-toggle" onclick="toggleTheme()" title="Changer le thème">🌓</button>
     <div class="app">
         {generate_sidebar_html("dashboard", kpi)}
@@ -1050,25 +1171,29 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
             </header>
             
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:32px">
-                <div class="panel" style="background:linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.1))">
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.1))">
                     <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TRADES (24H)</div>
                     <div style="font-size:32px;font-weight:900;color:var(--success)">{kpi['total_trades']}</div>
+                    <span class="tooltiptext">Nombre total de trades ouverts dans les dernières 24 heures</span>
                 </div>
-                <div class="panel" style="background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1))">
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1))">
                     <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">POSITIONS ACTIVES</div>
                     <div style="font-size:32px;font-weight:900;color:var(--accent)">{kpi['active_trades']}</div>
+                    <span class="tooltiptext">Positions ouvertes en attente de TP ou SL</span>
                 </div>
-                <div class="panel" style="background:linear-gradient(135deg,rgba(245,158,11,0.1),rgba(251,191,36,0.1))">
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(245,158,11,0.1),rgba(251,191,36,0.1))">
                     <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TP ATTEINTS</div>
                     <div style="font-size:32px;font-weight:900;color:var(--warning)">{kpi['tp_hits']}</div>
+                    <span class="tooltiptext">Nombre de Take Profit atteints (TP1, TP2, TP3)</span>
                 </div>
-                <div class="panel" style="background:linear-gradient(135deg,rgba(168,85,247,0.1),rgba(217,70,239,0.1))">
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(168,85,247,0.1),rgba(217,70,239,0.1))">
                     <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">WIN RATE</div>
                     <div style="font-size:32px;font-weight:900;color:var(--purple)">{kpi['winrate']}%</div>
+                    <span class="tooltiptext">Pourcentage de trades gagnants (TP) vs perdants (SL)</span>
                 </div>
             </div>
 
-            <div class="panel" style="margin-bottom:24px">
+            <div class="panel tooltip" style="margin-bottom:24px">
                 <h2 style="font-size:20px;font-weight:800;margin-bottom:16px">🌊 Altseason Index</h2>
                 <div style="display:flex;align-items:center;gap:24px;margin-bottom:16px">
                     <div style="flex:1">
@@ -1082,10 +1207,16 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     </div>
                 </div>
                 <div style="font-size:12px;color:var(--muted);font-style:italic">{alt['disclaimer']}</div>
+                <span class="tooltiptext">Score composite basé sur: ratio LONG/SHORT, ratio TP/SL, nombre de cryptos en gain, et momentum d'entrées récentes</span>
+            </div>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">📊 Performance (30 derniers jours)</h3>
+                <canvas id="performanceChart"></canvas>
             </div>
 
             <div class="panel">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:15px">
                     <h2 style="font-size:20px;font-weight:800">📊 Tous les Trades</h2>
                     <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Rechercher une crypto...">
                 </div>
@@ -1093,33 +1224,143 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     <table id="tradesTable">
                         <thead>
                             <tr>
-                                <th class="sortable" data-column="date">Date</th>
-                                <th class="sortable" data-column="crypto">Crypto</th>
-                                <th class="sortable" data-column="tf">TimeFrame</th>
-                                <th class="sortable" data-column="side">Status</th>
-                                <th>Entry</th>
-                                <th>TP1</th>
-                                <th>TP2</th>
-                                <th>TP3</th>
-                                <th>SL</th>
-                                <th class="sortable" data-column="pl">P&L</th>
-                                <th>Validation</th>
+                                <th class="sortable tooltip" data-column="date">Date<span class="tooltiptext">Date et heure d'ouverture du trade</span></th>
+                                <th class="sortable tooltip" data-column="crypto">Crypto<span class="tooltiptext">Symbole de la cryptomonnaie</span></th>
+                                <th class="sortable tooltip" data-column="tf">TimeFrame<span class="tooltiptext">Unité de temps du graphique (15m, 1h, 4h, etc.)</span></th>
+                                <th class="sortable tooltip" data-column="side">Status<span class="tooltiptext">Direction du trade (LONG = achat, SHORT = vente)</span></th>
+                                <th class="tooltip">Entry<span class="tooltiptext">Prix d'entrée du trade</span></th>
+                                <th class="tooltip">TP1<span class="tooltiptext">Premier objectif de profit (Take Profit 1)</span></th>
+                                <th class="tooltip">TP2<span class="tooltiptext">Deuxième objectif de profit (Take Profit 2)</span></th>
+                                <th class="tooltip">TP3<span class="tooltiptext">Troisième objectif de profit (Take Profit 3)</span></th>
+                                <th class="tooltip">SL<span class="tooltiptext">Stop Loss - Prix de protection contre les pertes</span></th>
+                                <th class="sortable tooltip" data-column="pl">P&L<span class="tooltiptext">Profit & Loss - Gain ou perte en pourcentage. * = estimation en cours</span></th>
+                                <th class="tooltip">Validation<span class="tooltiptext">État actuel du trade (TP atteint, SL touché, ou en cours)</span></th>
                             </tr>
                         </thead>
                         <tbody>{table_rows}</tbody>
                     </table>
                 </div>
+                <div class="pagination">
+                    <button onclick="changePage(1)" id="firstPage">⏮ Premier</button>
+                    <button onclick="changePage(currentPage - 1)" id="prevPage">◀ Précédent</button>
+                    <span id="pageInfo">Page <span id="currentPageNum">1</span> sur <span id="totalPages">1</span></span>
+                    <button onclick="changePage(currentPage + 1)" id="nextPage">Suivant ▶</button>
+                    <button onclick="changePage(totalPagesCount)" id="lastPage">Dernier ⏭</button>
+                </div>
             </div>
         </main>
     </div>
-    
-    <audio id="notificationSound" preload="auto">
-        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKfk77RgGwU7k9ryxXIpBSh+zPLaizsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvywnEpBSh+zPLajDsKGGS75eeXSgwKTKXh8LViFwU8ltvyw" type="audio/wav">
-    </audio>
 
     <script>
     let sortColumn = '';
     let sortDirection = 'asc';
+    let currentPage = 1;
+    let totalPagesCount = Math.ceil({total_trades} / 50);
+    let lastTradeCount = {total_trades};
+
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+
+    async function changePage(page) {{
+        if (page < 1 || page > totalPagesCount) return;
+        currentPage = page;
+        
+        try {{
+            const response = await fetch(`/api/trades-data?page=${{page}}&per_page=50`);
+            const data = await response.json();
+            
+            if (!data.ok) throw new Error(data.error);
+            
+            updateTable(data.trades);
+            updatePagination(data.pagination);
+        }} catch (error) {{
+            showError('Erreur de chargement des trades: ' + error.message);
+        }}
+    }}
+
+    function updateTable(trades) {{
+        const tbody = document.querySelector('#tradesTable tbody');
+        tbody.innerHTML = trades.map((r, idx) => {{
+            const state_class = r.row_state;
+            const side_badge = `<span class="badge badge-${{r.side ? r.side.toLowerCase() : 'pending'}}">${{r.side || 'N/A'}}</span>`;
+            const tf_badge = `<span class="badge badge-tf">${{r.tf_label}}</span>`;
+            
+            let status_html = "";
+            if (r.tp1_hit) status_html += '<span class="badge badge-tp">TP1 ✓</span> ';
+            if (r.tp2_hit) status_html += '<span class="badge badge-tp">TP2 ✓</span> ';
+            if (r.tp3_hit) status_html += '<span class="badge badge-tp">TP3 ✓</span> ';
+            if (r.sl_hit) status_html += '<span class="badge badge-sl">SL ✗</span>';
+            if (!status_html) status_html = '<span class="badge badge-pending">En cours</span>';
+            
+            const entry_val = r.entry ? r.entry.toFixed(4) : "N/A";
+            const tp1_val = r.tp1 ? r.tp1.toFixed(4) : "N/A";
+            const tp2_val = r.tp2 ? r.tp2.toFixed(4) : "N/A";
+            const tp3_val = r.tp3 ? r.tp3.toFixed(4) : "N/A";
+            const sl_val = r.sl ? r.sl.toFixed(4) : "N/A";
+            
+            let pl_html = "N/A";
+            if (r.entry && ['tp', 'sl'].includes(r.row_state)) {{
+                const entry_price = r.entry;
+                if (r.sl_hit && r.sl) {{
+                    let pl_pct = ((r.sl - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--danger);font-weight:700">${{pl_pct.toFixed(2)}}%</span>`;
+                }} else if (r.tp1_hit && r.tp1) {{
+                    let pl_pct = ((r.tp1 - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--success);font-weight:700">+${{pl_pct.toFixed(2)}}%</span>`;
+                }}
+            }}
+            
+            const date_str = new Date(r.t_entry).toLocaleString('fr-FR');
+            
+            return `<tr class="trade-row ${{state_class}}" data-symbol="${{r.symbol}}" data-side="${{r.side}}" data-tf="${{r.tf_label}}" data-date="${{r.t_entry}}">
+                <td>${{date_str}}</td>
+                <td><strong>${{r.symbol}}</strong></td>
+                <td>${{tf_badge}}</td>
+                <td>${{side_badge}}</td>
+                <td><strong style="color:var(--info)">${{entry_val}}</strong></td>
+                <td>${{tp1_val}}</td>
+                <td>${{tp2_val}}</td>
+                <td>${{tp3_val}}</td>
+                <td>${{sl_val}}</td>
+                <td>${{pl_html}}</td>
+                <td>${{status_html}}</td>
+            </tr>`;
+        }}).join('');
+    }}
+
+    function updatePagination(pagination) {{
+        currentPage = pagination.page;
+        totalPagesCount = pagination.total_pages;
+        
+        document.getElementById('currentPageNum').textContent = pagination.page;
+        document.getElementById('totalPages').textContent = pagination.total_pages;
+        
+        document.getElementById('firstPage').disabled = pagination.page === 1;
+        document.getElementById('prevPage').disabled = pagination.page === 1;
+        document.getElementById('nextPage').disabled = pagination.page === pagination.total_pages;
+        document.getElementById('lastPage').disabled = pagination.page === pagination.total_pages;
+    }}
+
+    function showError(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 5000);
+    }}
+
+    function showSuccess(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast success';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }}
 
     document.querySelectorAll('.sortable').forEach(header => {{
         header.addEventListener('click', function() {{
@@ -1134,8 +1375,8 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                 sortDirection = 'asc';
             }}
             
-            document.querySelectorAll('.sortable').forEach(h => h.className = 'sortable');
-            this.className = 'sortable ' + sortDirection;
+            document.querySelectorAll('.sortable').forEach(h => h.className = 'sortable tooltip');
+            this.className = 'sortable tooltip ' + sortDirection;
             
             rows.sort((a, b) => {{
                 let aVal, bVal;
@@ -1152,8 +1393,8 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     aVal = a.dataset.side;
                     bVal = b.dataset.side;
                 }} else if (column === 'pl') {{
-                    aVal = parseFloat(a.cells[9].textContent.replace('%', '')) || 0;
-                    bVal = parseFloat(b.cells[9].textContent.replace('%', '')) || 0;
+                    aVal = parseFloat(a.cells[9].textContent.replace('%', '').replace('+', '').replace('*', '')) || 0;
+                    bVal = parseFloat(b.cells[9].textContent.replace('%', '').replace('+', '').replace('*', '')) || 0;
                 }}
                 
                 if (sortDirection === 'asc') {{
@@ -1190,26 +1431,91 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
         document.body.classList.add('light-mode');
     }}
 
-    let lastDataHash = '';
+    // Charger les données de graphique
+    async function loadCharts() {{
+        try {{
+            const response = await fetch('/api/charts-data');
+            const result = await response.json();
+            
+            if (!result.ok) throw new Error(result.error);
+            
+            const data = result.data;
+            const ctx = document.getElementById('performanceChart').getContext('2d');
+            
+            new Chart(ctx, {{
+                type: 'line',
+                data: {{
+                    labels: data.daily.map(d => d.date),
+                    datasets: [
+                        {{
+                            label: 'Wins',
+                            data: data.daily.map(d => d.wins),
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            tension: 0.4
+                        }},
+                        {{
+                            label: 'Losses',
+                            data: data.daily.map(d => d.losses),
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            tension: 0.4
+                        }}
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {{
+                        legend: {{
+                            labels: {{ color: '#e2e8f0' }}
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }},
+                        x: {{
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }}
+                    }}
+                }}
+            }});
+        }} catch (error) {{
+            console.error('Erreur chargement graphiques:', error);
+            showError('Impossible de charger les graphiques');
+        }}
+    }}
+
+    loadCharts();
+
+    // Vérifier les nouveaux trades toutes les 30 secondes
     setInterval(async function() {{
         try {{
-            const response = await fetch('/trades');
-            const html = await response.text();
-            const newHash = html.length;
+            const response = await fetch('/api/trades-data?page=1&per_page=1');
+            const data = await response.json();
             
-            if (lastDataHash && newHash !== lastDataHash) {{
-                const indicator = document.getElementById('refreshIndicator');
-                indicator.classList.add('show');
-                setTimeout(() => indicator.classList.remove('show'), 2000);
+            if (data.ok && data.pagination.total > lastTradeCount) {{
+                const newCount = data.pagination.total - lastTradeCount;
+                lastTradeCount = data.pagination.total;
                 
-                const audio = document.getElementById('notificationSound');
-                audio.play().catch(e => console.log('Audio play failed:', e));
+                const badge = document.getElementById('newTradesBadge');
+                if (badge) {{
+                    badge.textContent = newCount;
+                    badge.style.display = 'inline-flex';
+                }}
                 
-                setTimeout(() => location.reload(), 2000);
+                showSuccess(`${{newCount}} nouveau(x) trade(s) !`);
+                
+                if (currentPage === 1) {{
+                    changePage(1);
+                }}
             }}
-            lastDataHash = newHash;
         }} catch (e) {{
-            console.log('Refresh check failed:', e);
+            console.log('Vérification des nouveaux trades échouée:', e);
         }}
     }}, 30000);
     </script>
@@ -1219,7 +1525,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
 @app.get("/positions", response_class=HTMLResponse)
 async def positions_page():
-    rows = [r for r in build_trade_rows() if r["row_state"] == "normal"]
+    rows = [r for r in build_trade_rows(limit=1000) if r["row_state"] == "normal"]
     kpi = compute_kpis(rows)
     
     table_rows = ""
@@ -1254,11 +1560,7 @@ async def positions_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Positions Actives - AI Trader Pro</title>
-    <style>{get_base_css()}
-.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-.theme-toggle:hover{{transform:scale(1.1)}}
-body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-    </style>
+    <style>{get_base_css()}</style>
 </head>
 <body>
     <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
@@ -1300,6 +1602,10 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
     if (localStorage.getItem('theme') === 'light') {{
         document.body.classList.add('light-mode');
     }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
     </script>
 </body>
 </html>'''
@@ -1307,7 +1613,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
 @app.get("/history", response_class=HTMLResponse)
 async def history_page():
-    rows = [r for r in build_trade_rows() if r["row_state"] in ("tp", "sl", "cancel")]
+    rows = [r for r in build_trade_rows(limit=1000) if r["row_state"] in ("tp", "sl", "cancel")]
     kpi = compute_kpis(rows)
     
     table_rows = ""
@@ -1368,11 +1674,7 @@ async def history_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Historique - AI Trader Pro</title>
-    <style>{get_base_css()}
-.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-.theme-toggle:hover{{transform:scale(1.1)}}
-body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-    </style>
+    <style>{get_base_css()}</style>
 </head>
 <body>
     <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
@@ -1416,6 +1718,10 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
     if (localStorage.getItem('theme') === 'light') {{
         document.body.classList.add('light-mode');
     }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
     </script>
 </body>
 </html>'''
@@ -1423,7 +1729,7 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page():
-    rows = build_trade_rows()
+    rows = build_trade_rows(limit=10000)
     kpi = compute_kpis(rows)
     alt = compute_altseason_snapshot()
     
@@ -1514,11 +1820,8 @@ async def analytics_page():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Analytics - AI Trader Pro</title>
-    <style>{get_base_css()}
-.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:1000;transition:all 0.3s}}
-.theme-toggle:hover{{transform:scale(1.1)}}
-body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>{get_base_css()}</style>
 </head>
 <body>
     <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
@@ -1532,25 +1835,33 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
             <div class="chart-container">
                 <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics Globales</h3>
-                <div class="bar">
-                    <div class="bar-label">Win Rate</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{kpi['winrate']}%"></div></div>
-                    <div class="bar-value">{kpi['winrate']}%</div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">Win Rate</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{kpi['winrate']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{kpi['winrate']}%</div>
                 </div>
-                <div class="bar">
-                    <div class="bar-label">LONG Ratio</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['long_ratio']}%"></div></div>
-                    <div class="bar-value">{alt['signals']['long_ratio']}%</div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">LONG Ratio</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['signals']['long_ratio']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['signals']['long_ratio']}%</div>
                 </div>
-                <div class="bar">
-                    <div class="bar-label">TP vs SL</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['signals']['tp_vs_sl']}%"></div></div>
-                    <div class="bar-value">{alt['signals']['tp_vs_sl']}%</div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">TP vs SL</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['signals']['tp_vs_sl']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['signals']['tp_vs_sl']}%</div>
                 </div>
-                <div class="bar">
-                    <div class="bar-label">Altseason</div>
-                    <div class="bar-track"><div class="bar-fill" style="width:{alt['score']}%"></div></div>
-                    <div class="bar-value">{alt['score']}/100</div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">Altseason</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['score']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['score']}/100</div>
                 </div>
             </div>
 
@@ -1567,6 +1878,11 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
                     <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Losses:</span> <strong style="color:var(--danger)">{kpi['losses']}</strong></div>
                     <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
                 </div>
+            </div>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">📈 Top 10 Cryptos par Volume</h3>
+                <canvas id="cryptoChart"></canvas>
             </div>
 
             <div class="panel">
@@ -1601,6 +1917,59 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
     if (localStorage.getItem('theme') === 'light') {{
         document.body.classList.add('light-mode');
     }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+    
+    // Charger graphique des top cryptos
+    async function loadCryptoChart() {{
+        try {{
+            const response = await fetch('/api/charts-data');
+            const result = await response.json();
+            
+            if (!result.ok) throw new Error(result.error);
+            
+            const data = result.data.top_cryptos;
+            const ctx = document.getElementById('cryptoChart').getContext('2d');
+            
+            new Chart(ctx, {{
+                type: 'bar',
+                data: {{
+                    labels: data.map(d => d.symbol),
+                    datasets: [{{
+                        label: 'Nombre de trades',
+                        data: data.map(d => d.count),
+                        backgroundColor: 'rgba(99, 102, 241, 0.6)',
+                        borderColor: '#6366f1',
+                        borderWidth: 2
+                    }}]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {{
+                        legend: {{ display: false }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }},
+                        x: {{
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ display: false }}
+                        }}
+                    }}
+                }}
+            }});
+        }} catch (error) {{
+            console.error('Erreur chargement graphique:', error);
+        }}
+    }}
+    
+    loadCryptoChart();
     </script>
 </body>
 </html>'''
@@ -1608,5 +1977,5 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting AI Trader Pro v2.1...")
+    logger.info("Starting AI Trader Pro v2.2...")
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
