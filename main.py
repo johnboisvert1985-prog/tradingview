@@ -536,6 +536,17 @@ def build_trade_rows(limit=300, offset=0):
         closed = bool(hm.get("CLOSE"))
         cancelled = _cancelled_by_opposite(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
         
+        # Récupérer les timestamps des TP touchés
+        tp_times = {}
+        if tp1_hit or tp2_hit or tp3_hit:
+            tp_events = db_query("""
+                SELECT type, time FROM events 
+                WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT')
+                ORDER BY time ASC
+            """, (e["trade_id"],))
+            for tp_event in tp_events:
+                tp_times[tp_event["type"]] = tp_event["time"]
+        
         if sl_hit:
             state = "sl"
         elif tp1_hit or tp2_hit or tp3_hit:
@@ -560,6 +571,9 @@ def build_trade_rows(limit=300, offset=0):
             "tp2_hit": tp2_hit,
             "tp3_hit": tp3_hit,
             "sl_hit": sl_hit,
+            "tp1_time": tp_times.get("TP1_HIT"),
+            "tp2_time": tp_times.get("TP2_HIT"),
+            "tp3_time": tp_times.get("TP3_HIT"),
             "row_state": state,
             "t_entry": item["t_entry"]
         })
@@ -1082,9 +1096,38 @@ async def trades_page():
             status_html = '<span class="badge badge-pending">En cours</span>'
         
         entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
-        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
-        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
-        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        
+        # TP avec indicateurs visuels et tooltips si atteints
+        if r["tp1"]:
+            if r["tp1_hit"]:
+                tp1_time = datetime.fromtimestamp(r.get("tp1_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp1_time") else ""
+                tooltip = f' title="Atteint à {tp1_time}"' if tp1_time else ''
+                tp1_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp1"]:.4f} ✓</span>'
+            else:
+                tp1_val = f'<span style="opacity:0.6">{r["tp1"]:.4f}</span>'
+        else:
+            tp1_val = "N/A"
+            
+        if r["tp2"]:
+            if r["tp2_hit"]:
+                tp2_time = datetime.fromtimestamp(r.get("tp2_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp2_time") else ""
+                tooltip = f' title="Atteint à {tp2_time}"' if tp2_time else ''
+                tp2_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp2"]:.4f} ✓</span>'
+            else:
+                tp2_val = f'<span style="opacity:0.6">{r["tp2"]:.4f}</span>'
+        else:
+            tp2_val = "N/A"
+            
+        if r["tp3"]:
+            if r["tp3_hit"]:
+                tp3_time = datetime.fromtimestamp(r.get("tp3_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp3_time") else ""
+                tooltip = f' title="Atteint à {tp3_time}"' if tp3_time else ''
+                tp3_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp3"]:.4f} ✓</span>'
+            else:
+                tp3_val = f'<span style="opacity:0.6">{r["tp3"]:.4f}</span>'
+        else:
+            tp3_val = "N/A"
+        
         sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
         
         pl_html = "N/A"
@@ -1296,9 +1339,41 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
             if (!status_html) status_html = '<span class="badge badge-pending">En cours</span>';
             
             const entry_val = r.entry ? r.entry.toFixed(4) : "N/A";
-            const tp1_val = r.tp1 ? r.tp1.toFixed(4) : "N/A";
-            const tp2_val = r.tp2 ? r.tp2.toFixed(4) : "N/A";
-            const tp3_val = r.tp3 ? r.tp3.toFixed(4) : "N/A";
+            
+            // TP avec indicateurs visuels
+            let tp1_val = "N/A";
+            if (r.tp1) {{
+                if (r.tp1_hit) {{
+                    const tp1_time = r.tp1_time ? new Date(r.tp1_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp1_time ? ` title="Atteint à ${{tp1_time}}"` : '';
+                    tp1_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp1.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp1_val = `<span style="opacity:0.6">${{r.tp1.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp2_val = "N/A";
+            if (r.tp2) {{
+                if (r.tp2_hit) {{
+                    const tp2_time = r.tp2_time ? new Date(r.tp2_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp2_time ? ` title="Atteint à ${{tp2_time}}"` : '';
+                    tp2_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp2.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp2_val = `<span style="opacity:0.6">${{r.tp2.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp3_val = "N/A";
+            if (r.tp3) {{
+                if (r.tp3_hit) {{
+                    const tp3_time = r.tp3_time ? new Date(r.tp3_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp3_time ? ` title="Atteint à ${{tp3_time}}"` : '';
+                    tp3_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp3.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp3_val = `<span style="opacity:0.6">${{r.tp3.toFixed(4)}}</span>`;
+                }}
+            }}
+            
             const sl_val = r.sl ? r.sl.toFixed(4) : "N/A";
             
             let pl_html = "N/A";
