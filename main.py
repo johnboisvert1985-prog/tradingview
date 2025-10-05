@@ -722,11 +722,14 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(circle
 .badge-sl{background:rgba(239,68,68,0.15);color:var(--danger);border:1px solid rgba(239,68,68,0.35)}
 .badge-cancel{background:rgba(100,116,139,0.15);color:var(--muted);border:1px solid rgba(100,116,139,0.35)}
 .badge-tf{background:rgba(6,182,212,0.15);color:var(--info);border:1px solid rgba(6,182,212,0.35)}
-table{width:100%;border-collapse:collapse}
-thead th{padding:16px 12px;text-align:left;font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border);white-space:nowrap}
-tbody tr{border-bottom:1px solid rgba(99,102,241,0.05);transition:all 0.3s;cursor:pointer}
+table{width:100%;border-collapse:collapse;display:table}
+thead{display:table-header-group}
+tbody{display:table-row-group}
+thead tr, tbody tr{display:grid;grid-template-columns:140px 120px 90px 100px 100px 100px 100px 100px 100px 100px 1fr;border-bottom:1px solid rgba(99,102,241,0.05)}
+thead th, tbody td{padding:16px 12px;text-align:left;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center}
+thead th{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;background:rgba(15,23,38,0.3);border-bottom:1px solid var(--border)}
+tbody tr{cursor:pointer;transition:all 0.3s}
 tbody tr:hover{background:rgba(99,102,241,0.08)}
-tbody td{padding:16px 12px;font-size:13px;white-space:nowrap}
 .trade-row{position:relative}
 .trade-row::before{content:'';position:absolute;left:0;top:0;width:4px;height:100%}
 .trade-row.tp::before{background:var(--success);box-shadow:0 0 16px var(--success)}
