@@ -1,5 +1,5 @@
-# main.py - AI Trader Pro v2.2 Enhanced
-# Professional Trading Dashboard with Advanced Features
+# main.py - AI Trader Pro v2.3 Enhanced & Patched
+# Professional Trading Dashboard with Security & Performance Fixes
 # Python 3.8+
 
 import os
@@ -16,14 +16,25 @@ from contextlib import contextmanager
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 import httpx
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # CONFIGURATION
 class Settings:
     DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
     DB_PATH = os.path.join(DB_DIR, "data.db")
-    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "nqgjiebqgiehgq8e76qhefjqer78gfq0eyrg")
+    
+    # CRITIQUE: Secret obligatoire sans valeur par défaut
+    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+    if not WEBHOOK_SECRET:
+        raise ValueError("❌ WEBHOOK_SECRET est obligatoire. Définissez-le: export WEBHOOK_SECRET='votre_secret_32_chars'")
+    
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
@@ -40,6 +51,10 @@ class Settings:
     VECTOR_DN_ICON = "🟥"
     VECTOR_GLOBAL_GAP_SEC = int(os.getenv("VECTOR_GLOBAL_GAP_SEC", "10"))
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    # Nouveaux paramètres de sécurité
+    MAX_TRADES_PER_REQUEST = int(os.getenv("MAX_TRADES_PER_REQUEST", "1000"))
+    ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "1") == "1"
 
 settings = Settings()
 os.makedirs(settings.DB_DIR, exist_ok=True)
@@ -64,7 +79,7 @@ try:
 except Exception as e:
     logger.warning(f"Could not create file handler: {e}")
 
-logger.info(f"AI Trader Pro v2.2 Enhanced - DB: {settings.DB_PATH}")
+logger.info(f"AI Trader Pro v2.3 Enhanced & Patched - DB: {settings.DB_PATH}")
 
 # PYDANTIC MODELS
 class WebhookPayload(BaseModel):
@@ -97,14 +112,40 @@ class WebhookPayload(BaseModel):
     def validate_type(cls, v):
         valid = ['ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE', 'VECTOR_CANDLE']
         if v not in valid:
-            raise ValueError(f'Type invalide: {v}')
+            raise ValueError(f'Type invalide: {v}. Valeurs acceptées: {", ".join(valid)}')
         return v
 
     @validator('side')
     def validate_side(cls, v):
         if v and v.upper() not in ['LONG', 'SHORT']:
-            raise ValueError(f'Side invalide: {v}')
+            raise ValueError(f'Side invalide: {v}. Valeurs acceptées: LONG, SHORT')
         return v.upper() if v else None
+
+    @validator('entry', 'sl', 'tp1', 'tp2', 'tp3', 'price')
+    def validate_positive_price(cls, v, field):
+        if v is not None and v <= 0:
+            raise ValueError(f'{field.name} doit être positif, reçu: {v}')
+        return v
+
+    @validator('confidence')
+    def validate_confidence(cls, v):
+        if v is not None and (v < 0 or v > 100):
+            raise ValueError(f'Confidence doit être entre 0 et 100, reçu: {v}')
+        return v
+
+    def validate_trade_logic(self):
+        """Validation de la cohérence du trade"""
+        if self.type == 'ENTRY' and self.entry and self.side:
+            if self.side == 'LONG':
+                if self.tp1 and self.tp1 <= self.entry:
+                    raise ValueError(f"LONG: TP1 ({self.tp1}) doit être > Entry ({self.entry})")
+                if self.sl and self.sl >= self.entry:
+                    raise ValueError(f"LONG: SL ({self.sl}) doit être < Entry ({self.entry})")
+            elif self.side == 'SHORT':
+                if self.tp1 and self.tp1 >= self.entry:
+                    raise ValueError(f"SHORT: TP1 ({self.tp1}) doit être < Entry ({self.entry})")
+                if self.sl and self.sl <= self.entry:
+                    raise ValueError(f"SHORT: SL ({self.sl}) doit être > Entry ({self.entry})")
 
 # DATABASE
 def dict_factory(cursor, row):
@@ -180,9 +221,9 @@ def init_database():
         ]
         for idx in indices:
             db_execute(idx)
-        logger.info("Database initialized")
+        logger.info("✅ Database initialized successfully")
     except Exception as e:
-        logger.error(f"DB init failed: {e}")
+        logger.error(f"❌ DB init failed: {e}")
         raise
 
 init_database()
@@ -211,8 +252,9 @@ def ensure_trades_schema():
             db_execute("ALTER TABLE events ADD COLUMN tf_label TEXT")
         if "created_at" not in cols:
             db_execute("ALTER TABLE events ADD COLUMN created_at INTEGER")
-    except:
-        pass
+        logger.info("✅ Schema check passed")
+    except Exception as e:
+        logger.error(f"Schema update error: {e}")
 
 def now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -235,8 +277,8 @@ def human_duration_verbose(ms: int) -> str:
 
 try:
     ensure_trades_schema()
-except:
-    pass
+except Exception as e:
+    logger.error(f"Schema check failed: {e}")
 
 # TELEGRAM
 _last_tg_sent: Dict[str, float] = {}
@@ -272,6 +314,7 @@ def _record_sent():
 async def tg_send_text(text: str, disable_web_page_preview: bool = True, key: Optional[str] = None, reply_markup: Optional[dict] = None, pin: bool = False) -> Dict[str, Any]:
     if not settings.TELEGRAM_ENABLED:
         return {"ok": False, "reason": "disabled"}
+    
     k = key or "default"
     now_ts = time.time()
     last = _last_tg_sent.get(k, 0.0)
@@ -338,7 +381,19 @@ def format_vector_message(symbol: str, tf_label: str, direction: str, price: Any
     note_text = f" — {note}" if note else ""
     return f"{icon} Vector Candle {direction.upper()} | <b>{symbol}</b> <i>{tf_label}</i> @ <code>{price}</code>{note_text}"
 
+# Cache pour Altseason
+_altseason_cache = {"data": None, "timestamp": 0}
+ALTSEASON_CACHE_TTL = 60  # 60 secondes
+
 def compute_altseason_snapshot() -> dict:
+    """Version avec cache de 60 secondes"""
+    now = time.time()
+    
+    # Vérifier le cache
+    if _altseason_cache["data"] and (now - _altseason_cache["timestamp"]) < ALTSEASON_CACHE_TTL:
+        return _altseason_cache["data"]
+    
+    # Calculer les données
     t24 = ms_ago(24*60)
     row = db_query("""
         SELECT SUM(CASE WHEN side='LONG' THEN 1 ELSE 0 END) AS long_n,
@@ -384,7 +439,7 @@ def compute_altseason_snapshot() -> dict:
     score = round((A + B + C + D) / 4.0)
     label = "Altseason (forte)" if score >= 75 else ("Altseason (modérée)" if score >= 50 else "Marché neutre/faible")
     
-    return {
+    result = {
         "score": int(score),
         "label": label,
         "window_minutes": 24*60,
@@ -392,6 +447,12 @@ def compute_altseason_snapshot() -> dict:
         "signals": {"long_ratio": round(A, 1), "tp_vs_sl": round(B, 1), "breadth_symbols": int(sym_gain), "recent_entries_ratio": round(D, 1)},
         "symbols_with_tp": symbol_list
     }
+    
+    # Mettre en cache
+    _altseason_cache["data"] = result
+    _altseason_cache["timestamp"] = now
+    
+    return result
 
 def build_confidence_line(payload: dict) -> str:
     entry = payload.get("entry")
@@ -706,7 +767,7 @@ def save_event(payload: WebhookPayload) -> str:
         logger.error(f"Save failed: {e}")
         raise
 
-# HTML COMPONENTS
+# HTML COMPONENTS (suite dans le prochain message car limite de caractères)
 def generate_sidebar_html(active_page: str, kpi: dict) -> str:
     new_trades_badge = f'<span class="new-badge" id="newTradesBadge" style="display:none">0</span>' if active_page == 'dashboard' else ''
     
@@ -823,6 +884,16 @@ tbody tr:hover{background:rgba(99,102,241,0.08)}
 .tooltip .tooltiptext{visibility:hidden;background:var(--panel);color:var(--txt);text-align:left;border-radius:8px;padding:10px;position:absolute;z-index:1;bottom:125%;left:50%;margin-left:-100px;width:200px;opacity:0;transition:opacity 0.3s;border:1px solid var(--border);font-size:12px;line-height:1.4}
 .tooltip:hover .tooltiptext{visibility:visible;opacity:1}
 .menu-toggle{display:none;position:fixed;top:20px;left:20px;z-index:101;width:48px;height:48px;background:var(--accent);border:none;border-radius:12px;color:white;font-size:24px;cursor:pointer;box-shadow:0 4px 20px var(--glow)}
+.search-bar{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}
+.search-bar:focus{outline:none;border-color:var(--accent)}
+.theme-toggle{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:999;transition:all 0.3s}
+.theme-toggle:hover{transform:scale(1.1)}
+body.light-mode{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}
+.sortable{cursor:pointer;user-select:none;position:relative}
+.sortable:hover{color:var(--accent)}
+.sortable::after{content:'⇅';margin-left:8px;opacity:0.3}
+.sortable.asc::after{content:'↑';opacity:1}
+.sortable.desc::after{content:'↓';opacity:1}
 @media(max-width:1200px){
 .sidebar{transform:translateX(-100%)}
 .sidebar.open{transform:translateX(0)}
@@ -836,12 +907,54 @@ thead tr, tbody tr{grid-template-columns:120px 100px 80px 90px 90px 90px 90px 90
 """
 
 # FASTAPI APP
-app = FastAPI(title="AI Trader Pro Enhanced", version="2.2")
+app = FastAPI(title="AI Trader Pro Enhanced", version="2.3")
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Error on {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"error": str(exc), "type": "server_error"})
+    logger.error(f"Unhandled error on {request.url.path}: {exc}", exc_info=True)
+    
+    if os.getenv("ENV") == "production":
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error", "type": "server_error"}
+        )
+    
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "type": type(exc).__name__}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(f"HTTP {exc.status_code} on {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail, "type": "http_error"}
+    )
 
 @app.post("/api/reset-database")
 async def reset_database(req: Request):
@@ -912,7 +1025,7 @@ async def export_csv():
 async def root():
     return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8"><title>AI Trader Pro</title>
 <style>body{font-family:system-ui;padding:40px;background:#0b0f14;color:#e6edf3}h1{color:#6366f1}a{color:#8b5cf6}</style></head>
-<body><h1>AI Trader Pro v2.2</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
+<body><h1>AI Trader Pro v2.3</h1><p>Système opérationnel</p><h2>Endpoints:</h2><ul>
 <li><a href="/trades">📊 Dashboard</a></li><li><a href="/positions">📈 Positions</a></li>
 <li><a href="/history">📜 Historique</a></li><li><a href="/analytics">📊 Analytics</a></li>
 <li><a href="/health">🏥 Health</a></li><li><a href="/api/export-csv">📥 Export CSV</a></li></ul></body></html>""")
@@ -926,22 +1039,27 @@ async def health_check():
     except Exception as e:
         db_status = f"error: {e}"
         db_records = 0
-    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.2"}
+    return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.3"}
 
 @app.post("/tv-webhook")
+@limiter.limit("100/minute")
 async def tv_webhook(req: Request):
     try:
         payload_dict = await req.json()
     except Exception as e:
+        logger.error(f"Invalid JSON payload: {e}")
         raise HTTPException(400, f"Invalid JSON: {e}")
     
     secret = payload_dict.get("secret")
-    if settings.WEBHOOK_SECRET and secret != settings.WEBHOOK_SECRET:
-        raise HTTPException(403, "Forbidden")
+    if secret != settings.WEBHOOK_SECRET:
+        logger.warning(f"Invalid secret attempt from {req.client.host if req.client else 'unknown'}")
+        raise HTTPException(403, "Forbidden: Invalid secret")
     
     try:
         payload = WebhookPayload(**payload_dict)
+        payload.validate_trade_logic()
     except Exception as e:
+        logger.error(f"Validation error: {e}")
         raise HTTPException(422, f"Validation error: {e}")
     
     trade_id = save_event(payload)
@@ -1185,18 +1303,7 @@ async def trades_page():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard - AI Trader Pro</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-    <style>{get_base_css()}
-.search-bar{{padding:12px 20px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;width:100%;max-width:400px;margin-bottom:20px}}
-.search-bar:focus{{outline:none;border-color:var(--accent)}}
-.theme-toggle{{position:fixed;bottom:20px;right:20px;width:50px;height:50px;border-radius:50%;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 4px 20px var(--glow);z-index:999;transition:all 0.3s}}
-.theme-toggle:hover{{transform:scale(1.1)}}
-body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--card:rgba(255,255,255,0.8);--border:rgba(99,102,241,0.2);--txt:#1a202c;--muted:#64748b}}
-.sortable{{cursor:pointer;user-select:none;position:relative}}
-.sortable:hover{{color:var(--accent)}}
-.sortable::after{{content:'⇅';margin-left:8px;opacity:0.3}}
-.sortable.asc::after{{content:'↑';opacity:1}}
-.sortable.desc::after{{content:'↓';opacity:1}}
-    </style>
+    <style>{get_base_css()}</style>
 </head>
 <body>
     <button class="theme-toggle" onclick="toggleTheme()" title="Changer le thème">🌓</button>
@@ -2129,5 +2236,6 @@ async def analytics_page():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting AI Trader Pro v2.2...")
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
+    port = int(os.getenv("PORT", "8000"))
+    logger.info("🚀 Starting AI Trader Pro v2.3...")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, log_level="info")
