@@ -1260,8 +1260,23 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
 
             <div class="panel">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:15px">
-                    <h2 style="font-size:20px;font-weight:800">📊 Tous les Trades</h2>
-                    <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Rechercher une crypto...">
+                    <div>
+                        <h2 style="font-size:20px;font-weight:800">📊 Tous les Trades</h2>
+                        <div style="font-size:12px;color:var(--muted);margin-top:8px">
+                            <span style="color:var(--success);font-weight:600">✓ = TP atteint</span> • 
+                            <span style="opacity:0.6">Prix grisé = Non atteint</span> • 
+                            <span style="cursor:help" title="Survolez un TP atteint pour voir l'heure">Survolez pour l'heure</span>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                        <select id="filterSelect" style="padding:10px 16px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;cursor:pointer">
+                            <option value="all">Tous les trades ({total_trades})</option>
+                            <option value="tp">Avec TP atteints</option>
+                            <option value="sl">Avec SL touchés</option>
+                            <option value="active">En cours ({kpi['active_trades']})</option>
+                        </select>
+                        <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Rechercher une crypto...">
+                    </div>
                 </div>
                 <div style="overflow-x:auto">
                     <table id="tradesTable">
@@ -1497,6 +1512,38 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
         }});
     }});
 
+    document.getElementById('filterSelect').addEventListener('change', function(e) {{
+        const filterValue = e.target.value;
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        
+        rows.forEach(row => {{
+            const rowClass = row.className;
+            let shouldShow = true;
+            
+            if (filterValue === 'tp') {{
+                // Afficher seulement les trades avec TP atteints (classe tp)
+                shouldShow = rowClass.includes('trade-row tp');
+            }} else if (filterValue === 'sl') {{
+                // Afficher seulement les trades avec SL touchés (classe sl)
+                shouldShow = rowClass.includes('trade-row sl');
+            }} else if (filterValue === 'active') {{
+                // Afficher seulement les trades en cours (classe normal)
+                shouldShow = rowClass.includes('trade-row normal');
+            }}
+            // Si filterValue === 'all', shouldShow reste true
+            
+            // Respecter aussi le filtre de recherche
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const symbol = row.dataset.symbol.toLowerCase();
+            
+            if (shouldShow && (!searchTerm || symbol.includes(searchTerm))) {{
+                row.style.display = '';
+            }} else {{
+                row.style.display = 'none';
+            }}
+        }});
+    }});
+
     function toggleTheme() {{
         document.body.classList.toggle('light-mode');
         localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
@@ -1505,6 +1552,32 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
     if (localStorage.getItem('theme') === 'light') {{
         document.body.classList.add('light-mode');
     }}
+
+    // Mettre à jour les compteurs du filtre
+    function updateFilterCounts() {{
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        let tpCount = 0;
+        let slCount = 0;
+        let activeCount = 0;
+        
+        rows.forEach(row => {{
+            const rowClass = row.className;
+            if (rowClass.includes('trade-row tp')) tpCount++;
+            if (rowClass.includes('trade-row sl')) slCount++;
+            if (rowClass.includes('trade-row normal')) activeCount++;
+        }});
+        
+        const filterSelect = document.getElementById('filterSelect');
+        filterSelect.innerHTML = `
+            <option value="all">Tous les trades (${{rows.length}})</option>
+            <option value="tp">✅ Avec TP atteints (${{tpCount}})</option>
+            <option value="sl">🛑 Avec SL touchés (${{slCount}})</option>
+            <option value="active">⏳ En cours (${{activeCount}})</option>
+        `;
+    }}
+    
+    // Appeler au chargement
+    updateFilterCounts();
 
     // Charger les données de graphique
     async function loadCharts() {{
