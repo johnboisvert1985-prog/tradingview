@@ -1,20 +1,22 @@
+# Core FastAPI
 fastapi==0.115.0
-uvicorn==0.30.6
+uvicorn[standard]==0.30.6
+pydantic==2.5.0
+
+# HTTP Client (httpx/httpcore pin pour éviter les soucis de proxies args)
+httpx==0.27.2
+httpcore==1.0.5
+
+# Rate Limiting (OBLIGATOIRE pour v2.3)
+slowapi==0.1.9
+
+# Utilities
+python-dotenv==1.0.1
+python-multipart==0.0.6
+
+# OpenAI
 openai==1.51.0
-httpx==0.27.2
-httpcore==1.0.5
-python-dotenv==1.0.1
-requests==2.32.3
 
-# httpx/httpcore pin pour éviter les soucis de proxies args
-httpx==0.27.2
-httpcore==1.0.5
-
-python-dotenv==1.0.1
-
-# --- Ajouts pour Altseason (fetch + parsing) ---
+# Ajouts pour Altseason (fetch + parsing)
 requests==2.32.3
 beautifulsoup4==4.12.3
-
-
-
