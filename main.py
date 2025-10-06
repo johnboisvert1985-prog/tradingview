@@ -1047,16 +1047,16 @@ async def health_check():
 
 @app.post("/tv-webhook")
 @limiter.limit("100/minute")
-async def tv_webhook(req: Request):
+async def tv_webhook(request: Request):
     try:
-        payload_dict = await req.json()
+        payload_dict = await request.json()
     except Exception as e:
         logger.error(f"Invalid JSON payload: {e}")
         raise HTTPException(400, f"Invalid JSON: {e}")
     
     secret = payload_dict.get("secret")
     if secret != settings.WEBHOOK_SECRET:
-        logger.warning(f"Invalid secret attempt from {req.client.host if req.client else 'unknown'}")
+        logger.warning(f"Invalid secret attempt from {request.client.host if request.client else 'unknown'}")
         raise HTTPException(403, "Forbidden: Invalid secret")
     
     try:
