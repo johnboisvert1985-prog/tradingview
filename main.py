@@ -536,7 +536,6 @@ def build_trade_rows(limit=300, offset=0):
         closed = bool(hm.get("CLOSE"))
         cancelled = _cancelled_by_opposite(e) and not (tp1_hit or tp2_hit or tp3_hit or sl_hit)
         
-        # Récupérer les timestamps des TP touchés
         tp_times = {}
         if tp1_hit or tp2_hit or tp3_hit:
             tp_events = db_query("""
@@ -617,7 +616,6 @@ def compute_kpis(rows: List[dict]) -> Dict[str, Any]:
 def get_chart_data() -> dict:
     t30d = ms_ago(30*24*60)
     
-    # Daily wins/losses
     daily_data = db_query("""
         WITH RECURSIVE dates(d) AS (
             SELECT date('now', '-29 days')
@@ -645,7 +643,6 @@ def get_chart_data() -> dict:
         ORDER BY dates.d
     """, (t30d, t30d))
     
-    # Top cryptos by trade count
     top_cryptos = db_query("""
         SELECT symbol, COUNT(DISTINCT trade_id) as count
         FROM events
@@ -1097,7 +1094,6 @@ async def trades_page():
         
         entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
         
-        # TP avec indicateurs visuels et tooltips si atteints
         if r["tp1"]:
             if r["tp1_hit"]:
                 tp1_time = datetime.fromtimestamp(r.get("tp1_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp1_time") else ""
@@ -1151,7 +1147,6 @@ async def trades_page():
             except:
                 pass
         elif r["row_state"] == "normal" and r["entry"]:
-            # P&L temps réel pour trades en cours
             try:
                 entry_price = float(r["entry"])
                 current_price = entry_price
@@ -1337,6 +1332,146 @@ body.light-mode{{--bg:#f0f4f8;--sidebar:#ffffff;--panel:rgba(255,255,255,0.9);--
             
             updateTable(data.trades);
             updatePagination(data.pagination);
+        }} catch (error) {{
+            showError('Erreur de chargement des trades: ' + error.message);
+        }}
+    }}
+
+    function updateTable(trades) {{
+        const tbody = document.querySelector('#tradesTable tbody');
+        tbody.innerHTML = trades.map((r, idx) => {{
+            const state_class = r.row_state;
+            const side_badge = `<span class="badge badge-${{r.side ? r.side.toLowerCase() : 'pending'}}">${{r.side || 'N/A'}}</span>`;
+            const tf_badge = `<span class="badge badge-tf">${{r.tf_label}}</span>`;
+            
+            let status_html = "";
+            if (r.tp1_hit) status_html += '<span class="badge badge-tp">TP1 ✓</span> ';
+            if (r.tp2_hit) status_html += '<span class="badge badge-tp">TP2 ✓</span> ';
+            if (r.tp3_hit) status_html += '<span class="badge badge-tp">TP3 ✓</span> ';
+            if (r.sl_hit) status_html += '<span class="badge badge-sl">SL ✗</span>';
+            if (!status_html) status_html = '<span class="badge badge-pending">En cours</span>';
+            
+            const entry_val = r.entry ? r.entry.toFixed(4) : "N/A";
+            
+            let tp1_val = "N/A";
+            if (r.tp1) {{
+                if (r.tp1_hit) {{
+                    const tp1_time = r.tp1_time ? new Date(r.tp1_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp1_time ? ` title="Atteint à ${{tp1_time}}"` : '';
+                    tp1_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp1.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp1_val = `<span style="opacity:0.6">${{r.tp1.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp2_val = "N/A";
+            if (r.tp2) {{
+                if (r.tp2_hit) {{
+                    const tp2_time = r.tp2_time ? new Date(r.tp2_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp2_time ? ` title="Atteint à ${{tp2_time}}"` : '';
+                    tp2_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp2.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp2_val = `<span style="opacity:0.6">${{r.tp2.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp3_val = "N/A";
+            if (r.tp3) {{
+                if (r.tp3_hit) {{
+                    const tp3_time = r.tp3_time ? new Date(r.tp3_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp3_time ? ` title="Atteint à ${{tp3_time}}"` : '';
+                    tp3_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp3.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp3_val = `<span style="opacity:0.6">${{r.tp3.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            const sl_val = r.sl ? r.sl.toFixed(4) : "N/A";
+            
+            let pl_html = "N/A";
+            if (r.entry && ['tp', 'sl'].includes(r.row_state)) {{
+                const entry_price = r.entry;
+                if (r.sl_hit && r.sl) {{
+                    let pl_pct = ((r.sl - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--danger);font-weight:700">${{pl_pct.toFixed(2)}}%</span>`;
+                }} else if (r.tp1_hit && r.tp1) {{
+                    let pl_pct = ((r.tp1 - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--success);font-weight:700">+${{pl_pct.toFixed(2)}}%</span>`;
+                }}
+            }}
+            
+            const date_str = new Date(r.t_entry).toLocaleString('fr-FR');
+            
+            return `<tr class="trade-row ${{state_class}}" data-symbol="${{r.symbol}}" data-side="${{r.side}}" data-tf="${{r.tf_label}}" data-date="${{r.t_entry}}">
+                <td>${{date_str}}</td>
+                <td><strong>${{r.symbol}}</strong></td>
+                <td>${{tf_badge}}</td>
+                <td>${{side_badge}}</td>
+                <td><strong style="color:var(--info)">${{entry_val}}</strong></td>
+                <td>${{tp1_val}}</td>
+                <td>${{tp2_val}}</td>
+                <td>${{tp3_val}}</td>
+                <td>${{sl_val}}</td>
+                <td>${{pl_html}}</td>
+                <td>${{status_html}}</td>
+            </tr>`;
+        }}).join('');
+    }}
+
+    function updatePagination(pagination) {{
+        currentPage = pagination.page;
+        totalPagesCount = pagination.total_pages;
+        
+        document.getElementById('currentPageNum').textContent = pagination.page;
+        document.getElementById('totalPages').textContent = pagination.total_pages;
+        
+        document.getElementById('firstPage').disabled = pagination.page === 1;
+        document.getElementById('prevPage').disabled = pagination.page === 1;
+        document.getElementById('nextPage').disabled = pagination.page === pagination.total_pages;
+        document.getElementById('lastPage').disabled = pagination.page === pagination.total_pages;
+    }}
+
+    function showError(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 5000);
+    }}
+
+    function showSuccess(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast success';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }}
+
+    async function resetDatabase() {{
+        if (!confirm('⚠️ ATTENTION : Cela va supprimer TOUS les trades. Une sauvegarde sera créée. Continuer ?')) {{
+            return;
+        }}
+        
+        const secret = prompt('Entrez votre webhook secret pour confirmer :');
+        if (!secret) return;
+        
+        try {{
+            const response = await fetch('/api/reset-database', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{secret: secret}})
+            }});
+            
+            const data = await response.json();
+            
+            if (data.ok) {{
+                showSuccess('✅ Base réinitialisée ! Backup: ' + data.backup);
+                setTimeout(() => location.reload(), 2000);
+            }} else {{
+                showError('❌ Erreur: ' + (data.error || 'Secret invalide'));
+            }}
         }} catch (error) {{
             showError('❌ Erreur: ' + error.message);
         }}
@@ -1766,18 +1901,7 @@ async def analytics_page():
     for r in rows:
         symbol = r["symbol"]
         if symbol not in crypto_stats:
-            crypto_stats[symbol] = {
-                "total": 0,
-                "wins": 0,
-                "losses": 0,
-                "pending": 0,
-                "tp1": 0,
-                "tp2": 0,
-                "tp3": 0,
-                "sl": 0,
-                "total_pl": 0.0,
-                "trades": []
-            }
+            crypto_stats[symbol] = {"total": 0, "wins": 0, "losses": 0, "pending": 0, "tp1": 0, "tp2": 0, "tp3": 0, "sl": 0, "total_pl": 0.0, "trades": []}
         
         crypto_stats[symbol]["total"] += 1
         crypto_stats[symbol]["trades"].append(r)
@@ -2007,145 +2131,3 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting AI Trader Pro v2.2...")
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
-) {{
-            showError('Erreur de chargement des trades: ' + error.message);
-        }}
-    }}
-
-    function updateTable(trades) {{
-        const tbody = document.querySelector('#tradesTable tbody');
-        tbody.innerHTML = trades.map((r, idx) => {{
-            const state_class = r.row_state;
-            const side_badge = `<span class="badge badge-${{r.side ? r.side.toLowerCase() : 'pending'}}">${{r.side || 'N/A'}}</span>`;
-            const tf_badge = `<span class="badge badge-tf">${{r.tf_label}}</span>`;
-            
-            let status_html = "";
-            if (r.tp1_hit) status_html += '<span class="badge badge-tp">TP1 ✓</span> ';
-            if (r.tp2_hit) status_html += '<span class="badge badge-tp">TP2 ✓</span> ';
-            if (r.tp3_hit) status_html += '<span class="badge badge-tp">TP3 ✓</span> ';
-            if (r.sl_hit) status_html += '<span class="badge badge-sl">SL ✗</span>';
-            if (!status_html) status_html = '<span class="badge badge-pending">En cours</span>';
-            
-            const entry_val = r.entry ? r.entry.toFixed(4) : "N/A";
-            
-            // TP avec indicateurs visuels
-            let tp1_val = "N/A";
-            if (r.tp1) {{
-                if (r.tp1_hit) {{
-                    const tp1_time = r.tp1_time ? new Date(r.tp1_time).toLocaleTimeString('fr-FR') : '';
-                    const tooltip = tp1_time ? ` title="Atteint à ${{tp1_time}}"` : '';
-                    tp1_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp1.toFixed(4)}} ✓</span>`;
-                }} else {{
-                    tp1_val = `<span style="opacity:0.6">${{r.tp1.toFixed(4)}}</span>`;
-                }}
-            }}
-            
-            let tp2_val = "N/A";
-            if (r.tp2) {{
-                if (r.tp2_hit) {{
-                    const tp2_time = r.tp2_time ? new Date(r.tp2_time).toLocaleTimeString('fr-FR') : '';
-                    const tooltip = tp2_time ? ` title="Atteint à ${{tp2_time}}"` : '';
-                    tp2_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp2.toFixed(4)}} ✓</span>`;
-                }} else {{
-                    tp2_val = `<span style="opacity:0.6">${{r.tp2.toFixed(4)}}</span>`;
-                }}
-            }}
-            
-            let tp3_val = "N/A";
-            if (r.tp3) {{
-                if (r.tp3_hit) {{
-                    const tp3_time = r.tp3_time ? new Date(r.tp3_time).toLocaleTimeString('fr-FR') : '';
-                    const tooltip = tp3_time ? ` title="Atteint à ${{tp3_time}}"` : '';
-                    tp3_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp3.toFixed(4)}} ✓</span>`;
-                }} else {{
-                    tp3_val = `<span style="opacity:0.6">${{r.tp3.toFixed(4)}}</span>`;
-                }}
-            }}
-            
-            const sl_val = r.sl ? r.sl.toFixed(4) : "N/A";
-            
-            let pl_html = "N/A";
-            if (r.entry && ['tp', 'sl'].includes(r.row_state)) {{
-                const entry_price = r.entry;
-                if (r.sl_hit && r.sl) {{
-                    let pl_pct = ((r.sl - entry_price) / entry_price) * 100;
-                    if (r.side === "SHORT") pl_pct = -pl_pct;
-                    pl_html = `<span style="color:var(--danger);font-weight:700">${{pl_pct.toFixed(2)}}%</span>`;
-                }} else if (r.tp1_hit && r.tp1) {{
-                    let pl_pct = ((r.tp1 - entry_price) / entry_price) * 100;
-                    if (r.side === "SHORT") pl_pct = -pl_pct;
-                    pl_html = `<span style="color:var(--success);font-weight:700">+${{pl_pct.toFixed(2)}}%</span>`;
-                }}
-            }}
-            
-            const date_str = new Date(r.t_entry).toLocaleString('fr-FR');
-            
-            return `<tr class="trade-row ${{state_class}}" data-symbol="${{r.symbol}}" data-side="${{r.side}}" data-tf="${{r.tf_label}}" data-date="${{r.t_entry}}">
-                <td>${{date_str}}</td>
-                <td><strong>${{r.symbol}}</strong></td>
-                <td>${{tf_badge}}</td>
-                <td>${{side_badge}}</td>
-                <td><strong style="color:var(--info)">${{entry_val}}</strong></td>
-                <td>${{tp1_val}}</td>
-                <td>${{tp2_val}}</td>
-                <td>${{tp3_val}}</td>
-                <td>${{sl_val}}</td>
-                <td>${{pl_html}}</td>
-                <td>${{status_html}}</td>
-            </tr>`;
-        }}).join('');
-    }}
-
-    function updatePagination(pagination) {{
-        currentPage = pagination.page;
-        totalPagesCount = pagination.total_pages;
-        
-        document.getElementById('currentPageNum').textContent = pagination.page;
-        document.getElementById('totalPages').textContent = pagination.total_pages;
-        
-        document.getElementById('firstPage').disabled = pagination.page === 1;
-        document.getElementById('prevPage').disabled = pagination.page === 1;
-        document.getElementById('nextPage').disabled = pagination.page === pagination.total_pages;
-        document.getElementById('lastPage').disabled = pagination.page === pagination.total_pages;
-    }}
-
-    function showError(message) {{
-        const toast = document.createElement('div');
-        toast.className = 'error-toast';
-        toast.textContent = message;
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 5000);
-    }}
-
-    function showSuccess(message) {{
-        const toast = document.createElement('div');
-        toast.className = 'error-toast success';
-        toast.textContent = message;
-        document.body.appendChild(toast);
-        setTimeout(() => toast.remove(), 3000);
-    }}
-
-    async function resetDatabase() {{
-        if (!confirm('⚠️ ATTENTION : Cela va supprimer TOUS les trades. Une sauvegarde sera créée. Continuer ?')) {{
-            return;
-        }}
-        
-        const secret = prompt('Entrez votre webhook secret pour confirmer :');
-        if (!secret) return;
-        
-        try {{
-            const response = await fetch('/api/reset-database', {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{secret: secret}})
-            }});
-            
-            const data = await response.json();
-            
-            if (data.ok) {{
-                showSuccess('✅ Base réinitialisée ! Backup: ' + data.backup);
-                setTimeout(() => location.reload(), 2000);
-            }} else {{
-                showError('❌ Erreur: ' + (data.error || 'Secret invalide'));
-            }}
-        }} catch (error
