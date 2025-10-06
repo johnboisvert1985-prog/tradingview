@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 import httpx
 
 # Rate limiting
@@ -108,26 +108,30 @@ class WebhookPayload(BaseModel):
     trade_id: Optional[str] = None
     secret: Optional[str] = None
 
-    @validator('type')
+    @field_validator('type')
+    @classmethod
     def validate_type(cls, v):
         valid = ['ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE', 'VECTOR_CANDLE']
         if v not in valid:
             raise ValueError(f'Type invalide: {v}. Valeurs acceptées: {", ".join(valid)}')
         return v
 
-    @validator('side')
+    @field_validator('side')
+    @classmethod
     def validate_side(cls, v):
         if v and v.upper() not in ['LONG', 'SHORT']:
             raise ValueError(f'Side invalide: {v}. Valeurs acceptées: LONG, SHORT')
         return v.upper() if v else None
 
-    @validator('entry', 'sl', 'tp1', 'tp2', 'tp3', 'price')
-    def validate_positive_price(cls, v, field):
+    @field_validator('entry', 'sl', 'tp1', 'tp2', 'tp3', 'price')
+    @classmethod
+    def validate_positive_price(cls, v):
         if v is not None and v <= 0:
-            raise ValueError(f'{field.name} doit être positif, reçu: {v}')
+            raise ValueError(f'Le prix doit être positif, reçu: {v}')
         return v
 
-    @validator('confidence')
+    @field_validator('confidence')
+    @classmethod
     def validate_confidence(cls, v):
         if v is not None and (v < 0 or v > 100):
             raise ValueError(f'Confidence doit être entre 0 et 100, reçu: {v}')
