@@ -6,6 +6,9 @@ httpcore==1.0.5
 python-dotenv==1.0.1
 requests==2.32.3
 beautifulsoup4==4.12.3
+pydantic==2.5.0
+slowapi==0.1.9
+python-multipart==0.0.6
 
 # httpx/httpcore pin pour éviter les soucis de proxies args
 httpx==0.27.2
@@ -21,4 +24,5 @@ beautifulsoup4==4.12.3
 git add requirements.txt
 git commit -m "Add slowapi dependency"
 git push origin main
+
 
