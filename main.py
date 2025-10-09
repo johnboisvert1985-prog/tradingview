@@ -657,6 +657,150 @@ async def trades_page():
     curr_equity = curve[-1]["equity"] if curve else settings.INITIAL_CAPITAL
     total_return = ((curr_equity - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL) * 100
     
+    # Charte méthodologie
+    methodology_chart = """
+    <div class="card" style="background:linear-gradient(135deg,rgba(99,102,241,0.05),rgba(139,92,246,0.05))">
+        <h2>📖 Méthodologie : Comment la Phase est Détectée</h2>
+        <p style="color:#64748b;margin-bottom:24px">Détection automatique basée sur les données réelles du marché crypto (CoinGecko API)</p>
+        
+        <div style="overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;font-size:14px">
+                <thead>
+                    <tr style="background:rgba(99,102,241,0.1)">
+                        <th style="padding:12px;text-align:left;border:1px solid rgba(99,102,241,0.2)">Phase</th>
+                        <th style="padding:12px;text-align:left;border:1px solid rgba(99,102,241,0.2)">Critères Principaux</th>
+                        <th style="padding:12px;text-align:left;border:1px solid rgba(99,102,241,0.2)">Seuils</th>
+                        <th style="padding:12px;text-align:left;border:1px solid rgba(99,102,241,0.2)">Signification</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            <strong style="color:#64748b">🐻 Phase 0</strong><br>
+                            <span style="font-size:12px;color:#64748b">Accumulation</span>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • Aucun critère atteint<br>
+                            • Marché latéral ou baissier
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • BTC 30d < 10%<br>
+                            • Dominance neutre
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            Zone d'accumulation, patience requise
+                        </td>
+                    </tr>
+                    <tr style="background:rgba(247,147,26,0.05)">
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            <strong style="color:#f7931a">₿ Phase 1</strong><br>
+                            <span style="font-size:12px;color:#64748b">Bitcoin Season</span>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • BTC surperforme tout<br>
+                            • Dominance BTC élevée<br>
+                            • BTC performance positive
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • <strong>BTC 30d > 10%</strong><br>
+                            • <strong>Dominance > 55%</strong><br>
+                            • Score = Perf × (Dom/50)
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            Bitcoin mène le marché, alts suivent faiblement
+                        </td>
+                    </tr>
+                    <tr style="background:rgba(98,126,234,0.05)">
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            <strong style="color:#627eea">💎 Phase 2</strong><br>
+                            <span style="font-size:12px;color:#64748b">ETH & Large-Cap</span>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • ETH ou Large-Caps > BTC<br>
+                            • ETH performance positive<br>
+                            • Large-Caps (SOL, BNB, ADA...)
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • <strong>ETH 30d > BTC 30d</strong><br>
+                            • <strong>ETH 30d > 5%</strong><br>
+                            • OU Large-Caps > BTC
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            Capital rotate vers ETH et grosses alts
+                        </td>
+                    </tr>
+                    <tr style="background:rgba(16,185,129,0.05)">
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            <strong style="color:#10b981">🚀 Phase 3</strong><br>
+                            <span style="font-size:12px;color:#64748b">Altcoin Season</span>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • Alts surperforment BTC & ETH<br>
+                            • Dominance BTC baisse<br>
+                            • Petites alts explosent
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • <strong>Alts 30d > BTC & ETH</strong><br>
+                            • <strong>Dominance < 55%</strong><br>
+                            • Score = Perf × 1.5
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            Phase euphorique, toutes les alts montent
+                        </td>
+                    </tr>
+                    <tr style="background:rgba(255,0,128,0.05)">
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            <strong style="color:#ff0080">🚀🔥 Phase 4</strong><br>
+                            <span style="font-size:12px;color:#64748b">MEGA BULL RUN</span>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • <strong>TOUT</strong> explose ensemble<br>
+                            • BTC, ETH, Large-Caps, Alts<br>
+                            • Marché en euphorie maximale
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            • <strong>BTC 30d > 15%</strong><br>
+                            • <strong>ETH 30d > 15%</strong><br>
+                            • <strong>Large-Caps > 15%</strong><br>
+                            • <strong>Alts > 15%</strong>
+                        </td>
+                        <td style="padding:12px;border:1px solid rgba(99,102,241,0.1)">
+                            🚨 Sommet probable proche, prenez profits
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <div style="margin-top:32px;padding:24px;background:rgba(99,102,241,0.1);border-radius:12px">
+            <h3 style="margin:0 0 16px 0;font-size:18px">📊 Données Sources (CoinGecko API)</h3>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px">
+                <div>
+                    <div style="font-size:12px;color:#64748b;margin-bottom:4px">Bitcoin</div>
+                    <div style="font-weight:700">Prix & Perf 30j</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#64748b;margin-bottom:4px">Ethereum</div>
+                    <div style="font-weight:700">Prix & Perf 30j</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#64748b;margin-bottom:4px">Large-Caps</div>
+                    <div style="font-weight:700">SOL, BNB, ADA, AVAX, DOT, MATIC, LINK</div>
+                </div>
+                <div>
+                    <div style="font-size:12px;color:#64748b;margin-bottom:4px">Dominance BTC</div>
+                    <div style="font-weight:700">Market Cap % Bitcoin</div>
+                </div>
+            </div>
+        </div>
+        
+        <div style="margin-top:16px;padding:16px;background:rgba(16,185,129,0.1);border-radius:8px;font-size:13px">
+            <strong style="color:#10b981">✅ Avantages :</strong> Détection objective et automatique, basée sur données réelles du marché, 
+            mise à jour toutes les 5 minutes, aucun biais émotionnel
+        </div>
+    </div>
+    """
+    
     return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Dashboard</title>{CSS}</head><body><div class="container"><div class="header"><h1>📊 Dashboard Principal</h1><p>Vue complète de vos trades 🔴 <strong>MARCHÉ RÉEL</strong></p></div>{NAV}
     
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
@@ -670,6 +814,8 @@ async def trades_page():
         <div id="p2" class="phase-indicator" style="color:#627eea"><div class="phase-number">💎</div><div style="flex:1"><div style="font-weight:700">Phase 2: ETH & Large-Cap</div><div style="font-size:12px;color:#64748b" id="p2s">--</div></div></div>
         <div id="p3" class="phase-indicator" style="color:#10b981"><div class="phase-number">🚀</div><div style="flex:1"><div style="font-weight:700">Phase 3: Altcoin Season</div><div style="font-size:12px;color:#64748b" id="p3s">--</div></div></div>
     </div>
+    
+    {methodology_chart}
     
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
         <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value">{len(rows)}</div></div>
@@ -836,6 +982,75 @@ async def altseason_page():
     
     <div style="margin-top:24px;padding:16px;background:rgba(99,102,241,0.1);border-radius:12px;font-size:14px;color:#64748b">
         💡 <strong>Source:</strong> Données en temps réel via CoinGecko API (gratuite) | ⏰ Rafraîchi toutes les 5 min
+    </div>
+    
+    <div class="card" style="background:linear-gradient(135deg,rgba(99,102,241,0.05),rgba(139,92,246,0.05));margin-top:24px">
+        <h2>📖 Comment l'Altseason est Détectée</h2>
+        <p style="color:#64748b;margin-bottom:24px">Méthodologie basée sur la performance relative des altcoins vs Bitcoin</p>
+        
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-bottom:24px">
+            <div style="padding:20px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:12px">
+                <div style="font-size:32px;margin-bottom:8px">🚀</div>
+                <h3 style="margin:0 0 8px 0;color:#10b981">Altseason Active</h3>
+                <ul style="margin:8px 0;padding-left:20px;font-size:14px">
+                    <li><strong>>75%</strong> des alts surperforment BTC</li>
+                    <li>Dominance BTC <strong>< 55%</strong></li>
+                    <li><strong>OU</strong> Moyenne alts > BTC ET > 20%</li>
+                </ul>
+                <div style="margin-top:12px;padding:8px;background:rgba(16,185,129,0.15);border-radius:6px;font-size:12px">
+                    💡 C'est le moment idéal pour trader les altcoins
+                </div>
+            </div>
+            
+            <div style="padding:20px;background:rgba(247,147,26,0.1);border:1px solid rgba(247,147,26,0.3);border-radius:12px">
+                <div style="font-size:32px;margin-bottom:8px">₿</div>
+                <h3 style="margin:0 0 8px 0;color:#f7931a">Bitcoin Domine</h3>
+                <ul style="margin:8px 0;padding-left:20px;font-size:14px">
+                    <li>BTC performe mieux que les alts</li>
+                    <li>Dominance BTC élevée</li>
+                    <li>Les alts suivent BTC passivement</li>
+                </ul>
+                <div style="margin-top:12px;padding:8px;background:rgba(247,147,26,0.15);border-radius:6px;font-size:12px">
+                    ⚠️ Concentrez-vous sur BTC ou attendez
+                </div>
+            </div>
+            
+            <div style="padding:20px;background:rgba(100,116,139,0.1);border:1px solid rgba(100,116,139,0.3);border-radius:12px">
+                <div style="font-size:32px;margin-bottom:8px">🔄</div>
+                <h3 style="margin:0 0 8px 0;color:#64748b">Phase Neutre</h3>
+                <ul style="margin:8px 0;padding-left:20px;font-size:14px">
+                    <li>Performance mixte</li>
+                    <li>Pas de tendance claire</li>
+                    <li>Marché en consolidation</li>
+                </ul>
+                <div style="margin-top:12px;padding:8px;background:rgba(100,116,139,0.15);border-radius:6px;font-size:12px">
+                    📊 Observez et préparez-vous
+                </div>
+            </div>
+        </div>
+        
+        <div style="padding:20px;background:rgba(99,102,241,0.1);border-radius:12px">
+            <h3 style="margin:0 0 12px 0;font-size:16px">📊 Métriques Calculées</h3>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;font-size:14px">
+                <div>
+                    <strong style="color:#6366f1">% Alts > BTC</strong>
+                    <div style="color:#64748b;font-size:12px;margin-top:4px">Combien d'altcoins surperforment Bitcoin sur 30 jours</div>
+                </div>
+                <div>
+                    <strong style="color:#6366f1">Performance Moyenne</strong>
+                    <div style="color:#64748b;font-size:12px;margin-top:4px">Moyenne arithmétique de tous les altcoins (30j)</div>
+                </div>
+                <div>
+                    <strong style="color:#6366f1">Dominance BTC</strong>
+                    <div style="color:#64748b;font-size:12px;margin-top:4px">% de la market cap totale détenu par Bitcoin</div>
+                </div>
+            </div>
+        </div>
+        
+        <div style="margin-top:16px;padding:12px;background:rgba(139,92,246,0.1);border-radius:8px;font-size:13px">
+            <strong>💡 Astuce :</strong> L'altseason arrive généralement après une forte montée de Bitcoin. 
+            Surveillez la rotation du capital de BTC vers ETH, puis vers les large-caps, et enfin vers les small-caps.
+        </div>
     </div></div></body></html>""")
 
 @app.get("/backtest", response_class=HTMLResponse)
