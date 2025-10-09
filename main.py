@@ -1,10 +1,9 @@
-# main.py - AI Trader Pro v3.0 ULTIMATE - Version ULTRA COMPLÈTE
+# main.py - AI Trader Pro v3.0 - Version COMPLÈTE ET CORRIGÉE
 # Python 3.8+
 
 import os
 import sqlite3
 import logging
-import asyncio
 import time
 import json
 import math
@@ -51,7 +50,7 @@ logger.setLevel(settings.LOG_LEVEL)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
-logger.info("🚀 AI Trader Pro v3.0 ULTIMATE Edition")
+logger.info("🚀 AI Trader Pro v3.0 ULTIMATE")
 
 class WebhookPayload(BaseModel):
     type: str
@@ -78,12 +77,6 @@ class WebhookPayload(BaseModel):
         if v not in ['ENTRY', 'TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'CLOSE']:
             raise ValueError(f'Type invalide: {v}')
         return v
-
-class JournalNote(BaseModel):
-    trade_id: str
-    note: Optional[str] = ""
-    emotion: Optional[str] = ""
-    tags: Optional[str] = ""
 
 def dict_factory(cursor, row):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
@@ -161,7 +154,7 @@ def build_trade_rows(limit=300):
         rows.append({
             "trade_id": e["trade_id"], "symbol": e["symbol"], "tf": e.get("tf"),
             "tf_label": e.get("tf_label") or tf_to_label(e.get("tf")),
-            "side": e["side"], "entry": e["entry"], "tp1": e["tp1"], "sl": e["sl"],
+            "side": e.get("side"), "entry": e.get("entry"), "tp1": e.get("tp1"), "sl": e.get("sl"),
             "tp1_hit": tp1_hit, "sl_hit": sl_hit,
             "row_state": "sl" if sl_hit else ("tp" if tp1_hit else "normal"),
             "t_entry": item["t_entry"], "confidence": e.get("confidence", 50)
@@ -185,180 +178,165 @@ async def fetch_fear_greed_index() -> Dict[str, Any]:
                 else: sentiment, emoji, color, rec = "Extreme Greed", "🤑", "#22c55e", "Prenez des profits"
                 
                 return {"value": value, "sentiment": sentiment, "emoji": emoji, "color": color, "recommendation": rec}
-    except: pass
+    except Exception as e:
+        logger.error(f"Fear & Greed error: {e}")
+    
     return {"value": 50, "sentiment": "Unknown", "emoji": "❓", "color": "#64748b", "recommendation": "Données non disponibles"}
 
 def detect_bullrun_phase(rows: List[dict]) -> Dict[str, Any]:
-    if len(rows) < 20:
-        return {
-            "phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b",
-            "description": "Pas assez de données", "confidence": 0,
-            "details": {"btc": {"winrate": 0, "avg_return": 0, "trades": 0},
-                       "eth": {"winrate": 0, "avg_return": 0, "trades": 0},
-                       "large_cap": {"winrate": 0, "avg_return": 0, "trades": 0},
-                       "small_alts": {"winrate": 0, "avg_return": 0, "trades": 0}}
+    """Détecte la phase du bull run - VERSION CORRIGÉE"""
+    
+    default_response = {
+        "phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b",
+        "description": "Pas assez de données", "confidence": 0,
+        "details": {
+            "btc": {"winrate": 0, "avg_return": 0, "trades": 0},
+            "eth": {"winrate": 0, "avg_return": 0, "trades": 0},
+            "large_cap": {"winrate": 0, "avg_return": 0, "trades": 0},
+            "small_alts": {"winrate": 0, "avg_return": 0, "trades": 0}
         }
+    }
     
-    def calc_perf(trades):
-        if not trades: return 0, 0
-        wins = sum(1 for t in trades if t["row_state"] == "tp")
-        wr = (wins / len(trades)) * 100
-        returns = []
-        for r in trades:
-            if r.get("entry"):
-                try:
-                    entry = float(r["entry"])
-                    exit_p = float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None
-                    if exit_p:
-                        pl = ((exit_p - entry) / entry) * 100
-                        if r.get("side") == "SHORT": pl = -pl
-                        returns.append(pl)
-                except: pass
-        return wr, (sum(returns) / len(returns) if returns else 0)
+    if len(rows) < 10:
+        return default_response
     
-    btc = [r for r in rows if "BTC" in r.get("symbol", "").upper() and r["row_state"] in ("tp", "sl")]
-    eth = [r for r in rows if "ETH" in r.get("symbol", "").upper() and "BTC" not in r.get("symbol", "").upper() and r["row_state"] in ("tp", "sl")]
-    lc_syms = ["SOL", "BNB", "ADA", "AVAX", "DOT", "MATIC", "LINK"]
-    lc = [r for r in rows if any(s in r.get("symbol", "").upper() for s in lc_syms) and r["row_state"] in ("tp", "sl")]
-    alt = [r for r in rows if r["row_state"] in ("tp", "sl") and "BTC" not in r.get("symbol", "").upper() and "ETH" not in r.get("symbol", "").upper() and not any(s in r.get("symbol", "").upper() for s in lc_syms)]
+    try:
+        def calc_perf(trades):
+            if not trades: return 0, 0
+            wins = sum(1 for t in trades if t.get("row_state") == "tp")
+            wr = (wins / len(trades)) * 100 if trades else 0
+            returns = []
+            for r in trades:
+                if r.get("entry") and r.get("side"):
+                    try:
+                        entry = float(r["entry"])
+                        exit_p = None
+                        if r.get("sl_hit") and r.get("sl"):
+                            exit_p = float(r["sl"])
+                        elif r.get("tp1_hit") and r.get("tp1"):
+                            exit_p = float(r["tp1"])
+                        
+                        if exit_p:
+                            pl = ((exit_p - entry) / entry) * 100
+                            if r.get("side") == "SHORT": pl = -pl
+                            returns.append(pl)
+                    except: pass
+            return wr, (sum(returns) / len(returns) if returns else 0)
+        
+        btc = [r for r in rows if r.get("symbol") and "BTC" in r["symbol"].upper() and r.get("row_state") in ("tp", "sl")]
+        eth = [r for r in rows if r.get("symbol") and "ETH" in r["symbol"].upper() and "BTC" not in r["symbol"].upper() and r.get("row_state") in ("tp", "sl")]
+        lc_syms = ["SOL", "BNB", "ADA", "AVAX", "DOT", "MATIC", "LINK"]
+        lc = [r for r in rows if r.get("symbol") and any(s in r["symbol"].upper() for s in lc_syms) and r.get("row_state") in ("tp", "sl")]
+        alt = [r for r in rows if r.get("symbol") and r.get("row_state") in ("tp", "sl") and "BTC" not in r["symbol"].upper() and "ETH" not in r["symbol"].upper() and not any(s in r["symbol"].upper() for s in lc_syms)]
+        
+        btc_wr, btc_avg = calc_perf(btc)
+        eth_wr, eth_avg = calc_perf(eth)
+        lc_wr, lc_avg = calc_perf(lc)
+        alt_wr, alt_avg = calc_perf(alt)
+        
+        btc_sc = (btc_wr * 0.6 + (btc_avg + 10) * 4) if btc else 0
+        eth_sc = (eth_wr * 0.6 + (eth_avg + 10) * 4) if eth else 0
+        lc_sc = (lc_wr * 0.6 + (lc_avg + 10) * 4) if lc else 0
+        alt_sc = (alt_wr * 0.6 + (alt_avg + 10) * 4) if alt else 0
+        
+        details = {
+            "btc": {"winrate": round(btc_wr, 1), "avg_return": round(btc_avg, 2), "trades": len(btc)},
+            "eth": {"winrate": round(eth_wr, 1), "avg_return": round(eth_avg, 2), "trades": len(eth)},
+            "large_cap": {"winrate": round(lc_wr, 1), "avg_return": round(lc_avg, 2), "trades": len(lc)},
+            "small_alts": {"winrate": round(alt_wr, 1), "avg_return": round(alt_avg, 2), "trades": len(alt)}
+        }
+        
+        if btc_sc > eth_sc and btc_sc > alt_sc and btc_wr > 55:
+            return {"phase": 1, "phase_name": "Bitcoin Season", "emoji": "₿", "color": "#f7931a", "description": "BTC domine", "confidence": min(100, int(btc_sc - max(eth_sc, alt_sc))), "details": details}
+        elif (eth_sc > btc_sc or lc_sc > btc_sc) and eth_wr > 50:
+            return {"phase": 2, "phase_name": "ETH & Large-Cap", "emoji": "💎", "color": "#627eea", "description": "ETH surperforme", "confidence": min(100, int(max(eth_sc, lc_sc) - btc_sc)), "details": details}
+        elif alt_sc > btc_sc and alt_sc > eth_sc and alt_wr > 55:
+            return {"phase": 3, "phase_name": "Altcoin Season", "emoji": "🚀", "color": "#10b981", "description": "Alts explosent", "confidence": min(100, int(alt_sc - max(btc_sc, eth_sc))), "details": details}
+        
+        return {"phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b", "description": "Phase neutre", "confidence": 30, "details": details}
     
-    btc_wr, btc_avg = calc_perf(btc)
-    eth_wr, eth_avg = calc_perf(eth)
-    lc_wr, lc_avg = calc_perf(lc)
-    alt_wr, alt_avg = calc_perf(alt)
-    
-    btc_sc = (btc_wr * 0.6 + (btc_avg + 10) * 4) if btc else 0
-    eth_sc = (eth_wr * 0.6 + (eth_avg + 10) * 4) if eth else 0
-    lc_sc = (lc_wr * 0.6 + (lc_avg + 10) * 4) if lc else 0
-    alt_sc = (alt_wr * 0.6 + (alt_avg + 10) * 4) if alt else 0
-    
-    if btc_sc > eth_sc and btc_sc > alt_sc and btc_wr > 55:
-        return {"phase": 1, "phase_name": "Bitcoin Season", "emoji": "₿", "color": "#f7931a", "description": "BTC domine", "confidence": min(100, int(btc_sc - max(eth_sc, alt_sc))), "details": {"btc": {"winrate": round(btc_wr, 1), "avg_return": round(btc_avg, 2), "trades": len(btc)}, "eth": {"winrate": round(eth_wr, 1), "avg_return": round(eth_avg, 2), "trades": len(eth)}, "large_cap": {"winrate": round(lc_wr, 1), "avg_return": round(lc_avg, 2), "trades": len(lc)}, "small_alts": {"winrate": round(alt_wr, 1), "avg_return": round(alt_avg, 2), "trades": len(alt)}}}
-    elif (eth_sc > btc_sc or lc_sc > btc_sc) and eth_wr > 50:
-        return {"phase": 2, "phase_name": "ETH & Large-Cap", "emoji": "💎", "color": "#627eea", "description": "ETH surperforme", "confidence": min(100, int(max(eth_sc, lc_sc) - btc_sc)), "details": {"btc": {"winrate": round(btc_wr, 1), "avg_return": round(btc_avg, 2), "trades": len(btc)}, "eth": {"winrate": round(eth_wr, 1), "avg_return": round(eth_avg, 2), "trades": len(eth)}, "large_cap": {"winrate": round(lc_wr, 1), "avg_return": round(lc_avg, 2), "trades": len(lc)}, "small_alts": {"winrate": round(alt_wr, 1), "avg_return": round(alt_avg, 2), "trades": len(alt)}}}
-    elif alt_sc > btc_sc and alt_sc > eth_sc and alt_wr > 55:
-        return {"phase": 3, "phase_name": "Altcoin Season", "emoji": "🚀", "color": "#10b981", "description": "Alts explosent", "confidence": min(100, int(alt_sc - max(btc_sc, eth_sc))), "details": {"btc": {"winrate": round(btc_wr, 1), "avg_return": round(btc_avg, 2), "trades": len(btc)}, "eth": {"winrate": round(eth_wr, 1), "avg_return": round(eth_avg, 2), "trades": len(eth)}, "large_cap": {"winrate": round(lc_wr, 1), "avg_return": round(lc_avg, 2), "trades": len(lc)}, "small_alts": {"winrate": round(alt_wr, 1), "avg_return": round(alt_avg, 2), "trades": len(alt)}}}
-    
-    return {"phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b", "description": "Phase neutre", "confidence": 30, "details": {"btc": {"winrate": round(btc_wr, 1), "avg_return": round(btc_avg, 2), "trades": len(btc)}, "eth": {"winrate": round(eth_wr, 1), "avg_return": round(eth_avg, 2), "trades": len(eth)}, "large_cap": {"winrate": round(lc_wr, 1), "avg_return": round(lc_avg, 2), "trades": len(lc)}, "small_alts": {"winrate": round(alt_wr, 1), "avg_return": round(alt_avg, 2), "trades": len(alt)}}}
+    except Exception as e:
+        logger.error(f"Bull Run Phase error: {e}")
+        return default_response
 
-def calculate_advanced_metrics(rows: List[dict]) -> Dict[str, Any]:
-    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
-    if len(closed) < 2: return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0, "max_drawdown": 0}
+def calculate_altseason_metrics(rows: List[dict]) -> Dict[str, Any]:
+    """Calcule si c'est l'altseason"""
+    btc = [r for r in rows if r.get("symbol") and "BTC" in r["symbol"].upper() and r.get("row_state") in ("tp", "sl")]
+    alt = [r for r in rows if r.get("symbol") and "BTC" not in r["symbol"].upper() and r.get("row_state") in ("tp", "sl")]
+    
+    if len(btc) < 3 or len(alt) < 5:
+        return {"is_altseason": False, "confidence": 0, "btc_wr": 0, "alt_wr": 0, "message": "Pas assez de données"}
+    
+    btc_wins = sum(1 for t in btc if t.get("row_state") == "tp")
+    alt_wins = sum(1 for t in alt if t.get("row_state") == "tp")
+    
+    btc_wr = (btc_wins / len(btc)) * 100
+    alt_wr = (alt_wins / len(alt)) * 100
+    
+    is_alt = alt_wr > btc_wr and alt_wr > 55
+    conf = min(100, int(abs(alt_wr - btc_wr)))
+    
+    return {
+        "is_altseason": is_alt,
+        "confidence": conf,
+        "btc_wr": round(btc_wr, 1),
+        "alt_wr": round(alt_wr, 1),
+        "message": "🚀 ALTSEASON Active !" if is_alt else "₿ BTC Season" if btc_wr > alt_wr else "🔄 Phase Neutre"
+    }
+
+def run_backtest(rows: List[dict], filters: Dict[str, Any]) -> Dict[str, Any]:
+    """Backtester avec matching flexible"""
+    filtered = rows
+    
+    if filters.get("side"):
+        filtered = [r for r in filtered if r.get("side") == filters["side"]]
+    
+    if filters.get("symbol"):
+        sym = filters["symbol"].upper().strip()
+        filtered = [r for r in filtered if r.get("symbol") and sym in r["symbol"].upper()]
+    
+    if filters.get("tf"):
+        tf = filters["tf"].lower().strip()
+        filtered = [r for r in filtered if r.get("tf_label", "").lower() == tf]
+    
+    closed = [r for r in filtered if r.get("row_state") in ("tp", "sl")]
+    
+    if not closed:
+        return {"trades": 0, "winrate": 0, "total_return": 0, "avg_win": 0, "avg_loss": 0}
+    
+    wins = sum(1 for r in closed if r.get("row_state") == "tp")
+    wr = (wins / len(closed)) * 100
     
     returns = []
     for r in closed:
-        if r.get("entry"):
+        if r.get("entry") and r.get("side"):
             try:
                 entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None
+                exit_p = float(r["sl"]) if r.get("sl_hit") and r.get("sl") else (float(r["tp1"]) if r.get("tp1") else None)
                 if exit_p:
                     pl = ((exit_p - entry) / entry) * 100
-                    if r.get("side") == "SHORT": pl = -pl
+                    if r["side"] == "SHORT": pl = -pl
                     returns.append(pl)
             except: pass
     
-    if not returns: return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0, "max_drawdown": 0}
+    if not returns:
+        return {"trades": len(closed), "winrate": round(wr, 1), "wins": wins, "losses": len(closed)-wins, "total_return": 0, "avg_win": 0, "avg_loss": 0}
     
-    avg = sum(returns) / len(returns)
-    std = math.sqrt(sum((r - avg) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.01
-    sharpe = (avg / std) * math.sqrt(252) if std > 0 else 0
+    win_rets = [r for r in returns if r > 0]
+    loss_rets = [r for r in returns if r < 0]
     
-    down = [r for r in returns if r < 0]
-    down_std = math.sqrt(sum(r ** 2 for r in down) / len(down)) if down else 0.01
-    sortino = (avg / down_std) * math.sqrt(252) if down_std > 0 else 0
-    
-    cumul, run, max_dd, peak = [], 0, 0, 0
-    for r in returns:
-        run += r
-        cumul.append(run)
-        if run > peak: peak = run
-        dd = peak - run
-        if dd > max_dd: max_dd = dd
-    
-    calmar = (sum(returns) / max_dd) if max_dd > 0 else 0
-    
-    wins = [r for r in returns if r > 0]
-    losses = [r for r in returns if r < 0]
-    avg_w = sum(wins) / len(wins) if wins else 0
-    avg_l = abs(sum(losses) / len(losses)) if losses else 0
-    wr = len(wins) / len(returns) if returns else 0
-    expect = (wr * avg_w) - ((1 - wr) * avg_l)
-    
-    return {"sharpe_ratio": round(sharpe, 2), "sortino_ratio": round(sortino, 2), "calmar_ratio": round(calmar, 2), "expectancy": round(expect, 2), "max_drawdown": round(max_dd, 2)}
-
-def calculate_equity_curve(rows: List[dict]) -> List[Dict[str, Any]]:
-    closed = sorted([r for r in rows if r["row_state"] in ("tp", "sl")], key=lambda x: x.get("t_entry", 0))
-    equity, current, peak = [{"date": 0, "equity": settings.INITIAL_CAPITAL, "drawdown": 0}], settings.INITIAL_CAPITAL, settings.INITIAL_CAPITAL
-    
-    for r in closed:
-        if r.get("entry"):
-            try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None
-                if exit_p:
-                    pl = ((exit_p - entry) / entry) * 100
-                    if r.get("side") == "SHORT": pl = -pl
-                    pl_amt = current * 0.02 * (pl / 2)
-                    current = max(0, current + pl_amt)
-                    if current > peak: peak = current
-                    dd = ((peak - current) / peak) * 100 if peak > 0 else 0
-                    equity.append({"date": r.get("t_entry", 0), "equity": round(current, 2), "drawdown": round(dd, 2)})
-            except: pass
-    return equity
-
-def calculate_performance_heatmap(rows: List[dict]) -> Dict[str, Any]:
-    hm = defaultdict(lambda: {"wins": 0, "losses": 0, "total": 0})
-    for r in rows:
-        if r["row_state"] in ("tp", "sl") and r.get("t_entry"):
-            dt = datetime.fromtimestamp(r["t_entry"] / 1000, tz=timezone.utc)
-            key = f"{dt.strftime('%A')}_{(dt.hour // 4) * 4:02d}h"
-            hm[key]["total"] += 1
-            if r["row_state"] == "tp": hm[key]["wins"] += 1
-            else: hm[key]["losses"] += 1
-    
-    return {k: {**d, "winrate": round((d["wins"] / d["total"]) * 100, 1)} for k, d in hm.items() if d["total"] > 0}
-
-def detect_trading_patterns(rows: List[dict]) -> List[str]:
-    if len(rows) < 10: return ["Accumulez plus de trades"]
-    patterns = []
-    
-    def wr(trades):
-        c = [t for t in trades if t["row_state"] in ("tp", "sl")]
-        return (sum(1 for t in c if t["row_state"] == "tp") / len(c) * 100) if c else 0
-    
-    morn = [r for r in rows if r.get("t_entry") and 6 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 12]
-    aft = [r for r in rows if r.get("t_entry") and 12 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 18]
-    
-    m_wr, a_wr = wr(morn), wr(aft)
-    if m_wr > 60 and m_wr > a_wr: patterns.append(f"✅ Meilleur le matin ({m_wr:.0f}%)")
-    elif a_wr > 60: patterns.append(f"✅ Meilleur l'après-midi ({a_wr:.0f}%)")
-    
-    longs = [r for r in rows if r.get("side") == "LONG" and r["row_state"] in ("tp", "sl")]
-    shorts = [r for r in rows if r.get("side") == "SHORT" and r["row_state"] in ("tp", "sl")]
-    
-    if len(longs) >= 5:
-        l_wr = wr(longs)
-        if l_wr >= 65: patterns.append(f"📈 Excellent sur LONGs ({l_wr:.0f}%)")
-    
-    if len(shorts) >= 5:
-        s_wr = wr(shorts)
-        if s_wr >= 65: patterns.append(f"📉 Excellent sur SHORTs ({s_wr:.0f}%)")
-    
-    return patterns if patterns else ["📊 Continuez à trader"]
-
-def calculate_kelly_position(winrate: float, avg_win: float, avg_loss: float) -> Dict[str, Any]:
-    if avg_loss == 0 or winrate == 0: return {"kelly_pct": 0, "conservative_pct": 0, "recommendation": "Données insuffisantes"}
-    
-    p, q, b = winrate / 100.0, 1 - (winrate / 100.0), avg_win / avg_loss
-    kelly = max(0, min((p * b - q) / b, 0.25))
-    cons = kelly * 0.5
-    
-    if cons <= 0: rec = "❌ Ne pas trader"
-    elif cons < 0.02: rec = "⚠️ Edge faible"
-    elif cons < 0.05: rec = "✅ Normal - 2-5%"
-    else: rec = "🚀 Fort edge"
-    
-    return {"kelly_pct": round(kelly * 100, 2), "conservative_pct": round(cons * 100, 2), "recommendation": rec}
+    return {
+        "trades": len(closed),
+        "winrate": round(wr, 1),
+        "wins": wins,
+        "losses": len(closed) - wins,
+        "total_return": round(sum(returns), 2),
+        "avg_win": round(sum(win_rets) / len(win_rets), 2) if win_rets else 0,
+        "avg_loss": round(abs(sum(loss_rets) / len(loss_rets)), 2) if loss_rets else 0,
+        "best_trade": round(max(returns), 2) if returns else 0,
+        "worst_trade": round(min(returns), 2) if returns else 0,
+        "filters": filters
+    }
 
 def check_circuit_breaker() -> Dict[str, Any]:
     active = db_query("SELECT * FROM circuit_breaker WHERE active=1 AND cooldown_until > ? ORDER BY triggered_at DESC LIMIT 1", (int(time.time()),))
@@ -427,18 +405,12 @@ body{margin:0;font-family:system-ui;background:#050a12;color:#e2e8f0}
 .phase-indicator.active::before{background:currentColor}
 .phase-number{width:48px;height:48px;border-radius:50%;background:rgba(99,102,241,0.2);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900}
 .phase-indicator.active .phase-number{background:currentColor;color:#0a0f1a}
-.list{list-style:none;padding:0}
-.list li{padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)}
 </style>"""
 
 NAV = """<div class="nav">
 <a href="/trades">📊 Dashboard</a>
-<a href="/ai-insights">🤖 AI</a>
-<a href="/equity-curve">📈 Equity</a>
-<a href="/heatmap">🔥 Heatmap</a>
-<a href="/advanced-metrics">📊 Metrics</a>
-<a href="/patterns">🔍 Patterns</a>
-<a href="/journal">📝 Journal</a>
+<a href="/backtest">⏮️ Backtest</a>
+<a href="/strategie">⚙️ Stratégie</a>
 <a href="/altseason">🚀 Altseason</a>
 </div>"""
 
@@ -451,7 +423,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "3.0.0", "features": ["Fear & Greed", "Bull Run", "Altseason", "AI", "Analytics"]}
+    return {"status": "healthy", "version": "3.0.0"}
 
 @app.get("/api/fear-greed")
 async def get_fear_greed():
@@ -459,54 +431,23 @@ async def get_fear_greed():
 
 @app.get("/api/bullrun-phase")
 async def get_bullrun_phase():
-    return {"ok": True, "bullrun_phase": detect_bullrun_phase(build_trade_rows(100))}
+    rows = build_trade_rows(100)
+    phase = detect_bullrun_phase(rows)
+    return {"ok": True, "bullrun_phase": phase}
 
 @app.get("/api/trades")
 async def get_trades(limit: int = 50):
     return {"ok": True, "trades": build_trade_rows(limit)}
 
-@app.get("/api/equity-curve")
-async def get_equity():
-    return {"ok": True, "equity_curve": calculate_equity_curve(build_trade_rows(1000))}
+@app.get("/api/altseason")
+async def get_altseason():
+    rows = build_trade_rows(100)
+    return {"ok": True, "altseason": calculate_altseason_metrics(rows)}
 
-@app.get("/api/heatmap")
-async def get_heatmap():
-    return {"ok": True, "heatmap": calculate_performance_heatmap(build_trade_rows(1000))}
-
-@app.get("/api/advanced-metrics")
-async def get_metrics():
+@app.post("/api/backtest")
+async def post_backtest(filters: Dict[str, Any]):
     rows = build_trade_rows(1000)
-    metrics = calculate_advanced_metrics(rows)
-    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
-    wins = [r for r in closed if r["row_state"] == "tp"]
-    wr = (len(wins) / len(closed) * 100) if closed else 0
-    returns = []
-    for r in closed:
-        if r.get("entry"):
-            try:
-                entry, exit_p = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None)
-                if exit_p:
-                    pl = ((exit_p - entry) / entry) * 100
-                    if r.get("side") == "SHORT": pl = -pl
-                    returns.append(pl)
-            except: pass
-    avg_w = sum(r for r in returns if r > 0) / max(1, len([r for r in returns if r > 0]))
-    avg_l = abs(sum(r for r in returns if r < 0) / max(1, len([r for r in returns if r < 0])))
-    return {"ok": True, "metrics": metrics, "kelly": calculate_kelly_position(wr, avg_w, avg_l)}
-
-@app.get("/api/patterns")
-async def get_patterns():
-    return {"ok": True, "patterns": detect_trading_patterns(build_trade_rows(200))}
-
-@app.post("/api/journal")
-async def add_journal(note: JournalNote):
-    db_execute("INSERT INTO trade_notes (trade_id, note, emotion, tags) VALUES (?, ?, ?, ?)",
-        (note.trade_id, note.note, note.emotion, note.tags))
-    return {"ok": True}
-
-@app.get("/api/journal")
-async def get_journals(limit: int = 50):
-    return {"ok": True, "notes": db_query("SELECT * FROM trade_notes ORDER BY created_at DESC LIMIT ?", (limit,))}
+    return {"ok": True, "backtest": run_backtest(rows, filters)}
 
 @app.post("/tv-webhook")
 @rate_limit("100/minute")
@@ -527,8 +468,8 @@ async def webhook(request: Request):
         
         recent = build_trade_rows(10)
         consecutive = 0
-        for t in reversed([r for r in recent if r["row_state"] in ("tp", "sl")]):
-            if t["row_state"] == "sl": consecutive += 1
+        for t in reversed([r for r in recent if r.get("row_state") in ("tp", "sl")]):
+            if t.get("row_state") == "sl": consecutive += 1
             else: break
         
         if consecutive >= settings.MAX_CONSECUTIVE_LOSSES:
@@ -543,10 +484,10 @@ async def trades_page():
     rows = build_trade_rows(50)
     table = ""
     for r in rows[:20]:
-        badge = f'<span class="badge badge-green">TP</span>' if r["row_state"]=="tp" else (f'<span class="badge badge-red">SL</span>' if r["row_state"]=="sl" else f'<span class="badge badge-yellow">En cours</span>')
+        badge = f'<span class="badge badge-green">TP</span>' if r.get("row_state")=="tp" else (f'<span class="badge badge-red">SL</span>' if r.get("row_state")=="sl" else f'<span class="badge badge-yellow">En cours</span>')
         table += f"""<tr style="border-bottom:1px solid rgba(99,102,241,0.1)">
-            <td style="padding:12px">{r['symbol']}</td><td style="padding:12px">{r['tf_label']}</td>
-            <td style="padding:12px">{r['side']}</td><td style="padding:12px">{r['entry'] or 'N/A'}</td>
+            <td style="padding:12px">{r.get('symbol', 'N/A')}</td><td style="padding:12px">{r.get('tf_label', 'N/A')}</td>
+            <td style="padding:12px">{r.get('side', 'N/A')}</td><td style="padding:12px">{r.get('entry') or 'N/A'}</td>
             <td style="padding:12px">{badge}</td></tr>"""
     
     return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Dashboard</title>{CSS}</head>
@@ -554,12 +495,8 @@ async def trades_page():
     <div class="header"><h1>📊 Dashboard</h1></div>{NAV}
     
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(350px,1fr))">
-        <div class="card"><h2>😱 Fear & Greed</h2>
-            <div id="fg" style="text-align:center;padding:40px">⏳ Chargement...</div>
-        </div>
-        <div class="card"><h2>🚀 Bull Run Phase</h2>
-            <div id="br" style="text-align:center;padding:40px">⏳ Chargement...</div>
-        </div>
+        <div class="card"><h2>😱 Fear & Greed</h2><div id="fg" style="text-align:center;padding:40px">⏳</div></div>
+        <div class="card"><h2>🚀 Bull Run Phase</h2><div id="br" style="text-align:center;padding:40px">⏳</div></div>
     </div>
     
     <div class="card" id="phases" style="display:none"><h2>📈 Phases</h2>
@@ -579,8 +516,8 @@ async def trades_page():
     
     <div class="grid">
         <div class="metric"><div class="metric-label">Total</div><div class="metric-value">{len(rows)}</div></div>
-        <div class="metric"><div class="metric-label">Actifs</div><div class="metric-value">{sum(1 for r in rows if r['row_state']=='normal')}</div></div>
-        <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">{int((sum(1 for r in rows if r['row_state']=='tp')/max(1,sum(1 for r in rows if r['row_state'] in ('tp','sl'))))*100)}%</div></div>
+        <div class="metric"><div class="metric-label">Actifs</div><div class="metric-value">{sum(1 for r in rows if r.get('row_state')=='normal')}</div></div>
+        <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">{int((sum(1 for r in rows if r.get('row_state')=='tp')/max(1,sum(1 for r in rows if r.get('row_state') in ('tp','sl'))))*100)}%</div></div>
     </div>
     
     <div class="card"><h2>Derniers Trades</h2>
@@ -600,7 +537,7 @@ async def trades_page():
     <div class="gauge-value" style="color:${{f.color}}">${{f.value}}</div>
     <div class="gauge-label">/ 100</div></div></div>
     <div style="text-align:center;margin-top:24px;font-size:24px;font-weight:900;color:${{f.color}}">${{f.emoji}} ${{f.sentiment}}</div>
-    <p style="color:#64748b;font-size:14px;text-align:center">${{f.recommendation}}</p>`;}}}});
+    <p style="color:#64748b;font-size:14px;text-align:center">${{f.recommendation}}</p>`;}}}}).catch(e=>{{console.error(e);document.getElementById('fg').innerHTML='<p style="color:#ef4444">Erreur chargement</p>';}});
     
     fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{{if(d.ok){{const b=d.bullrun_phase;
     document.getElementById('br').innerHTML=`<div style="font-size:64px;margin-bottom:8px">${{b.emoji}}</div>
@@ -610,159 +547,173 @@ async def trades_page():
     document.getElementById('phases').style.display='block';
     ['p1','p2','p3'].forEach((id,i)=>{{const el=document.getElementById(id);
     if(i+1===b.phase)el.classList.add('active');else el.classList.remove('active');}});
-    const d=b.details;
-    document.getElementById('p1s').textContent=`WR: ${{d.btc.winrate}}% | ${{d.btc.trades}} trades`;
-    document.getElementById('p2s').textContent=`ETH: ${{d.eth.winrate}}% | LC: ${{d.large_cap.winrate}}%`;
-    document.getElementById('p3s').textContent=`WR: ${{d.small_alts.winrate}}% | ${{d.small_alts.trades}} trades`;}}}});
+    const det=b.details;
+    document.getElementById('p1s').textContent=`WR: ${{det.btc.winrate}}% | ${{det.btc.trades}} trades`;
+    document.getElementById('p2s').textContent=`ETH: ${{det.eth.winrate}}% | LC: ${{det.large_cap.winrate}}%`;
+    document.getElementById('p3s').textContent=`WR: ${{det.small_alts.winrate}}% | ${{det.small_alts.trades}} trades`;}}}}).catch(e=>{{console.error(e);document.getElementById('br').innerHTML='<p style="color:#ef4444">Erreur chargement</p>';}});
     </script>
     </div></body></html>""")
 
-@app.get("/ai-insights", response_class=HTMLResponse)
-async def ai_page():
-    rows = build_trade_rows(200)
-    patterns = detect_trading_patterns(rows)
-    p_html = "".join(f'<li>{p}</li>' for p in patterns)
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>AI Insights</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>🤖 AI Insights</h1></div>{NAV}
-    <div class="card"><h2>Patterns Détectés</h2><ul class="list">{p_html}</ul></div>
-    </div></body></html>""")
-
-@app.get("/equity-curve", response_class=HTMLResponse)
-async def equity_page():
-    rows = build_trade_rows(1000)
-    curve = calculate_equity_curve(rows)
-    curr = curve[-1]["equity"] if curve else settings.INITIAL_CAPITAL
-    ret = ((curr - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL) * 100
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Equity</title>{CSS}
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head>
-    <body><div class="container">
-    <div class="header"><h1>📈 Equity Curve</h1></div>{NAV}
-    <div class="grid">
-        <div class="metric"><div class="metric-label">Initial</div><div class="metric-value">${settings.INITIAL_CAPITAL:.0f}</div></div>
-        <div class="metric"><div class="metric-label">Actuel</div><div class="metric-value">${curr:.0f}</div></div>
-        <div class="metric"><div class="metric-label">Return</div><div class="metric-value" style="color:{'#10b981' if ret>=0 else '#ef4444'}">{ret:+.1f}%</div></div>
-    </div>
-    <div class="card" style="min-height:400px"><canvas id="c"></canvas></div>
-    <script>
-    new Chart(document.getElementById('c'),{{type:'line',data:{{
-    datasets:[{{label:'Equity',data:{json.dumps([{"x":i,"y":p["equity"]} for i,p in enumerate(curve)])},
-    borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,0.1)',tension:0.4,fill:true}}]}},
-    options:{{responsive:true,maintainAspectRatio:false,scales:{{x:{{type:'linear'}}}}}}}});
-    </script></div></body></html>""")
-
-@app.get("/heatmap", response_class=HTMLResponse)
-async def heatmap_page():
-    rows = build_trade_rows(1000)
-    hm = calculate_performance_heatmap(rows)
-    days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    hours = ["00h","04h","08h","12h","16h","20h"]
-    
-    table = "<table style='width:100%;border-collapse:collapse'><thead><tr><th style='padding:8px;border:1px solid rgba(99,102,241,0.2)'></th>"
-    for d in days: table += f"<th style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-size:12px'>{d[:3]}</th>"
-    table += "</tr></thead><tbody>"
-    
-    for h in hours:
-        table += f"<tr><td style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-weight:600'>{h}</td>"
-        for d in days:
-            data = hm.get(f"{d}_{h}", {"total": 0, "winrate": 0})
-            if data["total"] == 0: col, txt = "#1e293b", "-"
-            elif data["winrate"] >= 65: col, txt = "rgba(16,185,129,0.3)", f"{data['winrate']:.0f}%"
-            elif data["winrate"] >= 50: col, txt = "rgba(251,191,36,0.3)", f"{data['winrate']:.0f}%"
-            else: col, txt = "rgba(239,68,68,0.3)", f"{data['winrate']:.0f}%"
-            table += f"<td style='padding:12px;border:1px solid rgba(99,102,241,0.2);background:{col};text-align:center;font-weight:700'>{txt}</td>"
-        table += "</tr>"
-    table += "</tbody></table>"
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Heatmap</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>🔥 Heatmap</h1></div>{NAV}
-    <div class="card"><h2>Performance par jour/heure</h2>{table}</div>
-    </div></body></html>""")
-
-@app.get("/advanced-metrics", response_class=HTMLResponse)
-async def metrics_page():
-    rows = build_trade_rows(1000)
-    m = calculate_advanced_metrics(rows)
-    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
-    wr = (sum(1 for r in closed if r["row_state"]=="tp") / len(closed) * 100) if closed else 0
-    returns = []
-    for r in closed:
-        if r.get("entry"):
-            try:
-                entry, exit_p = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None)
-                if exit_p:
-                    pl = ((exit_p - entry) / entry) * 100
-                    if r.get("side") == "SHORT": pl = -pl
-                    returns.append(pl)
-            except: pass
-    avg_w = sum(r for r in returns if r > 0) / max(1, len([r for r in returns if r > 0]))
-    avg_l = abs(sum(r for r in returns if r < 0) / max(1, len([r for r in returns if r < 0])))
-    kelly = calculate_kelly_position(wr, avg_w, avg_l)
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Metrics</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>📊 Métriques Avancées</h1></div>{NAV}
-    <div class="grid">
-        <div class="metric"><div class="metric-label">Sharpe</div><div class="metric-value">{m['sharpe_ratio']}</div></div>
-        <div class="metric"><div class="metric-label">Sortino</div><div class="metric-value">{m['sortino_ratio']}</div></div>
-        <div class="metric"><div class="metric-label">Calmar</div><div class="metric-value">{m['calmar_ratio']}</div></div>
-        <div class="metric"><div class="metric-label">Expectancy</div><div class="metric-value">{m['expectancy']:.2f}%</div></div>
-    </div>
-    <div class="card"><h2>Kelly Criterion</h2>
-    <div class="grid">
-        <div class="metric"><div class="metric-label">Kelly %</div><div class="metric-value">{kelly['kelly_pct']:.1f}%</div></div>
-        <div class="metric"><div class="metric-label">Conservateur</div><div class="metric-value">{kelly['conservative_pct']:.1f}%</div></div>
-    </div>
-    <p style="padding:16px;background:rgba(99,102,241,0.1);border-radius:12px;margin-top:20px">{kelly['recommendation']}</p>
-    </div></div></body></html>""")
-
-@app.get("/patterns", response_class=HTMLResponse)
-async def patterns_page():
-    patterns = detect_trading_patterns(build_trade_rows(200))
-    p_html = "".join(f'<li>{p}</li>' for p in patterns)
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Patterns</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>🔍 Patterns</h1></div>{NAV}
-    <div class="card"><h2>Patterns Détectés</h2><ul class="list">{p_html}</ul></div>
-    </div></body></html>""")
-
-@app.get("/journal", response_class=HTMLResponse)
-async def journal_page():
-    rows = build_trade_rows(50)
-    table = ""
-    for r in rows[:20]:
-        notes = db_query("SELECT note, emotion FROM trade_notes WHERE trade_id=? ORDER BY created_at DESC LIMIT 1", (r["trade_id"],))
-        note = notes[0]["note"][:50] if notes and notes[0].get("note") else "Pas de note"
-        emo = notes[0]["emotion"] if notes and notes[0].get("emotion") else "-"
-        badge = f'<span class="badge badge-green">TP</span>' if r["row_state"]=="tp" else f'<span class="badge badge-red">SL</span>' if r["row_state"]=="sl" else f'<span class="badge badge-yellow">En cours</span>'
-        table += f"""<tr style="border-bottom:1px solid rgba(99,102,241,0.1)">
-            <td style="padding:12px">{r['symbol']}</td><td style="padding:12px">{badge}</td>
-            <td style="padding:12px">{emo}</td><td style="padding:12px">{note}</td></tr>"""
-    
-    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Journal</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>📝 Journal</h1></div>{NAV}
-    <div class="card"><h2>Trades</h2>
-    <table style="width:100%;border-collapse:collapse">
-        <thead><tr style="border-bottom:2px solid rgba(99,102,241,0.2)">
-            <th style="padding:12px;text-align:left;color:#64748b">Symbol</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Résultat</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Émotion</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Note</th>
-        </tr></thead><tbody>{table}</tbody>
-    </table></div></div></body></html>""")
-
 @app.get("/altseason", response_class=HTMLResponse)
 async def altseason_page():
-    return HTMLResponse("""<!DOCTYPE html><html><head><title>Altseason</title></head>
-    <body style="font-family:system-ui;padding:40px;background:#0a0f1a;color:#e6edf3">
-    <h1 style="color:#6366f1">🚀 Altseason</h1>
-    <p><a href="/trades" style="color:#8b5cf6">← Dashboard</a></p>
-    </body></html>""")
+    rows = build_trade_rows(100)
+    alt = calculate_altseason_metrics(rows)
+    
+    coin_stats = {}
+    for r in rows:
+        if r.get("row_state") in ("tp", "sl") and r.get("symbol"):
+            sym = r["symbol"]
+            if sym not in coin_stats: coin_stats[sym] = {"wins": 0, "total": 0}
+            coin_stats[sym]["total"] += 1
+            if r.get("row_state") == "tp": coin_stats[sym]["wins"] += 1
+    
+    top = sorted([(s, (d["wins"]/d["total"]*100) if d["total"]>0 else 0, d["total"]) for s,d in coin_stats.items() if d["total"]>=3], key=lambda x: x[1], reverse=True)[:10]
+    
+    top_html = ""
+    for sym, wr, tot in top:
+        is_btc = "BTC" in sym.upper()
+        col = "#f7931a" if is_btc else "#6366f1"
+        icon = "₿" if is_btc else "🪙"
+        top_html += f"""<div style="display:flex;justify-content:space-between;padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+            <span style="color:{col}">{icon} {sym}</span>
+            <span style="font-weight:700">{wr:.1f}% ({tot} trades)</span></div>"""
+    
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Altseason</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>🚀 Altseason Detector</h1></div>{NAV}
+    
+    <div class="card">
+        <h2>📊 Statut Actuel</h2>
+        <div style="text-align:center;padding:40px;background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1));border-radius:20px;margin-bottom:24px">
+            <div style="font-size:48px;margin-bottom:16px">{'🚀' if alt['is_altseason'] else '₿'}</div>
+            <div style="font-size:32px;font-weight:900;margin-bottom:8px">{alt['message']}</div>
+            <div style="color:#64748b">Confiance: {alt['confidence']}%</div>
+        </div>
+        <div class="grid">
+            <div class="metric"><div class="metric-label">₿ BTC WR</div><div class="metric-value">{alt['btc_wr']}%</div></div>
+            <div class="metric"><div class="metric-label">🪙 Alts WR</div><div class="metric-value">{alt['alt_wr']}%</div></div>
+        </div>
+    </div>
+    
+    <div class="card"><h2>🏆 Top Performers</h2>{top_html if top_html else '<p style="color:#64748b">Pas assez de données</p>'}</div>
+    
+    <div class="card">
+        <h2>💡 Utilisation</h2>
+        <p style="color:#64748b">L'altseason est détectée quand les altcoins ont un meilleur winrate que BTC et surperforment > 55%</p>
+    </div>
+    </div></body></html>""")
+
+@app.get("/backtest", response_class=HTMLResponse)
+async def backtest_page():
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Backtest</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>⏮️ Backtesting Engine</h1></div>{NAV}
+    
+    <div class="card">
+        <h2>Configuration</h2>
+        <form id="form">
+            <label>Side</label>
+            <select name="side" style="width:100%;padding:12px;background:rgba(20,30,48,0.8);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0;margin-bottom:16px">
+                <option value="">Tous</option>
+                <option value="LONG">LONG</option>
+                <option value="SHORT">SHORT</option>
+            </select>
+            
+            <label>Symbole (ex: XRP)</label>
+            <input type="text" name="symbol" placeholder="XRP, BTC, ETH..." style="width:100%;padding:12px;background:rgba(20,30,48,0.8);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0;margin-bottom:16px">
+            
+            <label>Timeframe (ex: 1h)</label>
+            <input type="text" name="tf" placeholder="15m, 1h, 4h..." style="width:100%;padding:12px;background:rgba(20,30,48,0.8);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0;margin-bottom:16px">
+            
+            <button type="submit" style="width:100%;padding:12px 24px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:8px;color:white;font-weight:700;cursor:pointer">🚀 Lancer</button>
+        </form>
+    </div>
+    
+    <div id="res" class="card" style="display:none"><h2>Résultats</h2><div id="content"></div></div>
+    
+    <script>
+    document.getElementById('form').addEventListener('submit', async (e) => {{
+        e.preventDefault();
+        const data = {{}};
+        new FormData(e.target).forEach((v, k) => {{ if(v) data[k] = v; }});
+        
+        document.getElementById('res').style.display = 'block';
+        document.getElementById('content').innerHTML = '<p style="color:#64748b">⏳ Calcul...</p>';
+        
+        const r = await fetch('/api/backtest', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(data)
+        }});
+        const d = await r.json();
+        
+        if (d.ok && d.backtest.trades > 0) {{
+            const b = d.backtest;
+            document.getElementById('content').innerHTML = `
+                <div class="grid">
+                    <div class="metric"><div class="metric-label">Trades</div><div class="metric-value">${{b.trades}}</div></div>
+                    <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value">${{b.wins}} / ${{b.losses}}</div></div>
+                    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">${{b.winrate}}%</div></div>
+                    <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" style="color:${{b.total_return>=0?'#10b981':'#ef4444'}}">${{b.total_return>=0?'+':''}}${{b.total_return}}%</div></div>
+                    <div class="metric"><div class="metric-label">Avg Win</div><div class="metric-value" style="color:#10b981">+${{b.avg_win}}%</div></div>
+                    <div class="metric"><div class="metric-label">Avg Loss</div><div class="metric-value" style="color:#ef4444">-${{b.avg_loss}}%</div></div>
+                </div>
+                <p style="margin-top:20px;padding:16px;background:rgba(99,102,241,0.1);border-radius:12px">
+                    💡 Filtres: ${{JSON.stringify(b.filters)}}
+                </p>`;
+        }} else {{
+            document.getElementById('content').innerHTML = '<p style="color:#ef4444">❌ Aucun trade trouvé avec ces filtres</p>';
+        }}
+    }});
+    </script>
+    </div></body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    breaker = check_circuit_breaker()
+    
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>Stratégie</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>⚙️ Stratégie & Protection</h1></div>{NAV}
+    
+    <div class="card">
+        <h2>🛡️ Circuit Breaker</h2>
+        {'<div style="padding:20px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:12px;margin-top:16px"><h3 style="color:#ef4444;margin:0 0 8px 0">🚨 ACTIF</h3><p style="margin:0">Raison: '+breaker['reason']+'</p><p style="margin:8px 0 0 0;color:#64748b">Temps restant: '+str(breaker['hours_remaining'])+'h</p></div>' if breaker['active'] else '<p style="padding:16px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:12px;color:#10b981">✅ Trading autorisé</p>'}
+        
+        <div style="margin-top:24px">
+            <h3>Paramètres de Protection</h3>
+            <ul style="list-style:none;padding:0">
+                <li style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+                    <strong>Pertes consécutives max:</strong> {settings.MAX_CONSECUTIVE_LOSSES}
+                </li>
+                <li style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+                    <strong>Circuit Breaker:</strong> {'✅ Activé' if settings.CIRCUIT_BREAKER_ENABLED else '❌ Désactivé'}
+                </li>
+                <li style="padding:12px">
+                    <strong>Capital initial:</strong> ${settings.INITIAL_CAPITAL}
+                </li>
+            </ul>
+        </div>
+    </div>
+    
+    <div class="card">
+        <h2>📋 Règles de Trading</h2>
+        <ul style="list-style:none;padding:0">
+            <li style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+                ✅ Position sizing: 2% max du capital par trade
+            </li>
+            <li style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+                ✅ Stop après {settings.MAX_CONSECUTIVE_LOSSES} pertes consécutives
+            </li>
+            <li style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)">
+                ✅ Cooldown 24h si circuit breaker activé
+            </li>
+            <li style="padding:12px">
+                ✅ Telegram notifications activées: {'✅ Oui' if settings.TELEGRAM_ENABLED else '❌ Non'}
+            </li>
+        </ul>
+    </div>
+    </div></body></html>""")
 
 if __name__ == "__main__":
     import uvicorn
