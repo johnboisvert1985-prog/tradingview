@@ -1295,7 +1295,1205 @@ async def health_check():
         db_records = 0
     return {"status": "healthy" if db_status == "ok" else "degraded", "database": db_status, "total_events": db_records, "telegram": settings.TELEGRAM_ENABLED, "timestamp": datetime.now(timezone.utc).isoformat(), "version": "2.4"}
 
-# Page Risk Manager continue dans le prochain message...
+@app.post("/tv-webhook")
+@limiter.limit("100/minute")
+async def tv_webhook(request: Request):
+    try:
+        payload_dict = await request.json()
+    except Exception as e:
+        logger.error(f"Invalid JSON payload: {e}")
+        raise HTTPException(400, f"Invalid JSON: {e}")
+    
+    secret = payload_dict.get("secret")
+    if secret != settings.WEBHOOK_SECRET:
+        logger.warning(f"Invalid secret attempt from {request.client.host if request.client else 'unknown'}")
+        raise HTTPException(403, "Forbidden: Invalid secret")
+    
+    try:
+        payload = WebhookPayload(**payload_dict)
+        payload.validate_trade_logic()
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(422, f"Validation error: {e}")
+    
+    trade_id = save_event(payload)
+    
+    try:
+        if settings.TELEGRAM_ENABLED:
+            key = payload.trade_id or f"{payload.type}:{payload.symbol}"
+            reply_markup = _create_dashboard_button()
+            
+            if payload.type == "VECTOR_CANDLE":
+                global _last_vector_flush_ts
+                now_sec = time.time()
+                if now_sec - _last_vector_flush_ts >= settings.VECTOR_GLOBAL_GAP_SEC:
+                    _last_vector_flush_ts = now_sec
+                    txt = format_vector_message(payload.symbol, payload.tf_label or tf_to_label(payload.tf), payload.direction or "", payload.price, payload.note)
+                    await tg_send_text(txt, key=key, reply_markup=reply_markup)
+            
+            elif payload.type == "ENTRY":
+                txt = format_entry_announcement(payload.dict())
+                await tg_send_text(txt, key=key, reply_markup=reply_markup)
+            
+            elif payload.type in {"TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "CLOSE"}:
+                hit_time = payload.time or now_ms()
+                entry_t = get_entry_time_for_trade(payload.trade_id)
+                
+                if not entry_t and payload.symbol and payload.tf:
+                    symbol = payload.symbol
+                    tf = str(payload.tf)
+                    side = payload.side
+                    query = """
+                        SELECT time FROM events
+                        WHERE symbol=? AND tf=? AND type='ENTRY'
+                    """
+                    params = [symbol, tf]
+                    if side:
+                        query += " AND side=?"
+                        params.append(side)
+                    query += " ORDER BY time DESC LIMIT 1"
+                    r = db_query(query, tuple(params))
+                    
+                    if r and r[0].get("time"):
+                        entry_t = int(r[0]["time"])
+                        logger.info(f"Found ENTRY by symbol+tf+side: {entry_t}")
+                    else:
+                        r = db_query("""
+                            SELECT time FROM events
+                            WHERE symbol=? AND tf=? AND type='ENTRY'
+                            ORDER BY time DESC LIMIT 1
+                        """, (symbol, tf))
+                        if r and r[0].get("time"):
+                            entry_t = int(r[0]["time"])
+                            logger.info(f"Found ENTRY by symbol+tf: {entry_t}")
+                        else:
+                            symbol_variants = [
+                                symbol,
+                                symbol.replace('.P', ''),
+                                symbol.replace('.PERP', ''),
+                                symbol + '.P',
+                                symbol + '.PERP'
+                            ]
+                            for sym_var in symbol_variants:
+                                r = db_query("""
+                                    SELECT time FROM events
+                                    WHERE symbol=? AND tf=? AND type='ENTRY'
+                                    ORDER BY time DESC LIMIT 1
+                                """, (sym_var, tf))
+                                if r and r[0].get("time"):
+                                    entry_t = int(r[0]["time"])
+                                    logger.info(f"Found ENTRY with symbol variant '{sym_var}': {entry_t}")
+                                    break
+                    
+                    if not entry_t:
+                        logger.error(f"NO ENTRY FOUND for {symbol} tf={tf} side={side}")
+                
+                duration = (hit_time - entry_t) if entry_t else None
+                txt = format_event_announcement(payload.type, payload.dict(), duration)
+                await tg_send_text(txt, key=key, reply_markup=reply_markup)
+            
+            await maybe_altseason_autonotify()
+    except Exception as e:
+        logger.warning(f"TG skip: {e}")
+    
+    return JSONResponse({"ok": True, "trade_id": trade_id})
+
+async def maybe_altseason_autonotify():
+    global _last_altseason_notify_ts
+    if not settings.ALTSEASON_AUTONOTIFY or not settings.TELEGRAM_ENABLED:
+        return
+    
+    alt = compute_altseason_snapshot()
+    greens = alt["signals"]["breadth_symbols"]
+    nowt = time.time()
+    
+    if greens < settings.ALT_GREENS_REQUIRED or alt["score"] < 50:
+        return
+    
+    if (nowt - _last_altseason_notify_ts) < (settings.ALTSEASON_NOTIFY_MIN_GAP_MIN * 60):
+        return
+    
+    emoji = "🟢" if alt["score"] >= 75 else "🟡"
+    symbols_list = ", ".join(alt["symbols_with_tp"][:15])
+    if len(alt["symbols_with_tp"]) > 15:
+        symbols_list += f" +{len(alt['symbols_with_tp'])-15} autres"
+    
+    msg = f"""🚨 <b>Alerte Altseason</b> {emoji}
+
+📊 Score: <b>{alt['score']}/100</b>
+📈 Status: <b>{alt['label']}</b>
+
+🔥 Signaux:
+- LONG: {alt['signals']['long_ratio']}%
+- TP/SL: {alt['signals']['tp_vs_sl']}%
+- Breadth: {alt['signals']['breadth_symbols']} sym
+- Momentum: {alt['signals']['recent_entries_ratio']}%
+
+⚡ <b>{greens} symboles</b> avec TP:
+{symbols_list}
+
+<i>{alt['disclaimer']}</i>"""
+    
+    reply_markup = _create_dashboard_button()
+    res = await tg_send_text(msg, key="altseason", reply_markup=reply_markup, pin=True)
+    if res.get("ok"):
+        _last_altseason_notify_ts = nowt
+
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page():
+    rows = build_trade_rows(limit=50)
+    kpi = compute_kpis(rows)
+    alt = compute_altseason_snapshot()
+    total_trades = count_total_trades()
+    
+    table_rows = ""
+    for idx, r in enumerate(rows, start=1):
+        state_class = r["row_state"]
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        
+        status_html = ""
+        if r["tp1_hit"]:
+            status_html += '<span class="badge badge-tp">TP1 ✓</span> '
+        if r["tp2_hit"]:
+            status_html += '<span class="badge badge-tp">TP2 ✓</span> '
+        if r["tp3_hit"]:
+            status_html += '<span class="badge badge-tp">TP3 ✓</span> '
+        if r["sl_hit"]:
+            status_html += '<span class="badge badge-sl">SL ✗</span>'
+        if not status_html:
+            status_html = '<span class="badge badge-pending">En cours</span>'
+        
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        
+        if r["tp1"]:
+            if r["tp1_hit"]:
+                tp1_time = datetime.fromtimestamp(r.get("tp1_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp1_time") else ""
+                tooltip = f' title="Atteint à {tp1_time}"' if tp1_time else ''
+                tp1_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp1"]:.4f} ✓</span>'
+            else:
+                tp1_val = f'<span style="opacity:0.6">{r["tp1"]:.4f}</span>'
+        else:
+            tp1_val = "N/A"
+            
+        if r["tp2"]:
+            if r["tp2_hit"]:
+                tp2_time = datetime.fromtimestamp(r.get("tp2_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp2_time") else ""
+                tooltip = f' title="Atteint à {tp2_time}"' if tp2_time else ''
+                tp2_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp2"]:.4f} ✓</span>'
+            else:
+                tp2_val = f'<span style="opacity:0.6">{r["tp2"]:.4f}</span>'
+        else:
+            tp2_val = "N/A"
+            
+        if r["tp3"]:
+            if r["tp3_hit"]:
+                tp3_time = datetime.fromtimestamp(r.get("tp3_time", 0) / 1000).strftime("%H:%M:%S") if r.get("tp3_time") else ""
+                tooltip = f' title="Atteint à {tp3_time}"' if tp3_time else ''
+                tp3_val = f'<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"{tooltip}>{r["tp3"]:.4f} ✓</span>'
+            else:
+                tp3_val = f'<span style="opacity:0.6">{r["tp3"]:.4f}</span>'
+        else:
+            tp3_val = "N/A"
+        
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
+        
+        pl_html = "N/A"
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--danger)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">{pl_pct:.2f}%</span>'
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--success)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">+{pl_pct:.2f}%</span>'
+            except:
+                pass
+        elif r["row_state"] == "normal" and r["entry"]:
+            try:
+                entry_price = float(r["entry"])
+                current_price = entry_price
+                if r["tp1"]:
+                    current_price = (float(r["tp1"]) + entry_price) / 2
+                pl_pct = ((current_price - entry_price) / entry_price) * 100
+                if r["side"] == "SHORT":
+                    pl_pct = -pl_pct
+                pl_color = "var(--success)" if pl_pct >= 0 else "var(--danger)"
+                pl_sign = "+" if pl_pct >= 0 else ""
+                pl_html = f'<span style="color:{pl_color};font-weight:700;opacity:0.7" class="tooltip" title="P&L estimé en cours">{pl_sign}{pl_pct:.2f}%*</span>'
+            except:
+                pass
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
+        
+        table_rows += f'''
+        <tr class="trade-row {state_class}" data-symbol="{r["symbol"]}" data-side="{r["side"]}" data-tf="{r["tf_label"]}" data-date="{r.get('t_entry', 0)}">
+            <td>{date_str}</td>
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{tf_badge}</td>
+            <td>{side_badge}</td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
+            <td>{pl_html}</td>
+            <td>{status_html}</td>
+        </tr>'''
+    
+    # Génération du HTML de la page /trades
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - AI Trader Pro</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Changer le thème">🌓</button>
+    <div class="app">
+        {generate_sidebar_html("dashboard", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px;background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Dashboard Trading</h1>
+                <p style="color:var(--muted)">Vue d'ensemble de vos positions et performances</p>
+            </header>
+            
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:32px">
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(16,185,129,0.1),rgba(6,182,212,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TRADES (24H)</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--success)">{kpi['total_trades']}</div>
+                    <span class="tooltiptext">Nombre total de trades ouverts dans les dernières 24 heures</span>
+                </div>
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">POSITIONS ACTIVES</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--accent)">{kpi['active_trades']}</div>
+                    <span class="tooltiptext">Positions ouvertes en attente de TP ou SL</span>
+                </div>
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(245,158,11,0.1),rgba(251,191,36,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">TP ATTEINTS</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--warning)">{kpi['tp_hits']}</div>
+                    <span class="tooltiptext">Nombre de Take Profit atteints (TP1, TP2, TP3)</span>
+                </div>
+                <div class="panel tooltip" style="background:linear-gradient(135deg,rgba(168,85,247,0.1),rgba(217,70,239,0.1))">
+                    <div style="font-size:13px;color:var(--muted);margin-bottom:8px;font-weight:700">WIN RATE</div>
+                    <div style="font-size:32px;font-weight:900;color:var(--purple)">{kpi['winrate']}%</div>
+                    <span class="tooltiptext">Pourcentage de trades gagnants (TP) vs perdants (SL)</span>
+                </div>
+            </div>
+
+            <div class="panel tooltip" style="margin-bottom:24px">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:16px">🌊 Altseason Index</h2>
+                <div style="display:flex;align-items:center;gap:24px;margin-bottom:16px">
+                    <div style="flex:1">
+                        <div style="font-size:48px;font-weight:900;color:var(--accent)">{alt['score']}/100</div>
+                        <div style="color:var(--muted);font-size:14px">{alt['label']}</div>
+                    </div>
+                    <div style="flex:2">
+                        <div style="background:rgba(100,116,139,0.1);height:20px;border-radius:10px;overflow:hidden">
+                            <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));width:{alt['score']}%;transition:width 0.3s"></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:var(--muted);font-style:italic">{alt['disclaimer']}</div>
+                <span class="tooltiptext">Score composite basé sur: ratio LONG/SHORT, ratio TP/SL, nombre de cryptos en gain, et momentum d'entrées récentes</span>
+            </div>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">📊 Performance (30 derniers jours)</h3>
+                <canvas id="performanceChart"></canvas>
+            </div>
+
+            <div class="panel">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:15px">
+                    <div>
+                        <h2 style="font-size:20px;font-weight:800">📊 Tous les Trades</h2>
+                        <div style="font-size:12px;color:var(--muted);margin-top:8px">
+                            <span style="color:var(--success);font-weight:600">✓ = TP atteint</span> • 
+                            <span style="opacity:0.6">Prix grisé = Non atteint</span> • 
+                            <span style="cursor:help" title="Survolez un TP atteint pour voir l'heure">Survolez pour l'heure</span>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                        <button onclick="resetDatabase()" class="btn btn-danger" style="display:flex;align-items:center;gap:8px">
+                            🗑️ Reset Database
+                        </button>
+                        <select id="filterSelect" style="padding:10px 16px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--txt);font-size:14px;cursor:pointer">
+                            <option value="all">Tous les trades ({total_trades})</option>
+                            <option value="tp">Avec TP atteints</option>
+                            <option value="sl">Avec SL touchés</option>
+                            <option value="active">En cours ({kpi['active_trades']})</option>
+                        </select>
+                        <input type="text" id="searchInput" class="search-bar" placeholder="🔍 Rechercher une crypto...">
+                    </div>
+                </div>
+                <div style="overflow-x:auto">
+                    <table id="tradesTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable tooltip" data-column="date">Date<span class="tooltiptext">Date et heure d'ouverture du trade</span></th>
+                                <th class="sortable tooltip" data-column="crypto">Crypto<span class="tooltiptext">Symbole de la cryptomonnaie</span></th>
+                                <th class="sortable tooltip" data-column="tf">TimeFrame<span class="tooltiptext">Unité de temps du graphique (15m, 1h, 4h, etc.)</span></th>
+                                <th class="sortable tooltip" data-column="side">Status<span class="tooltiptext">Direction du trade (LONG = achat, SHORT = vente)</span></th>
+                                <th class="tooltip">Entry<span class="tooltiptext">Prix d'entrée du trade</span></th>
+                                <th class="tooltip">TP1<span class="tooltiptext">Premier objectif de profit (Take Profit 1)</span></th>
+                                <th class="tooltip">TP2<span class="tooltiptext">Deuxième objectif de profit (Take Profit 2)</span></th>
+                                <th class="tooltip">TP3<span class="tooltiptext">Troisième objectif de profit (Take Profit 3)</span></th>
+                                <th class="tooltip">SL<span class="tooltiptext">Stop Loss - Prix de protection contre les pertes</span></th>
+                                <th class="sortable tooltip" data-column="pl">P&L<span class="tooltiptext">Profit & Loss - Gain ou perte en pourcentage. * = estimation en cours</span></th>
+                                <th class="tooltip">Validation<span class="tooltiptext">État actuel du trade (TP atteint, SL touché, ou en cours)</span></th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows}</tbody>
+                    </table>
+                </div>
+                <div class="pagination">
+                    <button onclick="changePage(1)" id="firstPage">⏮ Premier</button>
+                    <button onclick="changePage(currentPage - 1)" id="prevPage">◀ Précédent</button>
+                    <span id="pageInfo">Page <span id="currentPageNum">1</span> sur <span id="totalPages">1</span></span>
+                    <button onclick="changePage(currentPage + 1)" id="nextPage">Suivant ▶</button>
+                    <button onclick="changePage(totalPagesCount)" id="lastPage">Dernier ⏭</button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+    let sortColumn = '';
+    let sortDirection = 'asc';
+    let currentPage = 1;
+    let totalPagesCount = Math.ceil({total_trades} / 50);
+    let lastTradeCount = {total_trades};
+
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+
+    async function changePage(page) {{
+        if (page < 1 || page > totalPagesCount) return;
+        currentPage = page;
+        
+        try {{
+            const response = await fetch(`/api/trades-data?page=${{page}}&per_page=50`);
+            const data = await response.json();
+            
+            if (!data.ok) throw new Error(data.error);
+            
+            updateTable(data.trades);
+            updatePagination(data.pagination);
+        }} catch (error) {{
+            showError('Erreur de chargement des trades: ' + error.message);
+        }}
+    }}
+
+    function updateTable(trades) {{
+        const tbody = document.querySelector('#tradesTable tbody');
+        tbody.innerHTML = trades.map((r, idx) => {{
+            const state_class = r.row_state;
+            const side_badge = `<span class="badge badge-${{r.side ? r.side.toLowerCase() : 'pending'}}">${{r.side || 'N/A'}}</span>`;
+            const tf_badge = `<span class="badge badge-tf">${{r.tf_label}}</span>`;
+            
+            let status_html = "";
+            if (r.tp1_hit) status_html += '<span class="badge badge-tp">TP1 ✓</span> ';
+            if (r.tp2_hit) status_html += '<span class="badge badge-tp">TP2 ✓</span> ';
+            if (r.tp3_hit) status_html += '<span class="badge badge-tp">TP3 ✓</span> ';
+            if (r.sl_hit) status_html += '<span class="badge badge-sl">SL ✗</span>';
+            if (!status_html) status_html = '<span class="badge badge-pending">En cours</span>';
+            
+            const entry_val = r.entry ? r.entry.toFixed(4) : "N/A";
+            
+            let tp1_val = "N/A";
+            if (r.tp1) {{
+                if (r.tp1_hit) {{
+                    const tp1_time = r.tp1_time ? new Date(r.tp1_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp1_time ? ` title="Atteint à ${{tp1_time}}"` : '';
+                    tp1_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp1.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp1_val = `<span style="opacity:0.6">${{r.tp1.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp2_val = "N/A";
+            if (r.tp2) {{
+                if (r.tp2_hit) {{
+                    const tp2_time = r.tp2_time ? new Date(r.tp2_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp2_time ? ` title="Atteint à ${{tp2_time}}"` : '';
+                    tp2_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp2.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp2_val = `<span style="opacity:0.6">${{r.tp2.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            let tp3_val = "N/A";
+            if (r.tp3) {{
+                if (r.tp3_hit) {{
+                    const tp3_time = r.tp3_time ? new Date(r.tp3_time).toLocaleTimeString('fr-FR') : '';
+                    const tooltip = tp3_time ? ` title="Atteint à ${{tp3_time}}"` : '';
+                    tp3_val = `<span style="color:var(--success);font-weight:900;background:rgba(16,185,129,0.1);padding:4px 8px;border-radius:6px;cursor:help" class="tp-hit"${{tooltip}}>${{r.tp3.toFixed(4)}} ✓</span>`;
+                }} else {{
+                    tp3_val = `<span style="opacity:0.6">${{r.tp3.toFixed(4)}}</span>`;
+                }}
+            }}
+            
+            const sl_val = r.sl ? r.sl.toFixed(4) : "N/A";
+            
+            let pl_html = "N/A";
+            if (r.entry && ['tp', 'sl'].includes(r.row_state)) {{
+                const entry_price = r.entry;
+                if (r.sl_hit && r.sl) {{
+                    let pl_pct = ((r.sl - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--danger);font-weight:700">${{pl_pct.toFixed(2)}}%</span>`;
+                }} else if (r.tp1_hit && r.tp1) {{
+                    let pl_pct = ((r.tp1 - entry_price) / entry_price) * 100;
+                    if (r.side === "SHORT") pl_pct = -pl_pct;
+                    pl_html = `<span style="color:var(--success);font-weight:700">+${{pl_pct.toFixed(2)}}%</span>`;
+                }}
+            }}
+            
+            const date_str = new Date(r.t_entry).toLocaleString('fr-FR');
+            
+            return `<tr class="trade-row ${{state_class}}" data-symbol="${{r.symbol}}" data-side="${{r.side}}" data-tf="${{r.tf_label}}" data-date="${{r.t_entry}}">
+                <td>${{date_str}}</td>
+                <td><strong>${{r.symbol}}</strong></td>
+                <td>${{tf_badge}}</td>
+                <td>${{side_badge}}</td>
+                <td><strong style="color:var(--info)">${{entry_val}}</strong></td>
+                <td>${{tp1_val}}</td>
+                <td>${{tp2_val}}</td>
+                <td>${{tp3_val}}</td>
+                <td>${{sl_val}}</td>
+                <td>${{pl_html}}</td>
+                <td>${{status_html}}</td>
+            </tr>`;
+        }}).join('');
+    }}
+
+    function updatePagination(pagination) {{
+        currentPage = pagination.page;
+        totalPagesCount = pagination.total_pages;
+        
+        document.getElementById('currentPageNum').textContent = pagination.page;
+        document.getElementById('totalPages').textContent = pagination.total_pages;
+        
+        document.getElementById('firstPage').disabled = pagination.page === 1;
+        document.getElementById('prevPage').disabled = pagination.page === 1;
+        document.getElementById('nextPage').disabled = pagination.page === pagination.total_pages;
+        document.getElementById('lastPage').disabled = pagination.page === pagination.total_pages;
+    }}
+
+    function showError(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 5000);
+    }}
+
+    function showSuccess(message) {{
+        const toast = document.createElement('div');
+        toast.className = 'error-toast success';
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 3000);
+    }}
+
+    async function resetDatabase() {{
+        if (!confirm('⚠️ ATTENTION : Cela va supprimer TOUS les trades. Une sauvegarde sera créée. Continuer ?')) {{
+            return;
+        }}
+        
+        const secret = prompt('Entrez votre webhook secret pour confirmer :');
+        if (!secret) return;
+        
+        try {{
+            const response = await fetch('/api/reset-database', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{secret: secret}})
+            }});
+            
+            const data = await response.json();
+            
+            if (data.ok) {{
+                showSuccess('✅ Base réinitialisée ! Backup: ' + data.backup);
+                setTimeout(() => location.reload(), 2000);
+            }} else {{
+                showError('❌ Erreur: ' + (data.error || 'Secret invalide'));
+            }}
+        }} catch (error) {{
+            showError('❌ Erreur: ' + error.message);
+        }}
+    }}
+
+    document.querySelectorAll('.sortable').forEach(header => {{
+        header.addEventListener('click', function() {{
+            const column = this.dataset.column;
+            const tbody = document.querySelector('#tradesTable tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            if (sortColumn === column) {{
+                sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+            }} else {{
+                sortColumn = column;
+                sortDirection = 'asc';
+            }}
+            
+            document.querySelectorAll('.sortable').forEach(h => h.className = 'sortable tooltip');
+            this.className = 'sortable tooltip ' + sortDirection;
+            
+            rows.sort((a, b) => {{
+                let aVal, bVal;
+                if (column === 'date') {{
+                    aVal = parseInt(a.dataset.date);
+                    bVal = parseInt(b.dataset.date);
+                }} else if (column === 'crypto') {{
+                    aVal = a.dataset.symbol;
+                    bVal = b.dataset.symbol;
+                }} else if (column === 'tf') {{
+                    aVal = a.dataset.tf;
+                    bVal = b.dataset.tf;
+                }} else if (column === 'side') {{
+                    aVal = a.dataset.side;
+                    bVal = b.dataset.side;
+                }} else if (column === 'pl') {{
+                    aVal = parseFloat(a.cells[9].textContent.replace('%', '').replace('+', '').replace('*', '')) || 0;
+                    bVal = parseFloat(b.cells[9].textContent.replace('%', '').replace('+', '').replace('*', '')) || 0;
+                }}
+                
+                if (sortDirection === 'asc') {{
+                    return aVal > bVal ? 1 : -1;
+                }} else {{
+                    return aVal < bVal ? 1 : -1;
+                }}
+            }});
+            
+            rows.forEach(row => tbody.appendChild(row));
+        }});
+    }});
+
+    document.getElementById('searchInput').addEventListener('input', function(e) {{
+        const searchTerm = e.target.value.toLowerCase();
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        
+        rows.forEach(row => {{
+            const symbol = row.dataset.symbol.toLowerCase();
+            if (symbol.includes(searchTerm)) {{
+                row.style.display = '';
+            }} else {{
+                row.style.display = 'none';
+            }}
+        }});
+    }});
+
+    document.getElementById('filterSelect').addEventListener('change', function(e) {{
+        const filterValue = e.target.value;
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        
+        rows.forEach(row => {{
+            const rowClass = row.className;
+            let shouldShow = true;
+            
+            if (filterValue === 'tp') {{
+                shouldShow = rowClass.includes('trade-row tp');
+            }} else if (filterValue === 'sl') {{
+                shouldShow = rowClass.includes('trade-row sl');
+            }} else if (filterValue === 'active') {{
+                shouldShow = rowClass.includes('trade-row normal');
+            }}
+            
+            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+            const symbol = row.dataset.symbol.toLowerCase();
+            
+            if (shouldShow && (!searchTerm || symbol.includes(searchTerm))) {{
+                row.style.display = '';
+            }} else {{
+                row.style.display = 'none';
+            }}
+        }});
+    }});
+
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+
+    function updateFilterCounts() {{
+        const rows = document.querySelectorAll('#tradesTable tbody tr');
+        let tpCount = 0;
+        let slCount = 0;
+        let activeCount = 0;
+        
+        rows.forEach(row => {{
+            const rowClass = row.className;
+            if (rowClass.includes('trade-row tp')) tpCount++;
+            if (rowClass.includes('trade-row sl')) slCount++;
+            if (rowClass.includes('trade-row normal')) activeCount++;
+        }});
+        
+        const filterSelect = document.getElementById('filterSelect');
+        filterSelect.innerHTML = `
+            <option value="all">Tous les trades (${{rows.length}})</option>
+            <option value="tp">✅ Avec TP atteints (${{tpCount}})</option>
+            <option value="sl">🛑 Avec SL touchés (${{slCount}})</option>
+            <option value="active">⏳ En cours (${{activeCount}})</option>
+        `;
+    }}
+    
+    updateFilterCounts();
+
+    async function loadCharts() {{
+        try {{
+            const response = await fetch('/api/charts-data');
+            const result = await response.json();
+            
+            if (!result.ok) throw new Error(result.error);
+            
+            const data = result.data;
+            const ctx = document.getElementById('performanceChart').getContext('2d');
+            
+            new Chart(ctx, {{
+                type: 'line',
+                data: {{
+                    labels: data.daily.map(d => d.date),
+                    datasets: [
+                        {{
+                            label: 'Wins',
+                            data: data.daily.map(d => d.wins),
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            tension: 0.4
+                        }},
+                        {{
+                            label: 'Losses',
+                            data: data.daily.map(d => d.losses),
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            tension: 0.4
+                        }}
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {{
+                        legend: {{
+                            labels: {{ color: '#e2e8f0' }}
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }},
+                        x: {{
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }}
+                    }}
+                }}
+            }});
+        }} catch (error) {{
+            console.error('Erreur chargement graphiques:', error);
+            showError('Impossible de charger les graphiques');
+        }}
+    }}
+
+    loadCharts();
+
+    setInterval(async function() {{
+        try {{
+            const response = await fetch('/api/trades-data?page=1&per_page=1');
+            const data = await response.json();
+            
+            if (data.ok && data.pagination.total > lastTradeCount) {{
+                const newCount = data.pagination.total - lastTradeCount;
+                lastTradeCount = data.pagination.total;
+                
+                const badge = document.getElementById('newTradesBadge');
+                if (badge) {{
+                    badge.textContent = newCount;
+                    badge.style.display = 'inline-flex';
+                }}
+                
+                showSuccess(`${{newCount}} nouveau(x) trade(s) !`);
+                
+                if (currentPage === 1) {{
+                    changePage(1);
+                }}
+            }}
+        }} catch (e) {{
+            console.log('Vérification des nouveaux trades échouée:', e);
+        }}
+    }}, 30000);
+    </script>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/positions", response_class=HTMLResponse)
+async def positions_page():
+    rows = [r for r in build_trade_rows(limit=1000) if r["row_state"] == "normal"]
+    kpi = compute_kpis(rows)
+    
+    table_rows = ""
+    for idx, r in enumerate(rows, start=1):
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
+        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
+        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
+        
+        table_rows += f'''
+        <tr class="trade-row normal">
+            <td>{date_str}</td>
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{tf_badge}</td>
+            <td>{side_badge}</td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
+        </tr>'''
+    
+    empty_row = '<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--muted)">Aucune position active</td></tr>'
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Positions Actives - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
+    <div class="app">
+        {generate_sidebar_html("positions", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📈 Positions Actives</h1>
+                <p style="color:var(--muted)">{len(rows)} position(s) en cours</p>
+            </header>
+            
+            <div class="panel">
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Crypto</th>
+                                <th>TimeFrame</th>
+                                <th>Status</th>
+                                <th>Entry</th>
+                                <th>TP1</th>
+                                <th>TP2</th>
+                                <th>TP3</th>
+                                <th>SL</th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows if table_rows else empty_row}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+    </script>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page():
+    rows = [r for r in build_trade_rows(limit=1000) if r["row_state"] in ("tp", "sl", "cancel")]
+    kpi = compute_kpis(rows)
+    
+    table_rows = ""
+    for idx, r in enumerate(rows, start=1):
+        result = "WIN" if r["row_state"] == "tp" else ("LOSS" if r["row_state"] == "sl" else "ANNULÉ")
+        result_class = r["row_state"]
+        side_badge = f'<span class="badge badge-{r["side"].lower() if r["side"] else "pending"}">{r["side"] or "N/A"}</span>'
+        tf_badge = f'<span class="badge badge-tf">{r["tf_label"]}</span>'
+        result_badge = f'<span class="badge badge-{result_class}">{result}</span>'
+        
+        entry_val = f"{r['entry']:.4f}" if r["entry"] else "N/A"
+        tp1_val = f"{r['tp1']:.4f}" if r["tp1"] else "N/A"
+        tp2_val = f"{r['tp2']:.4f}" if r["tp2"] else "N/A"
+        tp3_val = f"{r['tp3']:.4f}" if r["tp3"] else "N/A"
+        sl_val = f"{r['sl']:.4f}" if r["sl"] else "N/A"
+        
+        pl_html = "N/A"
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--danger)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">{pl_pct:.2f}%</span>'
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    pl_color = "var(--success)"
+                    pl_html = f'<span style="color:{pl_color};font-weight:700">+{pl_pct:.2f}%</span>'
+            except:
+                pass
+        
+        date_str = datetime.fromtimestamp(r["t_entry"] / 1000).strftime("%Y-%m-%d %H:%M") if r.get("t_entry") else "N/A"
+        
+        table_rows += f'''
+        <tr class="trade-row {result_class}">
+            <td>{date_str}</td>
+            <td><strong>{r["symbol"]}</strong></td>
+            <td>{tf_badge}</td>
+            <td>{side_badge}</td>
+            <td><strong style="color:var(--info)">{entry_val}</strong></td>
+            <td>{tp1_val}</td>
+            <td>{tp2_val}</td>
+            <td>{tp3_val}</td>
+            <td>{sl_val}</td>
+            <td>{pl_html}</td>
+            <td>{result_badge}</td>
+        </tr>'''
+    
+    empty_row = '<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--muted)">Aucun historique</td></tr>'
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historique - AI Trader Pro</title>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
+    <div class="app">
+        {generate_sidebar_html("history", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📜 Historique</h1>
+                <p style="color:var(--muted)">{len(rows)} trade(s) terminé(s)</p>
+            </header>
+            
+            <div class="panel">
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Crypto</th>
+                                <th>TimeFrame</th>
+                                <th>Status</th>
+                                <th>Entry</th>
+                                <th>TP1</th>
+                                <th>TP2</th>
+                                <th>TP3</th>
+                                <th>SL</th>
+                                <th>P&L</th>
+                                <th>Résultat</th>
+                            </tr>
+                        </thead>
+                        <tbody>{table_rows if table_rows else empty_row}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+    </script>
+</body>
+</html>'''
+    return HTMLResponse(html)
+
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_page():
+    rows = build_trade_rows(limit=10000)
+    kpi = compute_kpis(rows)
+    alt = compute_altseason_snapshot()
+    
+    crypto_stats = {}
+    for r in rows:
+        symbol = r["symbol"]
+        if symbol not in crypto_stats:
+            crypto_stats[symbol] = {"total": 0, "wins": 0, "losses": 0, "pending": 0, "tp1": 0, "tp2": 0, "tp3": 0, "sl": 0, "total_pl": 0.0, "trades": []}
+        
+        crypto_stats[symbol]["total"] += 1
+        crypto_stats[symbol]["trades"].append(r)
+        
+        if r["row_state"] == "tp":
+            crypto_stats[symbol]["wins"] += 1
+        elif r["row_state"] == "sl":
+            crypto_stats[symbol]["losses"] += 1
+        elif r["row_state"] == "normal":
+            crypto_stats[symbol]["pending"] += 1
+        
+        if r["tp1_hit"]:
+            crypto_stats[symbol]["tp1"] += 1
+        if r["tp2_hit"]:
+            crypto_stats[symbol]["tp2"] += 1
+        if r["tp3_hit"]:
+            crypto_stats[symbol]["tp3"] += 1
+        if r["sl_hit"]:
+            crypto_stats[symbol]["sl"] += 1
+        
+        if r["entry"] and r["row_state"] in ("tp", "sl"):
+            try:
+                entry_price = float(r["entry"])
+                if r["sl_hit"] and r["sl"]:
+                    exit_price = float(r["sl"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    crypto_stats[symbol]["total_pl"] += pl_pct
+                elif r["tp1_hit"] and r["tp1"]:
+                    exit_price = float(r["tp1"])
+                    pl_pct = ((exit_price - entry_price) / entry_price) * 100
+                    if r["side"] == "SHORT":
+                        pl_pct = -pl_pct
+                    crypto_stats[symbol]["total_pl"] += pl_pct
+            except:
+                pass
+    
+    for symbol in crypto_stats:
+        stats = crypto_stats[symbol]
+        total_closed = stats["wins"] + stats["losses"]
+        stats["winrate"] = (stats["wins"] / total_closed * 100) if total_closed > 0 else 0
+    
+    sorted_cryptos = sorted(crypto_stats.items(), key=lambda x: x[1]["total"], reverse=True)[:20]
+    
+    crypto_rows = ""
+    for idx, (symbol, stats) in enumerate(sorted_cryptos, start=1):
+        winrate_color = "var(--success)" if stats["winrate"] >= 50 else "var(--danger)"
+        pl_color = "var(--success)" if stats["total_pl"] >= 0 else "var(--danger)"
+        pl_sign = "+" if stats["total_pl"] >= 0 else ""
+        
+        crypto_rows += f'''
+        <tr class="trade-row">
+            <td><strong>#{idx}</strong></td>
+            <td><strong>{symbol}</strong></td>
+            <td>{stats["total"]}</td>
+            <td style="color:var(--success)">{stats["wins"]}</td>
+            <td style="color:var(--danger)">{stats["losses"]}</td>
+            <td style="color:var(--info)">{stats["pending"]}</td>
+            <td style="color:{winrate_color};font-weight:700">{stats["winrate"]:.1f}%</td>
+            <td style="color:{pl_color};font-weight:700">{pl_sign}{stats["total_pl"]:.2f}%</td>
+            <td><span class="badge badge-tp">{stats["tp1"]}</span> <span class="badge badge-tp">{stats["tp2"]}</span> <span class="badge badge-tp">{stats["tp3"]}</span></td>
+            <td><span class="badge badge-sl">{stats["sl"]}</span></td>
+        </tr>'''
+    
+    empty_row = '<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'
+    
+    html = f'''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics - AI Trader Pro</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>{get_base_css()}</style>
+</head>
+<body>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓</button>
+    <div class="app">
+        {generate_sidebar_html("analytics", kpi)}
+        <main class="main">
+            <header style="margin-bottom:32px">
+                <h1 style="font-size:36px;font-weight:900;margin-bottom:8px">📊 Analytics</h1>
+                <p style="color:var(--muted)">Analyse détaillée de vos performances</p>
+            </header>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">Performance Metrics Globales</h3>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">Win Rate</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{kpi['winrate']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{kpi['winrate']}%</div>
+                </div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">LONG Ratio</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['signals']['long_ratio']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['signals']['long_ratio']}%</div>
+                </div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">TP vs SL</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['signals']['tp_vs_sl']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['signals']['tp_vs_sl']}%</div>
+                </div>
+                <div style="display:flex;gap:10px;margin:10px 0;align-items:center">
+                    <div style="flex:0 0 100px;font-size:13px;font-weight:600">Altseason</div>
+                    <div style="flex:1;height:32px;background:rgba(100,116,139,0.1);border-radius:8px;position:relative;overflow:hidden">
+                        <div style="height:100%;background:linear-gradient(90deg,var(--success),var(--accent));border-radius:8px;transition:width 0.3s;width:{alt['score']}%"></div>
+                    </div>
+                    <div style="min-width:60px;text-align:right;font-weight:700;font-size:14px">{alt['score']}/100</div>
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:32px">
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Trades (24h)</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Total:</span> <strong>{kpi['total_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Actifs:</span> <strong style="color:var(--accent)">{kpi['active_trades']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Clôturés:</span> <strong>{kpi['total_closed']}</strong></div>
+                </div>
+                <div class="panel">
+                    <h3 style="margin-bottom:16px;font-weight:800">Résultats</h3>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Wins:</span> <strong style="color:var(--success)">{kpi['wins']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">Losses:</span> <strong style="color:var(--danger)">{kpi['losses']}</strong></div>
+                    <div style="font-size:14px;margin:8px 0"><span style="color:var(--muted)">TP Atteints:</span> <strong>{kpi['tp_hits']}</strong></div>
+                </div>
+            </div>
+
+            <div class="chart-container">
+                <h3 style="margin-bottom:20px;font-weight:800">📈 Top 10 Cryptos par Volume</h3>
+                <canvas id="cryptoChart"></canvas>
+            </div>
+
+            <div class="panel">
+                <h2 style="font-size:20px;font-weight:800;margin-bottom:20px">📈 Statistiques par Crypto (Top 20)</h2>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Rang</th>
+                                <th>Crypto</th>
+                                <th>Total Trades</th>
+                                <th>Wins</th>
+                                <th>Losses</th>
+                                <th>En cours</th>
+                                <th>Win Rate</th>
+                                <th>P&L Total</th>
+                                <th>TP (1/2/3)</th>
+                                <th>SL</th>
+                            </tr>
+                        </thead>
+                        <tbody>{crypto_rows if crypto_rows else empty_row}</tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+    function toggleTheme() {{
+        document.body.classList.toggle('light-mode');
+        localStorage.setItem('theme', document.body.classList.contains('light-mode') ? 'light' : 'dark');
+    }}
+    if (localStorage.getItem('theme') === 'light') {{
+        document.body.classList.add('light-mode');
+    }}
+    function toggleSidebar() {{
+        document.getElementById('sidebar').classList.toggle('open');
+    }}
+    document.getElementById('sidebarOverlay')?.addEventListener('click', toggleSidebar);
+    
+    async function loadCryptoChart() {{
+        try {{
+            const response = await fetch('/api/charts-data');
+            const result = await response.json();
+            
+            if (!result.ok) throw new Error(result.error);
+            
+            const data = result.data.top_cryptos;
+            const ctx = document.getElementById('cryptoChart').getContext('2d');
+            
+            new Chart(ctx, {{
+                type: 'bar',
+                data: {{
+                    labels: data.map(d => d.symbol),
+                    datasets: [{{
+                        label: 'Nombre de trades',
+                        data: data.map(d => d.count),
+                        backgroundColor: 'rgba(99, 102, 241, 0.6)',
+                        borderColor: '#6366f1',
+                        borderWidth: 2
+                    }}]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {{
+                        legend: {{ display: false }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                        }},
+                        x: {{
+                            ticks: {{ color: '#64748b' }},
+                            grid: {{ display: false }}
+                        }}
+                    }}
+                }}
+            }});
+        }} catch (error) {{
+            console.error('Erreur chargement graphique:', error);
+        }}
+    }}
+    
+    loadCryptoChart();
+    </script>
+</body>
+</html>'''
+    return HTMLResponse(html)
 
 @app.get("/risk", response_class=HTMLResponse)
 async def risk_page():
