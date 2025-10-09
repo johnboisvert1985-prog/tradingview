@@ -879,7 +879,7 @@ async def health():
     ]}
 
 @app.post("/tv-webhook")
-@limiter.limit("100/minute")
+@rate_limit("100/minute")
 async def webhook(request: Request):
     try:
         data = await request.json()
@@ -1432,9 +1432,305 @@ async def backtest_page():
     </div></body></html>"""
     return html
 
-# Les autres pages restent identiques (ai-insights, equity-curve, heatmap, etc.)
-# Je les ai volontairement omises pour respecter la limite de caractères
-# Elles sont déjà présentes dans votre code original
+@app.get("/ai-insights", response_class=HTMLResponse)
+async def ai_page():
+    rows = build_trade_rows(limit=200)
+    patterns = detect_trading_patterns(rows)
+    
+    patterns_html = "".join(f'<li>{p}</li>' for p in patterns)
+    
+    html = f"""<!DOCTYPE html><html><head><title>AI Insights</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>🤖 AI Insights</h1><p>Intelligence artificielle appliquée à vos trades</p></div>
+    {NAV}
+    <div class="card"><h2>AI Trade Scoring</h2>
+    <p style="color:#64748b;margin-bottom:20px">L'IA analyse chaque nouveau trade et lui attribue un score de 0 à 100 basé sur:</p>
+    <ul class="list">
+        <li>✅ Performance historique du symbol sur ce timeframe</li>
+        <li>✅ Heure de la journée (8h-16h UTC = optimal)</li>
+        <li>✅ Confiance du signal initial</li>
+        <li>✅ Momentum récent (10 derniers trades)</li>
+        <li>✅ Performance LONG vs SHORT récente</li>
+    </ul>
+    </div>
+    <div class="card"><h2>Patterns Détectés</h2>
+    <ul class="list">{patterns_html}</ul>
+    </div>
+    </div></body></html>"""
+    return html
+
+@app.get("/equity-curve", response_class=HTMLResponse)
+async def equity_page():
+    rows = build_trade_rows(limit=1000)
+    curve = calculate_equity_curve(rows)
+    
+    current_equity = curve[-1]["equity"] if curve else settings.INITIAL_CAPITAL
+    total_return = ((current_equity - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL) * 100
+    max_dd = max((p["drawdown"] for p in curve), default=0)
+    
+    html = f"""<!DOCTYPE html><html><head><title>Equity Curve</title>{CSS}
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head>
+    <body><div class="container">
+    <div class="header"><h1>📈 Equity Curve</h1><p>Evolution de votre capital</p></div>
+    {NAV}
+    <div class="grid">
+        <div class="metric"><div class="metric-label">Capital Initial</div><div class="metric-value">${settings.INITIAL_CAPITAL:.0f}</div></div>
+        <div class="metric"><div class="metric-label">Capital Actuel</div><div class="metric-value">${current_equity:.0f}</div></div>
+        <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" style="color:{'#10b981' if total_return >= 0 else '#ef4444'}">{total_return:+.1f}%</div></div>
+        <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" style="color:#ef4444">-{max_dd:.1f}%</div></div>
+    </div>
+    <div class="chart">
+        <canvas id="equityChart"></canvas>
+    </div>
+    <script>
+    const ctx = document.getElementById('equityChart').getContext('2d');
+    const data = {json.dumps([{"x": i, "y": p["equity"]} for i, p in enumerate(curve)])};
+    new Chart(ctx, {{
+        type: 'line',
+        data: {{
+            datasets: [{{
+                label: 'Equity ($)',
+                data: data,
+                borderColor: '#6366f1',
+                backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                tension: 0.4,
+                fill: true
+            }}]
+        }},
+        options: {{
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {{
+                x: {{ type: 'linear', title: {{ display: true, text: 'Trade #', color: '#64748b' }} }},
+                y: {{ title: {{ display: true, text: 'Capital ($)', color: '#64748b' }} }}
+            }},
+            plugins: {{
+                legend: {{ labels: {{ color: '#e2e8f0' }} }}
+            }}
+        }}
+    }});
+    </script>
+    </div></body></html>"""
+    return html
+
+@app.get("/heatmap", response_class=HTMLResponse)
+async def heatmap_page():
+    rows = build_trade_rows(limit=1000)
+    heatmap = calculate_performance_heatmap(rows)
+    
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    hours = ["00h", "04h", "08h", "12h", "16h", "20h"]
+    
+    heatmap_html = "<table style='width:100%;border-collapse:collapse'><thead><tr><th style='padding:8px;border:1px solid rgba(99,102,241,0.2)'></th>"
+    for day in days:
+        heatmap_html += f"<th style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-size:12px'>{day[:3]}</th>"
+    heatmap_html += "</tr></thead><tbody>"
+    
+    for hour in hours:
+        heatmap_html += f"<tr><td style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-weight:600'>{hour}</td>"
+        for day in days:
+            key = f"{day}_{hour}"
+            data = heatmap.get(key, {"total": 0, "winrate": 0})
+            
+            if data["total"] == 0:
+                color = "#1e293b"
+                text = "-"
+            elif data["winrate"] >= 65:
+                color = "rgba(16,185,129,0.3)"
+                text = f"{data['winrate']:.0f}%"
+            elif data["winrate"] >= 50:
+                color = "rgba(251,191,36,0.3)"
+                text = f"{data['winrate']:.0f}%"
+            else:
+                color = "rgba(239,68,68,0.3)"
+                text = f"{data['winrate']:.0f}%"
+            
+            heatmap_html += f"<td style='padding:12px;border:1px solid rgba(99,102,241,0.2);background:{color};text-align:center;font-weight:700'>{text}</td>"
+        heatmap_html += "</tr>"
+    
+    heatmap_html += "</tbody></table>"
+    
+    html = f"""<!DOCTYPE html><html><head><title>Heatmap</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>🔥 Heatmap Performance</h1><p>Performance par jour et heure</p></div>
+    {NAV}
+    <div class="card">
+        <h2>Performance par bloc de 4h</h2>
+        <p style="color:#64748b;margin-bottom:20px">🟢 > 65% | 🟡 50-65% | 🔴 < 50%</p>
+        {heatmap_html}
+    </div>
+    </div></body></html>"""
+    return html
+
+@app.get("/advanced-metrics", response_class=HTMLResponse)
+async def metrics_page():
+    rows = build_trade_rows(limit=1000)
+    metrics = calculate_advanced_metrics(rows)
+    
+    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
+    wins = [r for r in closed if r["row_state"] == "tp"]
+    wr = (len(wins) / len(closed) * 100) if closed else 0
+    
+    returns = []
+    for r in closed:
+        if r.get("entry"):
+            try:
+                entry = float(r["entry"])
+                exit_p = float(r["sl"]) if r.get("sl_hit") else float(r["tp1"]) if r.get("tp1") else None
+                if exit_p:
+                    pl_pct = ((exit_p - entry) / entry) * 100
+                    if r.get("side") == "SHORT": pl_pct = -pl_pct
+                    returns.append(pl_pct)
+            except: pass
+    
+    avg_w = sum(r for r in returns if r > 0) / max(1, len([r for r in returns if r > 0]))
+    avg_l = abs(sum(r for r in returns if r < 0) / max(1, len([r for r in returns if r < 0])))
+    
+    kelly = calculate_kelly_position(wr, avg_w, avg_l)
+    
+    html = f"""<!DOCTYPE html><html><head><title>Advanced Metrics</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>📊 Métriques Avancées</h1><p>Analyse professionnelle de performance</p></div>
+    {NAV}
+    <div class="grid">
+        <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value">{metrics['sharpe_ratio']}</div><p style="font-size:12px;color:#64748b;margin-top:8px">{'Excellent' if metrics['sharpe_ratio'] >= 2 else 'Bon' if metrics['sharpe_ratio'] >= 1 else 'À améliorer'}</p></div>
+        <div class="metric"><div class="metric-label">Sortino Ratio</div><div class="metric-value">{metrics['sortino_ratio']}</div></div>
+        <div class="metric"><div class="metric-label">Calmar Ratio</div><div class="metric-value">{metrics['calmar_ratio']}</div></div>
+        <div class="metric"><div class="metric-label">Expectancy</div><div class="metric-value">{metrics['expectancy']:.2f}%</div></div>
+    </div>
+    <div class="card"><h2>Kelly Criterion - Position Sizing</h2>
+    <p style="color:#64748b;margin-bottom:20px">Taille de position optimale calculée selon la formule Kelly</p>
+    <div class="grid">
+        <div class="metric"><div class="metric-label">Kelly %</div><div class="metric-value">{kelly['kelly_pct']:.1f}%</div></div>
+        <div class="metric"><div class="metric-label">Kelly Conservateur</div><div class="metric-value">{kelly['conservative_pct']:.1f}%</div></div>
+    </div>
+    <p style="padding:16px;background:rgba(99,102,241,0.1);border-radius:12px;margin-top:20px">{kelly['recommendation']}</p>
+    </div>
+    <div class="card"><h2>Comprendre les métriques</h2>
+    <ul class="list">
+        <li><strong>Sharpe Ratio:</strong> Rendement ajusté au risque. > 2 = Excellent</li>
+        <li><strong>Sortino Ratio:</strong> Comme Sharpe mais ignore la volatilité positive</li>
+        <li><strong>Calmar Ratio:</strong> Rendement / Max Drawdown. > 3 = Excellent</li>
+        <li><strong>Expectancy:</strong> Gain moyen par trade. Doit être positif</li>
+        <li><strong>Kelly Criterion:</strong> % optimal du capital à risquer par trade</li>
+    </ul>
+    </div>
+    </div></body></html>"""
+    return html
+
+@app.get("/patterns", response_class=HTMLResponse)
+async def patterns_page():
+    rows = build_trade_rows(limit=200)
+    patterns = detect_trading_patterns(rows)
+    
+    patterns_html = "".join(f'<li>{p}</li>' for p in patterns)
+    
+    html = f"""<!DOCTYPE html><html><head><title>Patterns</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>🔍 Pattern Detection</h1><p>L'IA détecte des patterns dans votre comportement</p></div>
+    {NAV}
+    <div class="card"><h2>Patterns Détectés Automatiquement</h2>
+    <ul class="list">{patterns_html}</ul>
+    </div>
+    <div class="card"><h2>Comment utiliser ces insights</h2>
+    <p style="color:#64748b;margin-bottom:16px">Les patterns détectés vous aident à:</p>
+    <ul class="list">
+        <li>✅ Identifier vos meilleurs moments pour trader</li>
+        <li>✅ Découvrir vos setups les plus performants</li>
+        <li>✅ Éviter les conditions qui génèrent des pertes</li>
+        <li>✅ Optimiser votre stratégie en fonction de VOS données</li>
+    </ul>
+    </div>
+    </div></body></html>"""
+    return html
+
+@app.get("/journal", response_class=HTMLResponse)
+async def journal_page():
+    rows = build_trade_rows(limit=50)
+    
+    table_rows = ""
+    for r in rows[:20]:
+        notes = db_query("SELECT note, emotion, tags FROM trade_notes WHERE trade_id=? ORDER BY created_at DESC LIMIT 1", (r["trade_id"],))
+        note_text = notes[0]["note"] if notes else "Pas de note"
+        emotion = notes[0]["emotion"] if notes else "-"
+        
+        table_rows += f"""<tr style="border-bottom:1px solid rgba(99,102,241,0.1)">
+            <td style="padding:12px">{r['symbol']}</td>
+            <td style="padding:12px">{r['side']}</td>
+            <td style="padding:12px"><span class="badge {'badge-green' if r['row_state']=='tp' else 'badge-red' if r['row_state']=='sl' else 'badge-yellow'}">{r['row_state'].upper()}</span></td>
+            <td style="padding:12px">{emotion}</td>
+            <td style="padding:12px">{note_text[:50]}</td>
+        </tr>"""
+    
+    html = f"""<!DOCTYPE html><html><head><title>Journal</title>{CSS}</head>
+    <body><div class="container">
+    <div class="header"><h1>📝 Trading Journal</h1><p>Notes psychologiques et analyse</p></div>
+    {NAV}
+    <div class="card"><h2>Journal des Trades</h2>
+    <table style="width:100%;border-collapse:collapse">
+        <thead><tr style="border-bottom:2px solid rgba(99,102,241,0.2)">
+            <th style="padding:12px;text-align:left;color:#64748b">Symbol</th>
+            <th style="padding:12px;text-align:left;color:#64748b">Side</th>
+            <th style="padding:12px;text-align:left;color:#64748b">Résultat</th>
+            <th style="padding:12px;text-align:left;color:#64748b">Émotion</th>
+            <th style="padding:12px;text-align:left;color:#64748b">Note</th>
+        </tr></thead>
+        <tbody>{table_rows}</tbody>
+    </table>
+    </div>
+    <div class="card">
+        <h2>Ajouter une Note</h2>
+        <form id="journalForm">
+            <label>Trade ID</label>
+            <input type="text" name="trade_id" required placeholder="ex: BTCUSDT_4h_1234567890">
+            
+            <label>Émotion</label>
+            <select name="emotion">
+                <option value="">Sélectionner</option>
+                <option value="Confiant">😊 Confiant</option>
+                <option value="Anxieux">😰 Anxieux</option>
+                <option value="FOMO">😱 FOMO</option>
+                <option value="Patient">🧘 Patient</option>
+                <option value="Revanche">😡 Revanche</option>
+                <option value="Neutre">😐 Neutre</option>
+            </select>
+            
+            <label>Note</label>
+            <textarea name="note" rows="4" placeholder="Décrivez ce qui s'est passé, ce que vous avez ressenti..."></textarea>
+            
+            <label>Tags (séparés par virgule)</label>
+            <input type="text" name="tags" placeholder="ex: FOMO, Impatient, Bon setup">
+            
+            <button type="submit">💾 Enregistrer</button>
+        </form>
+        <div id="journalMessage" style="margin-top:16px"></div>
+    </div>
+    <script>
+    document.getElementById('journalForm').addEventListener('submit', async (e) => {{
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        const data = Object.fromEntries(formData.entries());
+        
+        const res = await fetch('/api/journal', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(data)
+        }});
+        
+        const result = await res.json();
+        const msg = document.getElementById('journalMessage');
+        
+        if (result.ok) {{
+            msg.innerHTML = '<p style="color:#10b981">✅ Note enregistrée avec succès !</p>';
+            e.target.reset();
+            setTimeout(() => location.reload(), 1500);
+        }} else {{
+            msg.innerHTML = '<p style="color:#ef4444">❌ Erreur lors de l\\'enregistrement</p>';
+        }}
+    }});
+    </script>
+    </div></body></html>"""
+    return html
 
 if __name__ == "__main__":
     import uvicorn
