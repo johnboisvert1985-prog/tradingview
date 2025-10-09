@@ -21,9 +21,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import httpx
 
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+# Rate limiting (optionnel)
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMIT_ENABLED = True
+except ImportError:
+    logger.warning("⚠️ slowapi non installé - Rate limiting désactivé")
+    RATE_LIMIT_ENABLED = False
+    Limiter = None
+    RateLimitExceeded = None
 
 # CONFIGURATION
 class Settings:
@@ -825,11 +833,24 @@ async def send_slack(text: str):
 # FASTAPI
 app = FastAPI(title="AI Trader Pro v3.0 ULTIMATE", version="3.0")
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if RATE_LIMIT_ENABLED:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    logger.info("✅ Rate limiting activé")
+else:
+    limiter = None
+    logger.info("⚠️ Rate limiting désactivé")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Helper pour rate limiting optionnel
+def rate_limit(limit_string):
+    def decorator(func):
+        if RATE_LIMIT_ENABLED and limiter:
+            return limiter.limit(limit_string)(func)
+        return func
+    return decorator
 
 # ROUTES
 @app.get("/", response_class=HTMLResponse)
