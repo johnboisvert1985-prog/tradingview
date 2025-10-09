@@ -1326,6 +1326,39 @@ async def risk_page():
     
     alert_html = f'<div class="alert-box {overtrading["alert_level"]}">{overtrading["alert_message"]}</div>'
     
+    # Préparer les valeurs pour éviter les backslashes dans les f-strings
+    ratio_color = 'var(--success)' if risk_metrics['win_loss_ratio'] >= 1.5 else 'var(--warning)'
+    ratio_label = 'Excellent' if risk_metrics['win_loss_ratio'] >= 2 else ('Bon' if risk_metrics['win_loss_ratio'] >= 1.5 else 'À améliorer')
+    
+    pf_color = 'var(--success)' if risk_metrics['profit_factor'] >= 1.5 else 'var(--warning)'
+    if risk_metrics['profit_factor'] >= 2:
+        pf_label = '🟢 Excellent'
+    elif risk_metrics['profit_factor'] >= 1.5:
+        pf_label = '🟢 Bon'
+    elif risk_metrics['profit_factor'] >= 1:
+        pf_label = '🟡 Acceptable'
+    else:
+        pf_label = '🔴 Attention'
+    
+    dd_label = '🟢 Faible' if risk_metrics['max_drawdown'] < 10 else ('🟡 Modéré' if risk_metrics['max_drawdown'] < 20 else '🔴 Élevé')
+    
+    if overtrading['alert_level'] == 'green':
+        ot_color = 'var(--success)'
+    elif overtrading['alert_level'] == 'orange':
+        ot_color = 'var(--orange)'
+    else:
+        ot_color = 'var(--danger)'
+    
+    cons_loss_color = 'var(--danger)' if overtrading['consecutive_losses'] >= overtrading['max_consecutive_losses'] else 'var(--muted)'
+    
+    # Recommandations
+    rec1 = '🟢 Votre Profit Factor est excellent (> 1.5). Continuez sur cette lancée !' if risk_metrics['profit_factor'] >= 1.5 else '🟡 Travaillez à améliorer votre Profit Factor en optimisant vos entrées et sorties.'
+    rec2 = '🟢 Votre ratio Gain/Perte est bon. Vos gains compensent bien vos pertes.' if risk_metrics['win_loss_ratio'] >= 1.5 else '🟡 Augmentez votre ratio en laissant courir vos gains plus longtemps.'
+    rec3 = '🟢 Drawdown maîtrisé. Votre gestion du risque est efficace.' if risk_metrics['max_drawdown'] < 15 else '🔴 Attention au drawdown. Réduisez la taille de vos positions.'
+    rec4 = '🟢 Pas de surtrading détecté. Continuez à être sélectif.' if overtrading['alert_level'] == 'green' else '🔴 ATTENTION: Signes d overtrading détectés. Prenez une pause et analysez votre stratégie.'
+    
+    empty_tf_row = '<tr style="grid-template-columns:1fr"><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'
+    
     html = f'''<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -1364,18 +1397,16 @@ async def risk_page():
                 </div>
                 <div class="risk-card">
                     <div class="risk-card-title">Ratio Gain/Perte</div>
-                    <div class="risk-card-value" style="color:{'var(--success)' if risk_metrics['win_loss_ratio'] >= 1.5 else 'var(--warning)'}">{risk_metrics["win_loss_ratio"]}</div>
-                    <div class="risk-card-subtitle">{'Excellent' if risk_metrics['win_loss_ratio'] >= 2 else ('Bon' if risk_metrics['win_loss_ratio'] >= 1.5 else 'À améliorer')}</div>
+                    <div class="risk-card-value" style="color:{ratio_color}">{risk_metrics["win_loss_ratio"]}</div>
+                    <div class="risk-card-subtitle">{ratio_label}</div>
                 </div>
             </div>
             
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:32px">
                 <div class="panel">
                     <h3 style="margin-bottom:16px;font-weight:800">📊 Profit Factor</h3>
-                    <div style="font-size:48px;font-weight:900;color:{'var(--success)' if risk_metrics['profit_factor'] >= 1.5 else 'var(--warning)'};margin-bottom:8px">{risk_metrics["profit_factor"]}</div>
-                    <div style="font-size:14px;color:var(--muted);margin-bottom:12px">
-                        {'🟢 Excellent' if risk_metrics['profit_factor'] >= 2 else ('🟢 Bon' if risk_metrics['profit_factor'] >= 1.5 else ('🟡 Acceptable' if risk_metrics['profit_factor'] >= 1 else '🔴 Attention'))}
-                    </div>
+                    <div style="font-size:48px;font-weight:900;color:{pf_color};margin-bottom:8px">{risk_metrics["profit_factor"]}</div>
+                    <div style="font-size:14px;color:var(--muted);margin-bottom:12px">{pf_label}</div>
                     <div style="font-size:12px;color:var(--muted);line-height:1.6">
                         <div>Total Gains: <strong style="color:var(--success)">+{risk_metrics["total_wins"]}%</strong></div>
                         <div>Total Pertes: <strong style="color:var(--danger)">-{risk_metrics["total_losses"]}%</strong></div>
@@ -1385,9 +1416,7 @@ async def risk_page():
                 <div class="panel">
                     <h3 style="margin-bottom:16px;font-weight:800">📉 Drawdown Max</h3>
                     <div style="font-size:48px;font-weight:900;color:var(--danger);margin-bottom:8px">-{risk_metrics["max_drawdown"]}%</div>
-                    <div style="font-size:14px;color:var(--muted);margin-bottom:12px">
-                        {'🟢 Faible' if risk_metrics['max_drawdown'] < 10 else ('🟡 Modéré' if risk_metrics['max_drawdown'] < 20 else '🔴 Élevé')}
-                    </div>
+                    <div style="font-size:14px;color:var(--muted);margin-bottom:12px">{dd_label}</div>
                     <div style="font-size:12px;color:var(--muted);line-height:1.6">
                         Perte maximale depuis le pic de performance
                     </div>
@@ -1395,10 +1424,10 @@ async def risk_page():
                 
                 <div class="panel">
                     <h3 style="margin-bottom:16px;font-weight:800">⚠️ Overtrading</h3>
-                    <div style="font-size:32px;font-weight:900;color:{'var(--success)' if overtrading['alert_level'] == 'green' else ('var(--orange)' if overtrading['alert_level'] == 'orange' else 'var(--danger)')};margin-bottom:8px">{overtrading["daily_trades"]}/{overtrading["max_daily_trades"]}</div>
+                    <div style="font-size:32px;font-weight:900;color:{ot_color};margin-bottom:8px">{overtrading["daily_trades"]}/{overtrading["max_daily_trades"]}</div>
                     <div style="font-size:14px;color:var(--muted);margin-bottom:12px">Trades en 24h</div>
                     <div style="font-size:12px;color:var(--muted);line-height:1.6">
-                        <div>Pertes consécutives: <strong style="color:{'var(--danger)' if overtrading['consecutive_losses'] >= overtrading['max_consecutive_losses'] else 'var(--muted)'}">{overtrading["consecutive_losses"]}</strong></div>
+                        <div>Pertes consécutives: <strong style="color:{cons_loss_color}">{overtrading["consecutive_losses"]}</strong></div>
                     </div>
                 </div>
             </div>
@@ -1418,7 +1447,7 @@ async def risk_page():
                                 <th>P&L Total</th>
                             </tr>
                         </thead>
-                        <tbody>{tf_rows if tf_rows else '<tr style="grid-template-columns:1fr"><td colspan="7" style="text-align:center;padding:40px;color:var(--muted)">Aucune donnée</td></tr>'}</tbody>
+                        <tbody>{tf_rows if tf_rows else empty_tf_row}</tbody>
                     </table>
                 </div>
             </div>
@@ -1426,13 +1455,10 @@ async def risk_page():
             <div class="panel" style="margin-top:24px">
                 <h3 style="margin-bottom:16px;font-weight:800">💡 Recommandations</h3>
                 <div style="font-size:14px;color:var(--muted);line-height:2">
-                    {'🟢 Votre Profit Factor est excellent (> 1.5). Continuez sur cette lancée !' if risk_metrics['profit_factor'] >= 1.5 else '🟡 Travaillez à améliorer votre Profit Factor en optimisant vos entrées et sorties.'}
-                    <br>
-                    {'🟢 Votre ratio Gain/Perte est bon. Vos gains compensent bien vos pertes.' if risk_metrics['win_loss_ratio'] >= 1.5 else '🟡 Augmentez votre ratio en laissant courir vos gains plus longtemps.'}
-                    <br>
-                    {'🟢 Drawdown maîtrisé. Votre gestion du risque est efficace.' if risk_metrics['max_drawdown'] < 15 else '🔴 Attention au drawdown. Réduisez la taille de vos positions.'}
-                    <br>
-                    {'🟢 Pas de surtrading détecté. Continuez à être sélectif.' if overtrading['alert_level'] == 'green' else '🔴 ATTENTION: Signes d\'overtrading détectés. Prenez une pause et analysez votre stratégie.'}
+                    {rec1}<br>
+                    {rec2}<br>
+                    {rec3}<br>
+                    {rec4}
                 </div>
             </div>
         </main>
