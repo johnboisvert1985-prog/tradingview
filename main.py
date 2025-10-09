@@ -1,31 +1,32 @@
-# main.py - AI Trader Pro v3.0 ULTIMATE - Version Complète Améliorée
-# Toutes les fonctionnalités révolutionnaires intégrées
+# main.py - AI Trader Pro v3.0 - VERSION FINALE COMPLÈTE + MARCHÉ RÉEL
 # Python 3.8+
 
 import os
 import sqlite3
 import logging
-import asyncio
 import time
 import json
-import hashlib
-from collections import deque, defaultdict
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
-from contextlib import contextmanager
 import math
+import asyncio
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional  # ✅ AJOUTÉ Dict et Any ici
+from contextlib import contextmanager
 
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import httpx
 
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMIT_ENABLED = True
+except ImportError:
+    RATE_LIMIT_ENABLED = False
 
-# CONFIGURATION
 class Settings:
     DB_DIR = os.getenv("DB_DIR", "/tmp/ai_trader")
     DB_PATH = os.path.join(DB_DIR, "data.db")
@@ -37,24 +38,10 @@ class Settings:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
     
-    # Multi-channel alerts
-    DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
-    SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
-    EMAIL_API_KEY = os.getenv("EMAIL_API_KEY", "")
-    EMAIL_TO = os.getenv("EMAIL_TO", "")
-    
-    TG_MIN_DELAY_SEC = float(os.getenv("TG_MIN_DELAY_SEC", "10.0"))
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    
-    MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
     MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
     CIRCUIT_BREAKER_ENABLED = os.getenv("CIRCUIT_BREAKER_ENABLED", "1") == "1"
     INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "10000.0"))
-    
-    # Trade Rules
-    SKIP_TRADES_BEFORE_HOUR = int(os.getenv("SKIP_TRADES_BEFORE_HOUR", "0"))
-    SKIP_TRADES_AFTER_HOUR = int(os.getenv("SKIP_TRADES_AFTER_HOUR", "24"))
-    MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "0"))
 
 settings = Settings()
 os.makedirs(settings.DB_DIR, exist_ok=True)
@@ -64,10 +51,155 @@ logger.setLevel(settings.LOG_LEVEL)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
+logger.info("🚀 AI Trader Pro v3.0 ULTIMATE + REAL MARKET DATA")
 
-logger.info("🚀 AI Trader Pro v3.0 ULTIMATE Edition - Version Complète")
+# ============================================================================
+# NOUVELLES FONCTIONS POUR LE MARCHÉ RÉEL
+# ============================================================================
 
-# MODELS
+async def fetch_real_market_data() -> Dict[str, Any]:
+    """Récupère les données réelles du marché crypto via CoinGecko API"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            coins = "bitcoin,ethereum,binancecoin,solana,cardano,avalanche-2,polkadot,matic-network,chainlink,dogecoin"
+            
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            params = {
+                "vs_currency": "usd",
+                "ids": coins,
+                "order": "market_cap_desc",
+                "per_page": 20,
+                "sparkline": False,
+                "price_change_percentage": "24h,7d,30d"
+            }
+            
+            response = await client.get(url, params=params)
+            data = response.json()
+            
+            if not data:
+                return None
+            
+            global_url = "https://api.coingecko.com/api/v3/global"
+            global_response = await client.get(global_url)
+            global_data = global_response.json()
+            
+            btc_dominance = global_data.get("data", {}).get("market_cap_percentage", {}).get("btc", 50)
+            total_market_cap = global_data.get("data", {}).get("total_market_cap", {}).get("usd", 0)
+            
+            return {
+                "coins": data,
+                "btc_dominance": btc_dominance,
+                "total_market_cap": total_market_cap,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Erreur fetch market data: {e}")
+        return None
+
+
+async def detect_real_bullrun_phase() -> Dict[str, Any]:
+    """Détecte la vraie phase du bull run basée sur les données réelles du marché"""
+    default = {
+        "phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b",
+        "description": "Marché en consolidation", "confidence": 0,
+        "details": {
+            "btc": {"performance_30d": 0, "dominance": 0, "winrate": 0, "avg_return": 0, "trades": 0},
+            "eth": {"performance_30d": 0, "winrate": 0, "avg_return": 0, "trades": 0},
+            "large_cap": {"avg_performance_30d": 0, "winrate": 0, "avg_return": 0, "trades": 0},
+            "small_alts": {"avg_performance_30d": 0, "winrate": 0, "avg_return": 0, "trades": 0}
+        },
+        "market_cap": 0, "btc_price": 0
+    }
+    
+    market_data = await fetch_real_market_data()
+    if not market_data:
+        return default
+    
+    try:
+        coins = market_data["coins"]
+        btc_dominance = market_data["btc_dominance"]
+        total_mc = market_data["total_market_cap"]
+        
+        btc = next((c for c in coins if c["id"] == "bitcoin"), None)
+        eth = next((c for c in coins if c["id"] == "ethereum"), None)
+        
+        large_caps = ["binancecoin", "solana", "cardano", "avalanche-2", "polkadot", "matic-network", "chainlink"]
+        lc_coins = [c for c in coins if c["id"] in large_caps]
+        alts = [c for c in coins if c["id"] not in ["bitcoin", "ethereum"] and c["id"] not in large_caps]
+        
+        if not btc or not eth:
+            return default
+        
+        btc_30d = btc.get("price_change_percentage_30d_in_currency", 0) or 0
+        eth_30d = eth.get("price_change_percentage_30d_in_currency", 0) or 0
+        lc_30d = sum(c.get("price_change_percentage_30d_in_currency", 0) or 0 for c in lc_coins) / len(lc_coins) if lc_coins else 0
+        alts_30d = sum(c.get("price_change_percentage_30d_in_currency", 0) or 0 for c in alts) / len(alts) if alts else 0
+        
+        btc_score = btc_30d * (btc_dominance / 50) if btc_dominance > 55 and btc_30d > 10 else 0
+        eth_lc_score = max(eth_30d, lc_30d) if (eth_30d > btc_30d or lc_30d > btc_30d) and eth_30d > 5 else 0
+        alt_score = alts_30d * 1.5 if alts_30d > btc_30d and alts_30d > eth_30d and btc_dominance < 55 else 0
+        full_bull = btc_30d > 15 and eth_30d > 15 and lc_30d > 15 and alts_30d > 15
+        
+        details = {
+            "btc": {"winrate": round(btc_30d, 1), "avg_return": round(btc_30d, 1), "trades": 1, "performance_30d": round(btc_30d, 1), "dominance": round(btc_dominance, 1), "price": btc.get("current_price", 0)},
+            "eth": {"winrate": round(eth_30d, 1), "avg_return": round(eth_30d, 1), "trades": 1, "performance_30d": round(eth_30d, 1), "price": eth.get("current_price", 0)},
+            "large_cap": {"winrate": round(lc_30d, 1), "avg_return": round(lc_30d, 1), "trades": len(lc_coins), "avg_performance_30d": round(lc_30d, 1)},
+            "small_alts": {"winrate": round(alts_30d, 1), "avg_return": round(alts_30d, 1), "trades": len(alts), "avg_performance_30d": round(alts_30d, 1)}
+        }
+        
+        if full_bull:
+            return {"phase": 4, "phase_name": "MEGA BULL RUN 🔥", "emoji": "🚀🔥", "color": "#ff0080", "description": "Tout explose!", "confidence": min(100, int((btc_30d + eth_30d + lc_30d + alts_30d) / 2)), "details": details, "market_cap": int(total_mc), "btc_price": btc.get("current_price", 0)}
+        elif alt_score > max(btc_score, eth_lc_score) and alt_score > 0:
+            return {"phase": 3, "phase_name": "Altcoin Season", "emoji": "🚀", "color": "#10b981", "description": "Alts explosent", "confidence": min(100, int(alt_score)), "details": details, "market_cap": int(total_mc), "btc_price": btc.get("current_price", 0)}
+        elif eth_lc_score > btc_score and eth_lc_score > 0:
+            return {"phase": 2, "phase_name": "ETH & Large-Cap", "emoji": "💎", "color": "#627eea", "description": "ETH domine", "confidence": min(100, int(eth_lc_score)), "details": details, "market_cap": int(total_mc), "btc_price": btc.get("current_price", 0)}
+        elif btc_score > 0:
+            return {"phase": 1, "phase_name": "Bitcoin Season", "emoji": "₿", "color": "#f7931a", "description": "BTC domine", "confidence": min(100, int(btc_score)), "details": details, "market_cap": int(total_mc), "btc_price": btc.get("current_price", 0)}
+        else:
+            return {"phase": 0, "phase_name": "Accumulation", "emoji": "🐻", "color": "#64748b", "description": "Consolidation", "confidence": 30, "details": details, "market_cap": int(total_mc), "btc_price": btc.get("current_price", 0)}
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur detect bullrun: {e}")
+        return default
+async def calculate_real_altseason_metrics() -> Dict[str, Any]:
+    """Calcule les vrais métriques d'altseason"""
+    market_data = await fetch_real_market_data()
+    if not market_data:
+        return {"is_altseason": False, "confidence": 0, "btc_wr": 0, "alt_wr": 0, "message": "Données indisponibles"}
+    
+    try:
+        coins = market_data["coins"]
+        btc_dominance = market_data["btc_dominance"]
+        btc = next((c for c in coins if c["id"] == "bitcoin"), None)
+        alts = [c for c in coins if c["id"] != "bitcoin"]
+        
+        if not btc or not alts:
+            return {"is_altseason": False, "confidence": 0, "btc_wr": 0, "alt_wr": 0, "message": "Données insuffisantes"}
+        
+        btc_30d = btc.get("price_change_percentage_30d_in_currency", 0) or 0
+        alts_beating_btc = sum(1 for c in alts if (c.get("price_change_percentage_30d_in_currency", 0) or 0) > btc_30d)
+        alt_performance = (alts_beating_btc / len(alts)) * 100 if alts else 0
+        avg_alt_30d = sum(c.get("price_change_percentage_30d_in_currency", 0) or 0 for c in alts) / len(alts) if alts else 0
+        
+        is_altseason = (alt_performance > 75 and btc_dominance < 55) or (avg_alt_30d > btc_30d and avg_alt_30d > 20)
+        confidence = min(100, int(alt_performance)) if is_altseason else int(alt_performance / 2)
+        
+        return {
+            "is_altseason": is_altseason, "confidence": confidence,
+            "btc_wr": round(btc_30d, 1), "alt_wr": round(avg_alt_30d, 1),
+            "btc_performance": round(btc_30d, 1), "alt_performance": round(avg_alt_30d, 1),
+            "alts_beating_btc_pct": round(alt_performance, 1), "btc_dominance": round(btc_dominance, 1),
+            "message": "🚀 ALTSEASON" if is_altseason else "₿ BTC" if btc_30d > avg_alt_30d else "🔄 Neutre"
+        }
+    except Exception as e:
+        logger.error(f"❌ Erreur altseason: {e}")
+        return {"is_altseason": False, "confidence": 0, "btc_wr": 0, "alt_wr": 0, "message": "Erreur"}
+
+# ============================================================================
+# RESTE DU CODE ORIGINAL (classes, fonctions DB, etc.)
+# ============================================================================
+
 class WebhookPayload(BaseModel):
     type: str
     symbol: str
@@ -100,13 +232,6 @@ class JournalNote(BaseModel):
     emotion: Optional[str] = ""
     tags: Optional[str] = ""
 
-class TradeRule(BaseModel):
-    name: str
-    condition: str
-    action: str
-    enabled: bool = True
-
-# DATABASE
 def dict_factory(cursor, row):
     return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
@@ -134,76 +259,23 @@ def db_query(sql: str, params: tuple = ()) -> List[dict]:
         return []
 
 def init_database():
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            tf TEXT,
-            tf_label TEXT,
-            time INTEGER NOT NULL,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            confidence INTEGER,
-            leverage TEXT,
-            note TEXT,
-            price REAL,
-            trade_id TEXT,
-            created_at INTEGER DEFAULT (strftime('%s', 'now'))
-        )
-    """)
+    db_execute("""CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, symbol TEXT NOT NULL,
+        tf TEXT, tf_label TEXT, time INTEGER NOT NULL, side TEXT, entry REAL, sl REAL,
+        tp1 REAL, tp2 REAL, tp3 REAL, confidence INTEGER, leverage TEXT, note TEXT,
+        price REAL, trade_id TEXT, created_at INTEGER DEFAULT (strftime('%s', 'now')))""")
     
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS trade_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_id TEXT NOT NULL,
-            note TEXT,
-            emotion TEXT,
-            tags TEXT,
-            created_at INTEGER DEFAULT (strftime('%s', 'now'))
-        )
-    """)
+    db_execute("""CREATE TABLE IF NOT EXISTS trade_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id TEXT NOT NULL, note TEXT,
+        emotion TEXT, tags TEXT, created_at INTEGER DEFAULT (strftime('%s', 'now')))""")
     
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS circuit_breaker (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            triggered_at INTEGER NOT NULL,
-            reason TEXT,
-            cooldown_until INTEGER,
-            active INTEGER DEFAULT 1
-        )
-    """)
-    
-    db_execute("""
-        CREATE TABLE IF NOT EXISTS trade_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            condition TEXT NOT NULL,
-            action TEXT NOT NULL,
-            enabled INTEGER DEFAULT 1,
-            created_at INTEGER DEFAULT (strftime('%s', 'now'))
-        )
-    """)
-    
-    indices = [
-        "CREATE INDEX IF NOT EXISTS idx_events_trade_id ON events(trade_id)",
-        "CREATE INDEX IF NOT EXISTS idx_events_time ON events(time DESC)"
-    ]
-    for idx in indices:
-        try:
-            db_execute(idx)
-        except:
-            pass
+    db_execute("""CREATE TABLE IF NOT EXISTS circuit_breaker (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, triggered_at INTEGER NOT NULL,
+        reason TEXT, cooldown_until INTEGER, active INTEGER DEFAULT 1)""")
 
 init_database()
 
-# UTILITIES
 def now_ms(): return int(datetime.now(timezone.utc).timestamp() * 1000)
-def ms_ago(minutes): return int((datetime.now(timezone.utc) - timedelta(minutes=minutes)).timestamp() * 1000)
 
 def tf_to_label(tf):
     if not tf: return ""
@@ -215,16 +287,9 @@ def tf_to_label(tf):
     except: pass
     return str(tf)
 
-# TRADE ANALYSIS
 def _latest_entry_for_trade(trade_id):
     r = db_query("SELECT * FROM events WHERE trade_id=? AND type='ENTRY' ORDER BY time DESC LIMIT 1", (trade_id,))
     return r[0] if r else None
-
-def _first_outcome(trade_id):
-    rows = db_query("SELECT type FROM events WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT') ORDER BY time ASC LIMIT 1", (trade_id,))
-    if not rows: return None
-    t = rows[0]["type"]
-    return "TP" if t in ('TP1_HIT', 'TP2_HIT', 'TP3_HIT') else "SL"
 
 def build_trade_rows(limit=300):
     base = db_query("SELECT trade_id, MAX(time) AS t_entry FROM events WHERE type='ENTRY' GROUP BY trade_id ORDER BY t_entry DESC LIMIT ?", (limit,))
@@ -232,751 +297,278 @@ def build_trade_rows(limit=300):
     for item in base:
         e = _latest_entry_for_trade(item["trade_id"])
         if not e: continue
-        
         hits = db_query("SELECT type FROM events WHERE trade_id=? AND type IN ('TP1_HIT','TP2_HIT','TP3_HIT','SL_HIT') GROUP BY type", (e["trade_id"],))
         hit_map = {h["type"]: True for h in hits}
-        
-        tp1_hit = bool(hit_map.get("TP1_HIT"))
-        sl_hit = bool(hit_map.get("SL_HIT"))
-        
-        if sl_hit:
-            state = "sl"
-        elif tp1_hit:
-            state = "tp"
-        else:
-            state = "normal"
-        
+        tp1_hit, sl_hit = bool(hit_map.get("TP1_HIT")), bool(hit_map.get("SL_HIT"))
         rows.append({
-            "trade_id": e["trade_id"],
-            "symbol": e["symbol"],
-            "tf": e.get("tf"),
+            "trade_id": e["trade_id"], "symbol": e["symbol"], "tf": e.get("tf"),
             "tf_label": e.get("tf_label") or tf_to_label(e.get("tf")),
-            "side": e["side"],
-            "entry": e["entry"],
-            "tp1": e["tp1"],
-            "sl": e["sl"],
-            "tp1_hit": tp1_hit,
-            "sl_hit": sl_hit,
-            "row_state": state,
-            "t_entry": item["t_entry"],
-            "confidence": e.get("confidence", 50)
+            "side": e.get("side"), "entry": e.get("entry"), "tp1": e.get("tp1"), "sl": e.get("sl"),
+            "tp1_hit": tp1_hit, "sl_hit": sl_hit,
+            "row_state": "sl" if sl_hit else ("tp" if tp1_hit else "normal"),
+            "t_entry": item["t_entry"], "confidence": e.get("confidence", 50)
         })
     return rows
 
-# AI TRADE SCORING
-def calculate_ai_trade_score(payload: dict, historical_data: List[dict]) -> Dict[str, Any]:
-    score = 50
-    factors = []
-    
-    symbol = payload.get("symbol")
-    tf = payload.get("tf_label") or payload.get("tf")
-    side = payload.get("side")
-    confidence = payload.get("confidence", 50)
-    
-    # Facteur 1: Performance historique symbol+TF
-    symbol_tf_trades = [t for t in historical_data if t.get("symbol") == symbol and t.get("tf_label") == tf]
-    if len(symbol_tf_trades) >= 5:
-        wins = sum(1 for t in symbol_tf_trades if t.get("row_state") == "tp")
-        total = len([t for t in symbol_tf_trades if t.get("row_state") in ("tp", "sl")])
-        if total > 0:
-            symbol_wr = (wins / total) * 100
-            score += (symbol_wr - 50) * 0.3
-            factors.append(f"{symbol} {tf}: {symbol_wr:.0f}% WR")
-    
-    # Facteur 2: Heure optimale
-    hour = datetime.now(timezone.utc).hour
-    if 8 <= hour <= 16:
-        score += 5
-        factors.append(f"Heure optimale ({hour}h)")
-    elif 0 <= hour <= 4 or 22 <= hour <= 23:
-        score -= 5
-        factors.append(f"Heure faible ({hour}h)")
-    
-    # Facteur 3: Confiance
-    score += (confidence - 50) * 0.4
-    factors.append(f"Confiance: {confidence}%")
-    
-    # Facteur 4: Momentum récent
-    recent = [t for t in historical_data[-10:] if t.get("row_state") in ("tp", "sl")]
-    if len(recent) >= 3:
-        recent_wins = sum(1 for t in recent if t.get("row_state") == "tp")
-        recent_wr = (recent_wins / len(recent)) * 100
-        if recent_wr >= 60:
-            score += 10
-            factors.append(f"Momentum+ ({recent_wr:.0f}%)")
-        elif recent_wr <= 30:
-            score -= 10
-            factors.append(f"Momentum- ({recent_wr:.0f}%)")
-    
-    # Facteur 5: Side performance
-    side_trades = [t for t in historical_data if t.get("side") == side and t.get("row_state") in ("tp", "sl")]
-    if len(side_trades) >= 5:
-        side_wins = sum(1 for t in side_trades if t.get("row_state") == "tp")
-        side_wr = (side_wins / len(side_trades)) * 100
-        if side_wr >= 65:
-            score += 5
-            factors.append(f"{side} excellent ({side_wr:.0f}%)")
-        elif side_wr <= 40:
-            score -= 5
-            factors.append(f"{side} faible ({side_wr:.0f}%)")
-    
-    score = max(0, min(100, int(score)))
-    
-    if score >= 75:
-        quality = "🟢 EXCELLENT"
-        recommendation = "Conditions optimales"
-    elif score >= 60:
-        quality = "🟡 BON"
-        recommendation = "Conditions favorables"
-    elif score >= 45:
-        quality = "🟠 MOYEN"
-        recommendation = "Soyez prudent"
-    else:
-        quality = "🔴 FAIBLE"
-        recommendation = "Envisagez de skipper"
-    
-    return {
-        "score": score,
-        "quality": quality,
-        "recommendation": recommendation,
-        "factors": factors
-    }
+async def fetch_fear_greed_index() -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://api.alternative.me/fng/?limit=1")
+            data = response.json()
+            if data and "data" in data and len(data["data"]) > 0:
+                fng = data["data"][0]
+                value = int(fng["value"])
+                if value <= 25: sentiment, emoji, color, rec = "Extreme Fear", "😱", "#ef4444", "Opportunité d'achat"
+                elif value <= 45: sentiment, emoji, color, rec = "Fear", "😰", "#f97316", "Bon moment"
+                elif value <= 55: sentiment, emoji, color, rec = "Neutral", "😐", "#64748b", "Équilibré"
+                elif value <= 75: sentiment, emoji, color, rec = "Greed", "😊", "#10b981", "Vigilant"
+                else: sentiment, emoji, color, rec = "Extreme Greed", "🤑", "#22c55e", "Prenez profits"
+                return {"value": value, "sentiment": sentiment, "emoji": emoji, "color": color, "recommendation": rec}
+    except Exception as e:
+        logger.error(f"FG error: {e}")
+    return {"value": 50, "sentiment": "Unknown", "emoji": "❓", "color": "#64748b", "recommendation": "N/A"}
 
-# KELLY CRITERION
-def calculate_kelly_position(winrate: float, avg_win: float, avg_loss: float) -> Dict[str, Any]:
-    if avg_loss == 0 or winrate == 0:
-        return {"kelly_pct": 0, "conservative_pct": 0, "recommendation": "Données insuffisantes"}
-    
-    p = winrate / 100.0
-    q = 1 - p
-    b = avg_win / avg_loss
-    kelly_pct = max(0, min((p * b - q) / b, 0.25))
-    conservative = kelly_pct * 0.5
-    
-    if conservative <= 0:
-        rec = "❌ Ne pas trader"
-    elif conservative < 0.02:
-        rec = "⚠️ Edge faible - 1-2%"
-    elif conservative < 0.05:
-        rec = "✅ Normal - 2-5%"
-    else:
-        rec = "🚀 Fort edge - 5-10%"
-    
-    return {
-        "kelly_pct": round(kelly_pct * 100, 2),
-        "conservative_pct": round(conservative * 100, 2),
-        "recommendation": rec
-    }
-
-# ADVANCED METRICS
 def calculate_advanced_metrics(rows: List[dict]) -> Dict[str, Any]:
-    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
-    if len(closed) < 2:
-        return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0}
-    
+    closed = [r for r in rows if r.get("row_state") in ("tp", "sl")]
+    if len(closed) < 2: return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0, "max_drawdown": 0}
     returns = []
     for r in closed:
-        if r["entry"]:
+        if r.get("entry") and r.get("side"):
             try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r["sl_hit"] else float(r["tp1"]) if r.get("tp1") else None
-                if not exit_p: continue
-                
-                pl_pct = ((exit_p - entry) / entry) * 100
-                if r["side"] == "SHORT": pl_pct = -pl_pct
-                returns.append(pl_pct)
+                en, ex = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") and r.get("sl") else (float(r["tp1"]) if r.get("tp1") else None))
+                if ex:
+                    pl = ((ex - en) / en) * 100
+                    if r.get("side") == "SHORT": pl = -pl
+                    returns.append(pl)
             except: pass
-    
-    if not returns:
-        return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0}
-    
-    avg_ret = sum(returns) / len(returns)
-    std = math.sqrt(sum((r - avg_ret) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.01
-    sharpe = (avg_ret / std) * math.sqrt(252) if std > 0 else 0
-    
-    downside = [r for r in returns if r < 0]
-    down_std = math.sqrt(sum(r ** 2 for r in downside) / len(downside)) if downside else 0.01
-    sortino = (avg_ret / down_std) * math.sqrt(252) if down_std > 0 else 0
-    
-    cumul = []
-    run = 0
+    if not returns: return {"sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "expectancy": 0, "max_drawdown": 0}
+    avg = sum(returns) / len(returns)
+    std = math.sqrt(sum((r - avg) ** 2 for r in returns) / len(returns)) if len(returns) > 1 else 0.01
+    sharpe = (avg / std) * math.sqrt(252) if std > 0 else 0
+    down = [r for r in returns if r < 0]
+    dstd = math.sqrt(sum(r ** 2 for r in down) / len(down)) if down else 0.01
+    sortino = (avg / dstd) * math.sqrt(252) if dstd > 0 else 0
+    cumul, run, mdd, pk = [], 0, 0, 0
     for r in returns:
         run += r
         cumul.append(run)
-    
-    max_dd = 0
-    peak = cumul[0] if cumul else 0
-    for val in cumul:
-        if val > peak: peak = val
-        dd = peak - val
-        if dd > max_dd: max_dd = dd
-    
-    total = sum(returns)
-    calmar = (total / max_dd) if max_dd > 0 else 0
-    
+        if run > pk: pk = run
+        dd = pk - run
+        if dd > mdd: mdd = dd
+    calmar = (sum(returns) / mdd) if mdd > 0 else 0
     wins = [r for r in returns if r > 0]
     losses = [r for r in returns if r < 0]
-    avg_w = sum(wins) / len(wins) if wins else 0
-    avg_l = abs(sum(losses) / len(losses)) if losses else 0
+    aw = sum(wins) / len(wins) if wins else 0
+    al = abs(sum(losses) / len(losses)) if losses else 0
     wr = len(wins) / len(returns) if returns else 0
-    expect = (wr * avg_w) - ((1 - wr) * avg_l)
-    
-    return {
-        "sharpe_ratio": round(sharpe, 2),
-        "sortino_ratio": round(sortino, 2),
-        "calmar_ratio": round(calmar, 2),
-        "expectancy": round(expect, 2),
-        "total_return_pct": round(total, 2),
-        "max_drawdown": round(max_dd, 2)
-    }
+    exp = (wr * aw) - ((1 - wr) * al)
+    return {"sharpe_ratio": round(sharpe, 2), "sortino_ratio": round(sortino, 2), "calmar_ratio": round(calmar, 2), "expectancy": round(exp, 2), "max_drawdown": round(mdd, 2)}
 
-# EQUITY CURVE
 def calculate_equity_curve(rows: List[dict]) -> List[Dict[str, Any]]:
-    closed = sorted([r for r in rows if r["row_state"] in ("tp", "sl")], key=lambda x: x.get("t_entry", 0))
-    equity = [{"date": 0, "equity": settings.INITIAL_CAPITAL, "drawdown": 0}]
-    current = settings.INITIAL_CAPITAL
-    peak = settings.INITIAL_CAPITAL
-    
+    closed = sorted([r for r in rows if r.get("row_state") in ("tp", "sl")], key=lambda x: x.get("t_entry", 0))
+    eq, cur, pk = [{"date": 0, "equity": settings.INITIAL_CAPITAL, "drawdown": 0}], settings.INITIAL_CAPITAL, settings.INITIAL_CAPITAL
     for r in closed:
-        if r["entry"]:
+        if r.get("entry") and r.get("side"):
             try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r["sl_hit"] else float(r["tp1"]) if r.get("tp1") else None
-                if not exit_p: continue
-                
-                pl_pct = ((exit_p - entry) / entry) * 100
-                if r["side"] == "SHORT": pl_pct = -pl_pct
-                
-                pl_amt = current * 0.02 * (pl_pct / 2)
-                current = max(0, current + pl_amt)
-                if current > peak: peak = current
-                
-                dd = ((peak - current) / peak) * 100 if peak > 0 else 0
-                equity.append({"date": r.get("t_entry", 0), "equity": round(current, 2), "drawdown": round(dd, 2)})
+                en, ex = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") and r.get("sl") else (float(r["tp1"]) if r.get("tp1") else None))
+                if ex:
+                    pl = ((ex - en) / en) * 100
+                    if r.get("side") == "SHORT": pl = -pl
+                    pla = cur * 0.02 * (pl / 2)
+                    cur = max(0, cur + pla)
+                    if cur > pk: pk = cur
+                    dd = ((pk - cur) / pk) * 100 if pk > 0 else 0
+                    eq.append({"date": r.get("t_entry", 0), "equity": round(cur, 2), "drawdown": round(dd, 2)})
             except: pass
-    
-    return equity
-
-# HEATMAP
+    return eq
 def calculate_performance_heatmap(rows: List[dict]) -> Dict[str, Any]:
-    heatmap = defaultdict(lambda: {"wins": 0, "losses": 0, "total": 0})
-    
+    hm = defaultdict(lambda: {"wins": 0, "losses": 0, "total": 0})
     for r in rows:
-        if r["row_state"] in ("tp", "sl") and r.get("t_entry"):
+        if r.get("row_state") in ("tp", "sl") and r.get("t_entry"):
             dt = datetime.fromtimestamp(r["t_entry"] / 1000, tz=timezone.utc)
-            day = dt.strftime("%A")
-            hour_block = f"{(dt.hour // 4) * 4:02d}h"
-            key = f"{day}_{hour_block}"
-            
-            heatmap[key]["total"] += 1
-            if r["row_state"] == "tp":
-                heatmap[key]["wins"] += 1
-            else:
-                heatmap[key]["losses"] += 1
-    
-    result = {}
-    for key, data in heatmap.items():
-        if data["total"] > 0:
-            wr = (data["wins"] / data["total"]) * 100
-            result[key] = {"wins": data["wins"], "losses": data["losses"], "total": data["total"], "winrate": round(wr, 1)}
-    
-    return result
+            key = f"{dt.strftime('%A')}_{(dt.hour // 4) * 4:02d}h"
+            hm[key]["total"] += 1
+            if r.get("row_state") == "tp": hm[key]["wins"] += 1
+            else: hm[key]["losses"] += 1
+    return {k: {**d, "winrate": round((d["wins"] / d["total"]) * 100, 1)} for k, d in hm.items() if d["total"] > 0}
 
-# PATTERN DETECTION
 def detect_trading_patterns(rows: List[dict]) -> List[str]:
-    if len(rows) < 10:
-        return ["Accumulez plus de trades pour détecter des patterns"]
-    
+    if len(rows) < 10: return ["Accumulez plus de trades"]
     patterns = []
-    
-    def calc_wr(trades):
-        closed = [t for t in trades if t["row_state"] in ("tp", "sl")]
-        if not closed: return 0
-        return (sum(1 for t in closed if t["row_state"] == "tp") / len(closed)) * 100
-    
-    # Meilleur moment
-    morning = [r for r in rows if r.get("t_entry") and 6 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 12]
-    afternoon = [r for r in rows if r.get("t_entry") and 12 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 18]
-    
-    m_wr = calc_wr(morning)
-    a_wr = calc_wr(afternoon)
-    
-    if m_wr > 60 and m_wr > a_wr:
-        patterns.append(f"✅ Meilleur le matin ({m_wr:.0f}% WR)")
-    elif a_wr > 60:
-        patterns.append(f"✅ Meilleur l'après-midi ({a_wr:.0f}% WR)")
-    
-    # Meilleur side
-    longs = [r for r in rows if r.get("side") == "LONG" and r["row_state"] in ("tp", "sl")]
-    shorts = [r for r in rows if r.get("side") == "SHORT" and r["row_state"] in ("tp", "sl")]
-    
+    def wr(t):
+        c = [x for x in t if x.get("row_state") in ("tp", "sl")]
+        return (sum(1 for x in c if x.get("row_state") == "tp") / len(c) * 100) if c else 0
+    morn = [r for r in rows if r.get("t_entry") and 6 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 12]
+    aft = [r for r in rows if r.get("t_entry") and 12 <= datetime.fromtimestamp(r["t_entry"] / 1000).hour < 18]
+    mw, aw = wr(morn), wr(aft)
+    if mw > 60 and mw > aw: patterns.append(f"✅ Matin ({mw:.0f}%)")
+    elif aw > 60: patterns.append(f"✅ Après-midi ({aw:.0f}%)")
+    longs = [r for r in rows if r.get("side") == "LONG" and r.get("row_state") in ("tp", "sl")]
+    shorts = [r for r in rows if r.get("side") == "SHORT" and r.get("row_state") in ("tp", "sl")]
     if len(longs) >= 5:
-        l_wr = calc_wr(longs)
-        if l_wr >= 65:
-            patterns.append(f"📈 Excellent sur LONGs ({l_wr:.0f}%)")
-        elif l_wr <= 35:
-            patterns.append(f"⚠️ Évitez les LONGs ({l_wr:.0f}%)")
-    
+        lw = wr(longs)
+        if lw >= 65: patterns.append(f"📈 LONGs ({lw:.0f}%)")
     if len(shorts) >= 5:
-        s_wr = calc_wr(shorts)
-        if s_wr >= 65:
-            patterns.append(f"📉 Excellent sur SHORTs ({s_wr:.0f}%)")
-        elif s_wr <= 35:
-            patterns.append(f"⚠️ Évitez les SHORTs ({s_wr:.0f}%)")
-    
-    # Best symbols
-    symbol_stats = {}
-    for r in rows:
-        if r["row_state"] in ("tp", "sl"):
-            sym = r["symbol"]
-            if sym not in symbol_stats:
-                symbol_stats[sym] = {"wins": 0, "total": 0}
-            symbol_stats[sym]["total"] += 1
-            if r["row_state"] == "tp":
-                symbol_stats[sym]["wins"] += 1
-    
-    for sym, stats in symbol_stats.items():
-        if stats["total"] >= 5:
-            wr = (stats["wins"] / stats["total"]) * 100
-            if wr >= 70:
-                patterns.append(f"🎯 {sym} très profitable ({wr:.0f}%)")
-    
-    if not patterns:
-        patterns.append("📊 Continuez à trader pour détecter des patterns")
-    
-    return patterns
+        sw = wr(shorts)
+        if sw >= 65: patterns.append(f"📉 SHORTs ({sw:.0f}%)")
+    return patterns if patterns else ["📊 Continuez"]
 
-# CORRELATION MATRIX
-def calculate_correlation_matrix(rows: List[dict]) -> Dict[str, Any]:
-    symbols = list(set(r["symbol"] for r in rows))
-    if len(symbols) < 2:
-        return {}
-    
-    # Group trades by symbol and time
-    symbol_returns = {sym: [] for sym in symbols}
-    
-    for r in rows:
-        if r["row_state"] in ("tp", "sl") and r["entry"]:
-            try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r["sl_hit"] else float(r["tp1"]) if r.get("tp1") else None
-                if not exit_p: continue
-                
-                pl_pct = ((exit_p - entry) / entry) * 100
-                if r["side"] == "SHORT": pl_pct = -pl_pct
-                
-                symbol_returns[r["symbol"]].append({"time": r.get("t_entry", 0), "return": pl_pct})
-            except: pass
-    
-    # Simple correlation calculation
-    matrix = {}
-    for sym1 in symbols:
-        matrix[sym1] = {}
-        for sym2 in symbols:
-            if sym1 == sym2:
-                matrix[sym1][sym2] = 1.0
-            else:
-                # Simplified correlation based on win/loss pattern similarity
-                r1 = [1 if r["return"] > 0 else 0 for r in symbol_returns[sym1]]
-                r2 = [1 if r["return"] > 0 else 0 for r in symbol_returns[sym2]]
-                
-                min_len = min(len(r1), len(r2))
-                if min_len > 0:
-                    matches = sum(1 for i in range(min_len) if r1[i] == r2[i])
-                    corr = matches / min_len
-                    matrix[sym1][sym2] = round(corr, 2)
-                else:
-                    matrix[sym1][sym2] = 0.0
-    
-    return matrix
+def calculate_kelly_position(winrate: float, avg_win: float, avg_loss: float) -> Dict[str, Any]:
+    if avg_loss == 0 or winrate == 0: return {"kelly_pct": 0, "conservative_pct": 0, "recommendation": "N/A"}
+    p, q, b = winrate / 100.0, 1 - (winrate / 100.0), avg_win / avg_loss
+    kelly = max(0, min((p * b - q) / b, 0.25))
+    cons = kelly * 0.5
+    if cons <= 0: rec = "❌ Ne pas trader"
+    elif cons < 0.02: rec = "⚠️ Edge faible"
+    elif cons < 0.05: rec = "✅ 2-5%"
+    else: rec = "🚀 Fort edge"
+    return {"kelly_pct": round(kelly * 100, 2), "conservative_pct": round(cons * 100, 2), "recommendation": rec}
 
-# BACKTESTING ENGINE
 def run_backtest(rows: List[dict], filters: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Backtester simple: teste une stratégie sur l'historique
-    Filters: {"side": "LONG", "confidence_min": 70, "tf": "4h", etc.}
-    """
-    filtered = rows
-    
+    filt = rows
     if filters.get("side"):
-        filtered = [r for r in filtered if r.get("side") == filters["side"]]
-    
-    if filters.get("confidence_min"):
-        filtered = [r for r in filtered if r.get("confidence", 0) >= filters["confidence_min"]]
-    
-    if filters.get("tf"):
-        filtered = [r for r in filtered if r.get("tf_label") == filters["tf"]]
-    
+        filt = [r for r in filt if r.get("side") == filters["side"]]
     if filters.get("symbol"):
-        filtered = [r for r in filtered if r.get("symbol") == filters["symbol"]]
-    
-    closed = [r for r in filtered if r["row_state"] in ("tp", "sl")]
-    
+        sym = filters["symbol"].upper().strip()
+        filt = [r for r in filt if r.get("symbol") and sym in r["symbol"].upper()]
+    if filters.get("tf"):
+        tf = filters["tf"].lower().strip()
+        filt = [r for r in filt if r.get("tf_label", "").lower() == tf]
+    closed = [r for r in filt if r.get("row_state") in ("tp", "sl")]
     if not closed:
-        return {"trades": 0, "winrate": 0, "total_return": 0, "filters": filters}
-    
-    wins = sum(1 for r in closed if r["row_state"] == "tp")
-    winrate = (wins / len(closed)) * 100
-    
-    # Calculate returns
-    returns = []
+        return {"trades": 0, "winrate": 0, "total_return": 0, "avg_win": 0, "avg_loss": 0}
+    wins = sum(1 for r in closed if r.get("row_state") == "tp")
+    wr = (wins / len(closed)) * 100
+    ret = []
     for r in closed:
-        if r["entry"]:
+        if r.get("entry") and r.get("side"):
             try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r["sl_hit"] else float(r["tp1"]) if r.get("tp1") else None
-                if not exit_p: continue
-                
-                pl_pct = ((exit_p - entry) / entry) * 100
-                if r["side"] == "SHORT": pl_pct = -pl_pct
-                returns.append(pl_pct)
+                en, ex = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") and r.get("sl") else (float(r["tp1"]) if r.get("tp1") else None))
+                if ex:
+                    pl = ((ex - en) / en) * 100
+                    if r["side"] == "SHORT": pl = -pl
+                    ret.append(pl)
             except: pass
-    
-    total_return = sum(returns)
-    avg_win = sum(r for r in returns if r > 0) / max(1, len([r for r in returns if r > 0]))
-    avg_loss = abs(sum(r for r in returns if r < 0) / max(1, len([r for r in returns if r < 0])))
-    
-    return {
-        "trades": len(closed),
-        "winrate": round(winrate, 1),
-        "total_return": round(total_return, 2),
-        "avg_win": round(avg_win, 2),
-        "avg_loss": round(avg_loss, 2),
-        "best_trade": round(max(returns), 2) if returns else 0,
-        "worst_trade": round(min(returns), 2) if returns else 0,
-        "filters": filters
-    }
+    if not ret:
+        return {"trades": len(closed), "winrate": round(wr, 1), "wins": wins, "losses": len(closed)-wins, "total_return": 0, "avg_win": 0, "avg_loss": 0}
+    wret = [r for r in ret if r > 0]
+    lret = [r for r in ret if r < 0]
+    return {"trades": len(closed), "winrate": round(wr, 1), "wins": wins, "losses": len(closed) - wins, "total_return": round(sum(ret), 2), "avg_win": round(sum(wret) / len(wret), 2) if wret else 0, "avg_loss": round(abs(sum(lret) / len(lret)), 2) if lret else 0, "best_trade": round(max(ret), 2) if ret else 0, "worst_trade": round(min(ret), 2) if ret else 0, "filters": filters}
 
-# CIRCUIT BREAKER
 def check_circuit_breaker() -> Dict[str, Any]:
     active = db_query("SELECT * FROM circuit_breaker WHERE active=1 AND cooldown_until > ? ORDER BY triggered_at DESC LIMIT 1", (int(time.time()),))
-    
     if active:
         b = active[0]
-        remaining = b["cooldown_until"] - int(time.time())
-        return {"active": True, "reason": b["reason"], "hours_remaining": round(remaining / 3600, 1)}
-    
+        return {"active": True, "reason": b["reason"], "hours_remaining": round((b["cooldown_until"] - int(time.time())) / 3600, 1)}
     return {"active": False}
 
 def trigger_circuit_breaker(reason: str):
     cooldown = int(time.time()) + (24 * 3600)
     db_execute("INSERT INTO circuit_breaker (triggered_at, reason, cooldown_until, active) VALUES (?, ?, ?, 1)", (int(time.time()), reason, cooldown))
-    logger.warning(f"🚨 CIRCUIT BREAKER: {reason}")
 
-# TRADE RULES ENGINE
-def evaluate_trade_rules(payload: dict) -> Dict[str, Any]:
-    """Évalue les règles custom avant d'accepter un trade"""
-    rules = db_query("SELECT * FROM trade_rules WHERE enabled=1")
-    
-    blocked = False
-    reasons = []
-    
-    # Rule 1: Hour restrictions
-    hour = datetime.now(timezone.utc).hour
-    if hour < settings.SKIP_TRADES_BEFORE_HOUR or hour >= settings.SKIP_TRADES_AFTER_HOUR:
-        blocked = True
-        reasons.append(f"Heure interdite ({hour}h)")
-    
-    # Rule 2: Confidence minimum
-    if payload.get("confidence", 100) < settings.MIN_CONFIDENCE:
-        blocked = True
-        reasons.append(f"Confiance trop faible ({payload.get('confidence')}% < {settings.MIN_CONFIDENCE}%)")
-    
-    # Rule 3: Custom rules from DB
-    for rule in rules:
-        # Simple evaluation (extend with proper parser for complex rules)
-        condition = rule["condition"]
-        
-        # Example: "consecutive_losses >= 3"
-        if "consecutive_losses" in condition:
-            recent = build_trade_rows(limit=10)
-            consecutive = 0
-            for t in reversed([r for r in recent if r["row_state"] in ("tp", "sl")]):
-                if t["row_state"] == "sl":
-                    consecutive += 1
-                else:
-                    break
-            
-            try:
-                if eval(condition.replace("consecutive_losses", str(consecutive))):
-                    blocked = True
-                    reasons.append(rule["action"])
-            except: pass
-    
-    return {"allowed": not blocked, "reasons": reasons}
-
-# SAVE EVENT
 def save_event(payload: WebhookPayload) -> str:
     trade_id = payload.trade_id or f"{payload.symbol}_{payload.tf}_{payload.time or now_ms()}"
-    
-    db_execute("""
-        INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, confidence, leverage, note, price, trade_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        payload.type, payload.symbol, str(payload.tf) if payload.tf else None,
-        payload.tf_label or tf_to_label(payload.tf), int(payload.time or now_ms()),
-        payload.side, payload.entry, payload.sl, payload.tp1, payload.tp2, payload.tp3,
-        payload.confidence, payload.leverage, payload.note, payload.price, trade_id
-    ))
-    
+    db_execute("""INSERT INTO events(type, symbol, tf, tf_label, time, side, entry, sl, tp1, tp2, tp3, confidence, leverage, note, price, trade_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (payload.type, payload.symbol, str(payload.tf) if payload.tf else None, payload.tf_label or tf_to_label(payload.tf), int(payload.time or now_ms()), payload.side, payload.entry, payload.sl, payload.tp1, payload.tp2, payload.tp3, payload.confidence, payload.leverage, payload.note, payload.price, trade_id))
     return trade_id
 
-# MULTI-CHANNEL ALERTS
-async def send_alert(text: str, channels: List[str] = None):
-    """Envoie des alertes sur plusieurs canaux"""
-    if channels is None:
-        channels = ["telegram"]
-    
-    tasks = []
-    
-    if "telegram" in channels and settings.TELEGRAM_ENABLED:
-        tasks.append(send_telegram(text))
-    
-    if "discord" in channels and settings.DISCORD_WEBHOOK:
-        tasks.append(send_discord(text))
-    
-    if "slack" in channels and settings.SLACK_WEBHOOK:
-        tasks.append(send_slack(text))
-    
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-async def send_telegram(text: str):
-    if not settings.TELEGRAM_ENABLED: return
+# ========= PATCH: send_telegram amélioré + helpers pour formater les messages =========
+async def send_telegram(text: str, disable_notification: bool = False):
+    if not settings.TELEGRAM_ENABLED:
+        return
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
                 f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": settings.TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+                json={
+                    "chat_id": settings.TELEGRAM_CHAT_ID,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                    "disable_notification": disable_notification,
+                },
             )
-    except: pass
+            if r.status_code == 429:
+                retry_after = (r.json().get("parameters", {}) or {}).get("retry_after", 3)
+                await asyncio.sleep(float(retry_after))
+                await client.post(
+                    f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": settings.TELEGRAM_CHAT_ID,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                        "disable_notification": disable_notification,
+                    },
+                )
+    except Exception as e:
+        logger.warning(f"Telegram send error: {e}")
 
-async def send_discord(text: str):
-    if not settings.DISCORD_WEBHOOK: return
+def _fmt_price(v):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(settings.DISCORD_WEBHOOK, json={"content": text})
-    except: pass
+        return f"{float(v):g}"
+    except:
+        return str(v)
 
-async def send_slack(text: str):
-    if not settings.SLACK_WEBHOOK: return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(settings.SLACK_WEBHOOK, json={"text": text})
-    except: pass
+def format_telegram_message(payload: "WebhookPayload", trade_id: str) -> str:
+    sym = payload.symbol
+    tf_label = payload.tf_label or tf_to_label(payload.tf)
+    t = datetime.fromtimestamp((payload.time or now_ms()) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    conf = f"{payload.confidence}%" if payload.confidence is not None else "—"
+    lev = payload.leverage or "—"
 
-# FASTAPI
-app = FastAPI(title="AI Trader Pro v3.0 ULTIMATE", version="3.0")
+    if payload.type == "ENTRY":
+        return (
+            f"🔔 <b>ENTRY</b> — <b>{sym}</b> <i>{tf_label}</i>\n"
+            f"• Side: <b>{payload.side or '—'}</b>\n"
+            f"• Entry: <code>{_fmt_price(payload.entry)}</code>\n"
+            f"• SL: <code>{_fmt_price(payload.sl)}</code>\n"
+            f"• TP1/2/3: <code>{_fmt_price(payload.tp1)}</code> / "
+            f"<code>{_fmt_price(payload.tp2)}</code> / <code>{_fmt_price(payload.tp3)}</code>\n"
+            f"• Confidence: {conf} • Leverage: {lev}\n"
+            f"• id: <code>{trade_id}</code>\n"
+            f"• time: {t}"
+        )
+    if payload.type in ("TP1_HIT", "TP2_HIT", "TP3_HIT"):
+        which = payload.type.replace("_HIT", "")
+        level = {"TP1_HIT": payload.tp1, "TP2_HIT": payload.tp2, "TP3_HIT": payload.tp3}.get(payload.type)
+        return (
+            f"✅ <b>{which} HIT</b> — <b>{sym}</b> <i>{tf_label}</i>\n"
+            f"• Price: <code>{_fmt_price(level)}</code> • Side: <b>{payload.side or '—'}</b>\n"
+            f"• id: <code>{trade_id}</code> • time: {t}"
+        )
+    if payload.type == "SL_HIT":
+        return (
+            f"🛑 <b>SL HIT</b> — <b>{sym}</b> <i>{tf_label}</i>\n"
+            f"• Price: <code>{_fmt_price(payload.sl)}</code> • Side: <b>{payload.side or '—'}</b>\n"
+            f"• id: <code>{trade_id}</code> • time: {t}"
+        )
+    if payload.type == "CLOSE":
+        return (
+            f"🔒 <b>CLOSE</b> — <b>{sym}</b> <i>{tf_label}</i>\n"
+            f"• Price: <code>{_fmt_price(payload.price)}</code> • Side: <b>{payload.side or '—'}</b>\n"
+            f"• id: <code>{trade_id}</code> • time: {t}"
+        )
+    return f"ℹ️ <b>{payload.type}</b> — <b>{sym}</b> <i>{tf_label}</i> • id: <code>{trade_id}</code>"
+app = FastAPI(title="AI Trader Pro v3.0", version="3.0")
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if RATE_LIMIT_ENABLED:
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    def rate_limit(s): return lambda f: limiter.limit(s)(f)
+else:
+    def rate_limit(s): return lambda f: f
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ROUTES
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return """<!DOCTYPE html><html><head><title>AI Trader Pro v3.0</title></head>
-    <body style="font-family:system-ui;padding:40px;background:#0a0f1a;color:#e6edf3">
-    <h1 style="color:#6366f1">🚀 AI Trader Pro v3.0 ULTIMATE</h1>
-    <p>Système de trading professionnel avec IA</p>
-    <h2>Pages disponibles:</h2><ul>
-    <li><a href="/trades" style="color:#8b5cf6">📊 Dashboard Principal</a></li>
-    <li><a href="/ai-insights" style="color:#8b5cf6">🤖 AI Insights</a></li>
-    <li><a href="/equity-curve" style="color:#8b5cf6">📈 Equity Curve</a></li>
-    <li><a href="/heatmap" style="color:#8b5cf6">🔥 Heatmap Performance</a></li>
-    <li><a href="/advanced-metrics" style="color:#8b5cf6">📊 Métriques Avancées</a></li>
-    <li><a href="/patterns" style="color:#8b5cf6">🔍 Pattern Detection</a></li>
-    <li><a href="/journal" style="color:#8b5cf6">📝 Trading Journal</a></li>
-    <li><a href="/correlation" style="color:#8b5cf6">🔗 Corrélations</a></li>
-    <li><a href="/backtest" style="color:#8b5cf6">⏮️ Backtesting</a></li>
-    </ul></body></html>"""
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "version": "3.0.0", "features": [
-        "AI Scoring", "Equity Curve", "Circuit Breaker", "Kelly", "Heatmap", 
-        "Patterns", "Journal", "Correlation", "Backtesting", "Multi-Channel Alerts", "Trade Rules"
-    ]}
-
-@app.post("/tv-webhook")
-@limiter.limit("100/minute")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-    except:
-        raise HTTPException(400, "Invalid JSON")
-    
-    if data.get("secret") != settings.WEBHOOK_SECRET:
-        raise HTTPException(403, "Invalid secret")
-    
-    try:
-        payload = WebhookPayload(**data)
-    except Exception as e:
-        raise HTTPException(422, str(e))
-    
-    # Check circuit breaker
-    if payload.type == "ENTRY" and settings.CIRCUIT_BREAKER_ENABLED:
-        breaker = check_circuit_breaker()
-        if breaker["active"]:
-            await send_alert(f"⛔ Trade bloqué: {breaker['reason']} ({breaker['hours_remaining']}h restantes)")
-            return {"ok": False, "reason": "circuit_breaker", "details": breaker}
-        
-        # Evaluate trade rules
-        rules_result = evaluate_trade_rules(data)
-        if not rules_result["allowed"]:
-            await send_alert(f"⛔ Trade refusé:\n" + "\n".join(f"• {r}" for r in rules_result["reasons"]))
-            return {"ok": False, "reason": "trade_rules", "details": rules_result}
-        
-        # Check consecutive losses
-        recent = build_trade_rows(limit=10)
-        consecutive = 0
-        for t in reversed([r for r in recent if r["row_state"] in ("tp", "sl")]):
-            if t["row_state"] == "sl":
-                consecutive += 1
-            else:
-                break
-        
-        if consecutive >= settings.MAX_CONSECUTIVE_LOSSES:
-            trigger_circuit_breaker(f"{consecutive} pertes consécutives")
-            await send_alert(f"🚨 CIRCUIT BREAKER ACTIVÉ: {consecutive} pertes consécutives - Trading bloqué 24h", ["telegram", "discord"])
-            return {"ok": False, "reason": "consecutive_losses"}
-    
-    trade_id = save_event(payload)
-    
-    # AI Score pour ENTRY
-    if payload.type == "ENTRY":
-        rows = build_trade_rows(limit=100)
-        ai_score = calculate_ai_trade_score(data, rows)
-        msg = f"""🤖 <b>AI TRADE SCORE</b>
-
-📊 {payload.symbol} {payload.side}
-Score: {ai_score['score']}/100 {ai_score['quality']}
-
-{ai_score['recommendation']}
-
-Facteurs:
-{chr(10).join('• ' + f for f in ai_score['factors'][:5])}"""
-        await send_alert(msg, ["telegram"])
-    
-    return {"ok": True, "trade_id": trade_id, "ai_score": ai_score if payload.type == "ENTRY" else None}
-
-# API ENDPOINTS
-@app.get("/api/trades")
-async def get_trades(limit: int = 50):
-    return {"ok": True, "trades": build_trade_rows(limit=limit)}
-
-@app.get("/api/equity-curve")
-async def get_equity():
-    rows = build_trade_rows(limit=1000)
-    curve = calculate_equity_curve(rows)
-    return {"ok": True, "equity_curve": curve}
-
-@app.get("/api/heatmap")
-async def get_heatmap():
-    rows = build_trade_rows(limit=1000)
-    heatmap = calculate_performance_heatmap(rows)
-    return {"ok": True, "heatmap": heatmap}
-
-@app.get("/api/advanced-metrics")
-async def get_metrics():
-    rows = build_trade_rows(limit=1000)
-    metrics = calculate_advanced_metrics(rows)
-    
-    closed = [r for r in rows if r["row_state"] in ("tp", "sl")]
-    wins = [r for r in closed if r["row_state"] == "tp"]
-    wr = (len(wins) / len(closed) * 100) if closed else 0
-    
-    returns = []
-    for r in closed:
-        if r["entry"]:
-            try:
-                entry = float(r["entry"])
-                exit_p = float(r["sl"]) if r["sl_hit"] else float(r["tp1"]) if r.get("tp1") else None
-                if exit_p:
-                    pl_pct = ((exit_p - entry) / entry) * 100
-                    if r["side"] == "SHORT": pl_pct = -pl_pct
-                    returns.append(pl_pct)
-            except: pass
-    
-    avg_w = sum(r for r in returns if r > 0) / max(1, len([r for r in returns if r > 0]))
-    avg_l = abs(sum(r for r in returns if r < 0) / max(1, len([r for r in returns if r < 0])))
-    
-    kelly = calculate_kelly_position(wr, avg_w, avg_l)
-    
-    return {"ok": True, "metrics": metrics, "kelly": kelly}
-
-@app.get("/api/patterns")
-async def get_patterns():
-    rows = build_trade_rows(limit=200)
-    patterns = detect_trading_patterns(rows)
-    return {"ok": True, "patterns": patterns}
-
-@app.get("/api/circuit-breaker")
-async def get_breaker():
-    return {"ok": True, "circuit_breaker": check_circuit_breaker()}
-
-@app.get("/api/correlation")
-async def get_correlation():
-    rows = build_trade_rows(limit=500)
-    matrix = calculate_correlation_matrix(rows)
-    return {"ok": True, "correlation_matrix": matrix}
-
-@app.post("/api/backtest")
-async def post_backtest(filters: Dict[str, Any]):
-    rows = build_trade_rows(limit=1000)
-    result = run_backtest(rows, filters)
-    return {"ok": True, "backtest": result}
-
-# JOURNAL API
-@app.post("/api/journal")
-async def add_journal_note(note: JournalNote):
-    db_execute(
-        "INSERT INTO trade_notes (trade_id, note, emotion, tags) VALUES (?, ?, ?, ?)",
-        (note.trade_id, note.note, note.emotion, note.tags)
-    )
-    return {"ok": True, "message": "Note ajoutée"}
-
-@app.get("/api/journal/{trade_id}")
-async def get_journal_notes(trade_id: str):
-    notes = db_query("SELECT * FROM trade_notes WHERE trade_id=? ORDER BY created_at DESC", (trade_id,))
-    return {"ok": True, "notes": notes}
-
-@app.get("/api/journal")
-async def get_all_journals(limit: int = 50):
-    notes = db_query("SELECT * FROM trade_notes ORDER BY created_at DESC LIMIT ?", (limit,))
-    return {"ok": True, "notes": notes}
-
-# TRADE RULES API
-@app.post("/api/rules")
-async def add_rule(rule: TradeRule):
-    db_execute(
-        "INSERT INTO trade_rules (name, condition, action, enabled) VALUES (?, ?, ?, ?)",
-        (rule.name, rule.condition, rule.action, 1 if rule.enabled else 0)
-    )
-    return {"ok": True, "message": "Règle ajoutée"}
-
-@app.get("/api/rules")
-async def get_rules():
-    rules = db_query("SELECT * FROM trade_rules ORDER BY created_at DESC")
-    return {"ok": True, "rules": rules}
-
-@app.delete("/api/rules/{rule_id}")
-async def delete_rule(rule_id: int):
-    db_execute("DELETE FROM trade_rules WHERE id=?", (rule_id,))
-    return {"ok": True, "message": "Règle supprimée"}
-
-# HTML PAGES
 CSS = """<style>
 body{margin:0;font-family:system-ui;background:#050a12;color:#e2e8f0}
 .container{max-width:1200px;margin:0 auto;padding:40px 20px}
 .header{margin-bottom:40px}
 .header h1{font-size:36px;font-weight:900;background:linear-gradient(135deg,#6366f1,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
-.header p{color:#64748b}
 .nav{display:flex;gap:16px;margin-bottom:32px;flex-wrap:wrap}
 .nav a{padding:12px 24px;background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.3);border-radius:12px;color:#6366f1;text-decoration:none;font-weight:600;transition:all 0.3s}
-.nav a:hover{background:rgba(99,102,241,0.2);transform:translateY(-2px)}
 .card{background:rgba(20,30,48,0.6);border:1px solid rgba(99,102,241,0.12);border-radius:20px;padding:32px;margin-bottom:24px}
 .card h2{font-size:24px;font-weight:800;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:24px}
@@ -984,203 +576,171 @@ body{margin:0;font-family:system-ui;background:#050a12;color:#e2e8f0}
 .metric-label{font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;margin-bottom:8px}
 .metric-value{font-size:32px;font-weight:900;color:#6366f1}
 .badge{display:inline-block;padding:6px 12px;border-radius:8px;font-size:12px;font-weight:700}
-.badge-green{background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3)}
-.badge-red{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3)}
-.badge-yellow{background:rgba(251,191,36,0.15);color:#fbbf24;border:1px solid rgba(251,191,36,0.3)}
+.badge-green{background:rgba(16,185,129,0.15);color:#10b981}
+.badge-red{background:rgba(239,68,68,0.15);color:#ef4444}
+.badge-yellow{background:rgba(251,191,36,0.15);color:#fbbf24}
+.gauge{width:200px;height:200px;border-radius:50%;background:conic-gradient(from 180deg,#ef4444,#f97316 25%,#fbbf24 45%,#10b981 55%,#22c55e);position:relative;display:flex;align-items:center;justify-content:center;margin:0 auto}
+.gauge-inner{width:160px;height:160px;border-radius:50%;background:#0a0f1a;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gauge-value{font-size:48px;font-weight:900}
+.gauge-label{font-size:12px;color:#64748b;margin-top:4px}
+.phase-indicator{display:flex;align-items:center;gap:16px;padding:20px;background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.1));border-radius:16px;margin-bottom:12px;position:relative}
+.phase-indicator::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px}
+.phase-indicator.active::before{background:currentColor}
+.phase-number{width:48px;height:48px;border-radius:50%;background:rgba(99,102,241,0.2);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900}
+.phase-indicator.active .phase-number{background:currentColor;color:#0a0f1a}
 .list{list-style:none;padding:0}
-.list li{padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;align-items:center;gap:12px}
-.chart{background:rgba(20,30,48,0.6);border:1px solid rgba(99,102,241,0.12);border-radius:20px;padding:32px;min-height:300px;margin-bottom:24px}
-input,textarea,select{background:rgba(20,30,48,0.8);border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:12px;color:#e2e8f0;width:100%;margin-bottom:16px}
-button{background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:8px;padding:12px 24px;color:white;font-weight:700;cursor:pointer}
-button:hover{transform:translateY(-2px)}
+.list li{padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)}
 </style>"""
 
 NAV = """<div class="nav">
 <a href="/trades">📊 Dashboard</a>
-<a href="/ai-insights">🤖 AI Insights</a>
+<a href="/ai-insights">🤖 AI</a>
 <a href="/equity-curve">📈 Equity</a>
 <a href="/heatmap">🔥 Heatmap</a>
 <a href="/advanced-metrics">📊 Metrics</a>
 <a href="/patterns">🔍 Patterns</a>
 <a href="/journal">📝 Journal</a>
-<a href="/correlation">🔗 Corrélations</a>
 <a href="/backtest">⏮️ Backtest</a>
+<a href="/strategie">⚙️ Stratégie</a>
+<a href="/altseason">🚀 Altseason</a>
 </div>"""
+
+@app.get("/")
+async def root():
+    return HTMLResponse("""<!DOCTYPE html><html><head><title>AI Trader</title></head>
+    <body style="font-family:system-ui;padding:40px;background:#0a0f1a;color:#e6edf3">
+    <h1 style="color:#6366f1">🚀 AI Trader Pro v3.0</h1>
+    <p><a href="/trades" style="color:#8b5cf6">📊 Dashboard</a></p></body></html>""")
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "3.0.0"}
+
+# ✅ Endpoint de sanity pour ENV
+@app.get("/env-sanity")
+async def env_sanity(secret: Optional[str] = Query(default=None)):
+    if settings.WEBHOOK_SECRET and secret != settings.WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    return {
+        "WEBHOOK_SECRET_set": bool(settings.WEBHOOK_SECRET),
+        "TELEGRAM_BOT_TOKEN_set": bool(settings.TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_CHAT_ID_set": bool(settings.TELEGRAM_CHAT_ID),
+        "TELEGRAM_ENABLED": settings.TELEGRAM_ENABLED,
+    }
+
+@app.get("/api/fear-greed")
+async def get_fear_greed():
+    return {"ok": True, "fear_greed": await fetch_fear_greed_index()}
+
+# ✅ ENDPOINT MODIFIÉ POUR UTILISER LES VRAIES DONNÉES
+@app.get("/api/bullrun-phase")
+async def get_bullrun_phase():
+    return {"ok": True, "bullrun_phase": await detect_real_bullrun_phase()}
+
+@app.get("/api/trades")
+async def get_trades(limit: int = 50):
+    return {"ok": True, "trades": build_trade_rows(limit)}
+
+@app.get("/api/equity-curve")
+async def get_equity():
+    return {"ok": True, "equity_curve": calculate_equity_curve(build_trade_rows(1000))}
+
+@app.get("/api/heatmap")
+async def get_heatmap():
+    return {"ok": True, "heatmap": calculate_performance_heatmap(build_trade_rows(1000))}
+
+@app.get("/api/advanced-metrics")
+async def get_metrics():
+    rows = build_trade_rows(1000)
+    m = calculate_advanced_metrics(rows)
+    closed = [r for r in rows if r.get("row_state") in ("tp", "sl")]
+    wr = (sum(1 for r in closed if r.get("row_state")=="tp") / len(closed) * 100) if closed else 0
+    ret = []
+    for r in closed:
+        if r.get("entry") and r.get("side"):
+            try:
+                en, ex = float(r["entry"]), (float(r["sl"]) if r.get("sl_hit") and r.get("sl") else (float(r["tp1"]) if r.get("tp1") else None))
+                if ex:
+                    pl = ((ex - en) / en) * 100
+                    if r["side"] == "SHORT": pl = -pl
+                    ret.append(pl)
+            except: pass
+    aw = sum(r for r in ret if r > 0) / max(1, len([r for r in ret if r > 0]))
+    al = abs(sum(r for r in ret if r < 0) / max(1, len([r for r in ret if r < 0])))
+    return {"ok": True, "metrics": m, "kelly": calculate_kelly_position(wr, aw, al)}
+
+@app.get("/api/patterns")
+async def get_patterns():
+    return {"ok": True, "patterns": detect_trading_patterns(build_trade_rows(200))}
+
+# ✅ ENDPOINT MODIFIÉ POUR UTILISER LES VRAIES DONNÉES
+@app.get("/api/altseason")
+async def get_altseason():
+    return {"ok": True, "altseason": await calculate_real_altseason_metrics()}
+
+# ✅ NOUVEL ENDPOINT POUR LES DONNÉES BRUTES DU MARCHÉ
+@app.get("/api/market-data")
+async def get_market_data():
+    return {"ok": True, "market": await fetch_real_market_data()}
+
+@app.post("/api/backtest")
+async def post_backtest(filters: Dict[str, Any]):
+    return {"ok": True, "backtest": run_backtest(build_trade_rows(1000), filters)}
+
+@app.post("/api/journal")
+async def add_journal(note: JournalNote):
+    db_execute("INSERT INTO trade_notes (trade_id, note, emotion, tags) VALUES (?, ?, ?, ?)", (note.trade_id, note.note, note.emotion, note.tags))
+    return {"ok": True}
+
+@app.get("/api/journal")
+async def get_journals(limit: int = 50):
+    return {"ok": True, "notes": db_query("SELECT * FROM trade_notes ORDER BY created_at DESC LIMIT ?", (limit,))}
+
+# ========= PATCH: envoi Telegram après insert DB dans /tv-webhook =========
+@app.post("/tv-webhook")
+@rate_limit("100/minute")
+async def webhook(request: Request):
+    try: data = await request.json()
+    except: raise HTTPException(400)
+    if data.get("secret") != settings.WEBHOOK_SECRET: raise HTTPException(403)
+    try: payload = WebhookPayload(**data)
+    except Exception as e: raise HTTPException(422, str(e))
+    if payload.type == "ENTRY" and settings.CIRCUIT_BREAKER_ENABLED:
+        breaker = check_circuit_breaker()
+        if breaker["active"]:
+            await send_telegram(f"⛔ Bloqué: {breaker['reason']}")
+            return {"ok": False, "reason": "circuit_breaker"}
+        recent = build_trade_rows(10)
+        cons = 0
+        for t in reversed([r for r in recent if r.get("row_state") in ("tp", "sl")]):
+            if t.get("row_state") == "sl": cons += 1
+            else: break
+        if cons >= settings.MAX_CONSECUTIVE_LOSSES:
+            trigger_circuit_breaker(f"{cons} pertes")
+            await send_telegram(f"🚨 BREAKER: {cons} pertes")
+            return {"ok": False, "reason": "consecutive_losses"}
+    trade_id = save_event(payload)
+    try:
+        msg = format_telegram_message(payload, trade_id)
+        await send_telegram(msg)
+    except Exception as e:
+        logger.warning(f"Telegram format/send error: {e}")
+    return {"ok": True, "trade_id": trade_id}
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
-    rows = build_trade_rows(limit=50)
+    rows = build_trade_rows(50)
+    patterns = detect_trading_patterns(rows)
+    metrics = calculate_advanced_metrics(rows)
+    closed = [r for r in rows if r.get("row_state") in ("tp", "sl")]
+    wr = (sum(1 for r in closed if r.get("row_state")=="tp") / len(closed) * 100) if closed else 0
     
-    table_rows = ""
+    table = ""
     for r in rows[:20]:
-        state_badge = f'<span class="badge badge-green">TP ✓</span>' if r["row_state"] == "tp" else (f'<span class="badge badge-red">SL ✗</span>' if r["row_state"] == "sl" else f'<span class="badge badge-yellow">En cours</span>')
-        
-        table_rows += f"""<tr style="border-bottom:1px solid rgba(99,102,241,0.1)">
-            <td style="padding:12px">{r['symbol']}</td>
-            <td style="padding:12px">{r['tf_label']}</td>
-            <td style="padding:12px">{r['side']}</td>
-            <td style="padding:12px">{r['entry'] if r['entry'] else 'N/A'}</td>
-            <td style="padding:12px">{state_badge}</td>
-        </tr>"""
+        badge = f'<span class="badge badge-green">TP</span>' if r.get("row_state")=="tp" else (f'<span class="badge badge-red">SL</span>' if r.get("row_state")=="sl" else f'<span class="badge badge-yellow">En cours</span>')
+        table += f"""<tr style="border-bottom:1px solid rgba(99,102,241,0.1)"><td style="padding:12px">{r.get('symbol','N/A')}</td><td style="padding:12px">{r.get('tf_label','N/A')}</td><td style="padding:12px">{r.get('side','N/A')}</td><td style="padding:12px">{r.get('entry') or 'N/A'}</td><td style="padding:12px">{badge}</td></tr>"""
     
-    html = f"""<!DOCTYPE html><html><head><title>Dashboard</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>📊 Dashboard Principal</h1><p>Vue d'ensemble de vos trades</p></div>
-    {NAV}
-    <div class="grid">
-        <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value">{len(rows)}</div></div>
-        <div class="metric"><div class="metric-label">Actifs</div><div class="metric-value">{sum(1 for r in rows if r['row_state']=='normal')}</div></div>
-        <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">{int((sum(1 for r in rows if r['row_state']=='tp') / max(1, sum(1 for r in rows if r['row_state'] in ('tp','sl')))) * 100)}%</div></div>
-    </div>
-    <div class="card"><h2>Derniers Trades</h2>
-    <table style="width:100%;border-collapse:collapse">
-        <thead><tr style="border-bottom:2px solid rgba(99,102,241,0.2)">
-            <th style="padding:12px;text-align:left;color:#64748b">Symbol</th>
-            <th style="padding:12px;text-align:left;color:#64748b">TF</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Side</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Entry</th>
-            <th style="padding:12px;text-align:left;color:#64748b">Status</th>
-        </tr></thead>
-        <tbody>{table_rows}</tbody>
-    </table>
-    </div>
-    </div></body></html>"""
-    return html
-
-@app.get("/correlation", response_class=HTMLResponse)
-async def correlation_page():
-    rows = build_trade_rows(limit=500)
-    matrix = calculate_correlation_matrix(rows)
-    
-    if not matrix:
-        html = f"""<!DOCTYPE html><html><head><title>Corrélations</title>{CSS}</head>
-        <body><div class="container">
-        <div class="header"><h1>🔗 Matrix de Corrélation</h1><p>Corrélation entre symboles</p></div>
-        {NAV}
-        <div class="card"><p>Pas assez de données pour calculer les corrélations (minimum 2 symboles)</p></div>
-        </div></body></html>"""
-        return html
-    
-    symbols = list(matrix.keys())
-    
-    table_html = "<table style='width:100%;border-collapse:collapse'><thead><tr><th style='padding:8px;border:1px solid rgba(99,102,241,0.2)'></th>"
-    for sym in symbols:
-        table_html += f"<th style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-size:12px'>{sym}</th>"
-    table_html += "</tr></thead><tbody>"
-    
-    for sym1 in symbols:
-        table_html += f"<tr><td style='padding:8px;border:1px solid rgba(99,102,241,0.2);font-weight:600'>{sym1}</td>"
-        for sym2 in symbols:
-            corr = matrix[sym1][sym2]
-            if corr >= 0.7:
-                color = "rgba(16,185,129,0.3)"
-            elif corr >= 0.5:
-                color = "rgba(251,191,36,0.3)"
-            else:
-                color = "rgba(239,68,68,0.2)"
-            
-            table_html += f"<td style='padding:12px;border:1px solid rgba(99,102,241,0.2);background:{color};text-align:center;font-weight:700'>{corr}</td>"
-        table_html += "</tr>"
-    
-    table_html += "</tbody></table>"
-    
-    html = f"""<!DOCTYPE html><html><head><title>Corrélations</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>🔗 Matrix de Corrélation</h1><p>Corrélation entre symboles</p></div>
-    {NAV}
-    <div class="card">
-        <h2>Matrice de Corrélation</h2>
-        <p style="color:#64748b;margin-bottom:20px">🟢 > 0.7 | 🟡 0.5-0.7 | 🔴 < 0.5</p>
-        {table_html}
-    </div>
-    <div class="card"><h2>Interprétation</h2>
-    <p style="color:#64748b">Une corrélation élevée entre deux symboles signifie qu'ils ont tendance à bouger ensemble. Utilisez ceci pour:</p>
-    <ul class="list">
-        <li>✅ Diversifier votre portefeuille (évitez les symboles trop corrélés)</li>
-        <li>✅ Identifier des paires de trading potentielles</li>
-        <li>✅ Comprendre les relations entre marchés</li>
-    </ul>
-    </div>
-    </div></body></html>"""
-    return html
-
-@app.get("/backtest", response_class=HTMLResponse)
-async def backtest_page():
-    html = f"""<!DOCTYPE html><html><head><title>Backtesting</title>{CSS}</head>
-    <body><div class="container">
-    <div class="header"><h1>⏮️ Backtesting Engine</h1><p>Testez des stratégies sur l'historique</p></div>
-    {NAV}
-    <div class="card">
-        <h2>Configuration du Backtest</h2>
-        <form id="backtestForm">
-            <label>Side (optionnel)</label>
-            <select name="side">
-                <option value="">Tous</option>
-                <option value="LONG">LONG seulement</option>
-                <option value="SHORT">SHORT seulement</option>
-            </select>
-            
-            <label>Symbole (optionnel)</label>
-            <input type="text" name="symbol" placeholder="ex: BTCUSDT">
-            
-            <label>Timeframe (optionnel)</label>
-            <input type="text" name="tf" placeholder="ex: 4h">
-            
-            <label>Confiance minimale (0-100)</label>
-            <input type="number" name="confidence_min" min="0" max="100" value="0">
-            
-            <button type="submit">🚀 Lancer le Backtest</button>
-        </form>
-    </div>
-    <div id="results" class="card" style="display:none">
-        <h2>Résultats</h2>
-        <div id="resultsContent"></div>
-    </div>
-    <script>
-    document.getElementById('backtestForm').addEventListener('submit', async (e) => {{
-        e.preventDefault();
-        const formData = new FormData(e.target);
-        const filters = {{}};
-        for (let [key, value] of formData.entries()) {{
-            if (value) filters[key] = isNaN(value) ? value : Number(value);
-        }}
-        
-        const res = await fetch('/api/backtest', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify(filters)
-        }});
-        const data = await res.json();
-        
-        if (data.ok) {{
-            const r = data.backtest;
-            document.getElementById('results').style.display = 'block';
-            document.getElementById('resultsContent').innerHTML = `
-                <div class="grid">
-                    <div class="metric"><div class="metric-label">Trades</div><div class="metric-value">${{r.trades}}</div></div>
-                    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">${{r.winrate}}%</div></div>
-                    <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" style="color:${{r.total_return >= 0 ? '#10b981' : '#ef4444'}}">${{r.total_return >= 0 ? '+' : ''}}${{r.total_return}}%</div></div>
-                    <div class="metric"><div class="metric-label">Avg Win</div><div class="metric-value">${{r.avg_win}}%</div></div>
-                    <div class="metric"><div class="metric-label">Avg Loss</div><div class="metric-value">${{r.avg_loss}}%</div></div>
-                    <div class="metric"><div class="metric-label">Best Trade</div><div class="metric-value" style="color:#10b981">+${{r.best_trade}}%</div></div>
-                    <div class="metric"><div class="metric-label">Worst Trade</div><div class="metric-value" style="color:#ef4444">${{r.worst_trade}}%</div></div>
-                </div>
-                <p style="margin-top:20px;padding:16px;background:rgba(99,102,241,0.1);border-radius:12px">
-                    💡 <strong>Filtres appliqués:</strong> ${{JSON.stringify(r.filters)}}
-                </p>
-            `;
-        }}
-    }});
-    </script>
-    </div></body></html>"""
-    return html
-
-# Les autres pages restent identiques (ai-insights, equity-curve, heatmap, etc.)
-# Je les ai volontairement omises pour respecter la limite de caractères
-# Elles sont déjà présentes dans votre code original
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    logger.info("🚀 Starting AI Trader Pro v3.0 ULTIMATE...")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    patterns_html = "".join(f'<li style="padding:8px;font-size:14px">{p}</li>' for p in patterns[:5])
+    curve = calculate_equity_curve(rows)
+    curr_equity = curve[-1]["equity"] if curve else settings.INITIAL_CAPITAL
+    total_return = ((curr_equity - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL) * 100
