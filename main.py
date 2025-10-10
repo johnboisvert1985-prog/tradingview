@@ -12,6 +12,7 @@ import aiohttp
 import os
 import asyncio
 import random
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.1.0")
+app = FastAPI(title="Trading Dashboard", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,8 +32,8 @@ app.add_middleware(
 
 class Settings:
     INITIAL_CAPITAL = 10000
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip("'").strip('"')
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'").strip('"')
     FEAR_GREED_API = "https://api.alternative.me/fng/"
     COINGECKO_API = "https://api.coingecko.com/api/v3"
 
@@ -273,7 +274,6 @@ async def init_demo():
         })
     logger.info("✅ Démo initialisée")
 
-# Exécuter l'init au démarrage de l'app (évite RuntimeError de create_task au niveau module)
 @app.on_event("startup")
 async def _startup_event():
     try:
@@ -282,28 +282,45 @@ async def _startup_event():
         logger.error(f"Startup init error: {e}")
 
 # ============================================================================
-# TELEGRAM
+# TELEGRAM (avec diagnostics)
 # ============================================================================
+def _telegram_config_ok() -> bool:
+    return bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
+
 async def send_telegram_message(message: str) -> bool:
-    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram non configuré")
+    if not _telegram_config_ok():
+        logger.warning("⚠️ Telegram non configuré (TOKEN/CHAT_ID manquants)")
         return False
+
+    # Accepte chat_id numérique ou string
+    chat_id = settings.TELEGRAM_CHAT_ID
+    try:
+        chat_id = int(chat_id)
+    except ValueError:
+        pass
 
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    logger.info("✅ Telegram envoyé")
-                    return True
-                else:
-                    logger.error(f"❌ Telegram: {response.status}")
-                    return False
-    except Exception as e:
-        logger.error(f"❌ Telegram: {str(e)}")
-        return False
+    # Petit retry: 2 tentatives
+    timeouts = [10, 15]
+    last_error = None
+    async with aiohttp.ClientSession() as session:
+        for t in timeouts:
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=t)) as response:
+                    txt = await response.text()
+                    if response.status == 200:
+                        logger.info("✅ Telegram envoyé")
+                        return True
+                    else:
+                        logger.error(f"❌ Telegram HTTP {response.status} | réponse: {txt}")
+                        last_error = f"HTTP {response.status} {txt}"
+            except Exception as e:
+                logger.error(f"❌ Telegram exception: {e}")
+                last_error = str(e)
+    logger.error(f"Telegram échec final: {last_error}")
+    return False
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
     message = (
@@ -338,9 +355,7 @@ async def notify_sl_hit(trade: Dict[str, Any]) -> bool:
     )
     return await send_telegram_message(message)
 
-# ============================================================================
-# CSS & NAV
-# ============================================================================
+# End CSS & NAV below
 CSS = """<style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
@@ -394,6 +409,7 @@ NAV = """<div class="nav">
 <a href="/heatmap">🔥 Heatmap</a>
 <a href="/strategie">⚙️ Stratégie</a>
 <a href="/backtest">⏮️ Backtest</a>
+<a href="/bullrun-guide">📚 Bullrun Guide</a>
 <a href="/patterns">🤖 Patterns</a>
 <a href="/advanced-metrics">📊 Metrics</a>
 </div>"""
@@ -482,6 +498,21 @@ async def api_bullrun_phase():
         }
     }
 
+# --- Telegram diagnostics endpoints
+@app.get("/api/telegram/status")
+async def telegram_status():
+    ok = _telegram_config_ok()
+    return {
+        "configured": ok,
+        "bot_token_present": bool(settings.TELEGRAM_BOT_TOKEN),
+        "chat_id_present": bool(settings.TELEGRAM_CHAT_ID),
+    }
+
+@app.get("/api/telegram/test")
+async def telegram_test(text: str = "Test depuis le Dashboard ✅"):
+    sent = await send_telegram_message(text)
+    return {"ok": sent}
+
 @app.get("/api/stats")
 async def api_stats():
     return JSONResponse(trading_state.get_stats())
@@ -509,7 +540,6 @@ async def api_heatmap():
     hours = [f"{h:02d}:00" for h in range(8, 20)]
     heatmap = {}
 
-    # données réalistes
     for day in days:
         for hour in hours:
             key = f"{day}_{hour}"
@@ -525,7 +555,6 @@ async def api_heatmap():
                 trades = random.randint(0, 8)
             heatmap[key] = {"winrate": winrate, "trades": trades}
 
-    # intégrer vrais trades fermés
     for trade in trading_state.trades:
         if 'timestamp' in trade and trade.get('row_state') in ('tp', 'sl'):
             ts = trade['timestamp']
@@ -544,7 +573,6 @@ async def api_heatmap():
 # BACKTEST ENGINE (Binance)
 # ============================================================================
 async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000):
-    """Récupère les données historiques depuis Binance"""
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
@@ -565,14 +593,14 @@ async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1
                     logger.info(f"✅ Binance: {len(klines)} klines pour {symbol}")
                     return klines
                 else:
-                    logger.error(f"❌ Binance API: {response.status}")
+                    txt = await response.text()
+                    logger.error(f"❌ Binance API: {response.status} | {txt}")
                     return None
     except Exception as e:
         logger.error(f"❌ Binance: {str(e)}")
         return None
 
 def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: float, initial_capital: float = 10000):
-    """Stratégie simple momentum + TP/SL"""
     if not klines or len(klines) < 2:
         return None
 
@@ -664,22 +692,14 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
 
 def _candles_for_days(interval: str, days: int) -> int:
     interval = interval.lower()
-    if interval == "1m":
-        per_day = 60 * 24
-    elif interval == "5m":
-        per_day = 12 * 24
-    elif interval == "15m":
-        per_day = 4 * 24
-    elif interval == "30m":
-        per_day = 2 * 24
-    elif interval == "1h":
-        per_day = 24
-    elif interval == "4h":
-        per_day = 6
-    elif interval == "1d":
-        per_day = 1
-    else:
-        per_day = 24
+    if interval == "1m": per_day = 60 * 24
+    elif interval == "5m": per_day = 12 * 24
+    elif interval == "15m": per_day = 4 * 24
+    elif interval == "30m": per_day = 2 * 24
+    elif interval == "1h": per_day = 24
+    elif interval == "4h": per_day = 6
+    elif interval == "1d": per_day = 1
+    else: per_day = 24
     return min(per_day * max(days, 1), 1000)
 
 @app.get("/api/backtest")
@@ -691,7 +711,6 @@ async def api_backtest(
     tp_percent: float = 3.0,
     sl_percent: float = 2.0
 ):
-    """Backtest avec vraies données Binance (supporte ?days=)"""
     if limit <= 0:
         limit = _candles_for_days(interval, days)
 
@@ -900,11 +919,9 @@ async def trades():
         + NAV +
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(300px,1fr))'>"
 
-        # ——— Carte Fear & Greed
         "<div class='card'><h2>😱 Fear & Greed <span class='live-badge'>LIVE</span></h2>"
         "<div id='fg' style='text-align:center;padding:40px'>⏳</div></div>"
 
-        # ——— Carte Bull Run + NOTE EXPLICATIVE
         "<div class='card'><h2>🚀 Bull Run <span class='live-badge'>LIVE</span></h2>"
         "<div id='br' style='text-align:center;padding:40px'>⏳</div>"
         "<details style='margin-top:8px;background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.2);border-radius:8px;padding:12px;'>"
@@ -919,12 +936,10 @@ async def trades():
         "<div style='margin-top:8px;color:#94a3b8'>⚠️ Seuils indicatifs : l’estimation utilise <b>dominance BTC</b> &amp; <b>sentiment</b> en temps réel.</div>"
         "</div></details></div>"
 
-        # ——— Carte Patterns
         "<div class='card'><h2>🤖 Patterns</h2><ul class='list'>" + patterns_html + "</ul></div>"
 
         "</div>"
 
-        # ——— Métriques
         "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(200px,1fr))'>"
         f"<div class='metric'><div class='metric-label'>Total</div><div class='metric-value'>{stats['total_trades']}</div></div>"
         f"<div class='metric'><div class='metric-label'>Actifs</div><div class='metric-value'>{stats['active_trades']}</div></div>"
@@ -934,12 +949,10 @@ async def trades():
         f"<div class='metric-value' style='color:{'#10b981' if stats['total_return']>=0 else '#ef4444'}'>{stats['total_return']:+.1f}%</div></div>"
         "</div>"
 
-        # ——— Tableau
         "<div class='card'><h2>📊 Trades</h2>"
         "<table><thead><tr><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>Status</th></tr></thead>"
         "<tbody>" + table + "</tbody></table></div>"
 
-        # ——— JS
         "<script>"
         "fetch('/api/fear-greed').then(r=>r.json()).then(d=>{"
         "  if(d.ok){"
@@ -1078,8 +1091,9 @@ async def heatmap():
 
 @app.get("/strategie", response_class=HTMLResponse)
 async def strategie():
-    telegram_status = '✅ Configuré' if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else '⚠️ Non configuré'
-    color = '#10b981' if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else '#ef4444'
+    telegram_ok = _telegram_config_ok()
+    telegram_status = '✅ Configuré' if telegram_ok else '⚠️ Non configuré'
+    color = '#10b981' if telegram_ok else '#ef4444'
     return HTMLResponse(
         "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Stratégie</title>"
         + CSS +
@@ -1095,7 +1109,26 @@ async def strategie():
         "<div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>TP</span><span style='font-weight:700;color:#10b981'>+3%</span></div>"
         "<div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>SL</span><span style='font-weight:700;color:#ef4444'>-2%</span></div>"
         "</div></div>"
-        f"<div class='card'><h2>🔔 Telegram</h2><p style='color:{color}'>{telegram_status}</p></div>"
+        f"<div class='card'><h2>🔔 Telegram</h2>"
+        f"<p style='color:{color}'>{telegram_status}</p>"
+        "<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+        "<button id='tgTestBtn'>Envoyer un test Telegram</button>"
+        "<span id='tgResult' style='color:#94a3b8'></span>"
+        "</div>"
+        "</div>"
+        "<script>"
+        "document.getElementById('tgTestBtn').addEventListener('click', async () => {"
+        "  const btn = document.getElementById('tgTestBtn');"
+        "  const out = document.getElementById('tgResult');"
+        "  btn.disabled = true; out.textContent = 'Envoi…';"
+        "  try {"
+        "    const r = await fetch('/api/telegram/test?text=' + encodeURIComponent('Ping depuis la page Stratégie ✅'));"
+        "    const d = await r.json();"
+        "    out.textContent = d.ok ? 'Message envoyé ✅' : 'Échec ❌ (voir logs serveur)';"
+        "  } catch(e){ out.textContent = 'Erreur réseau ❌'; }"
+        "  finally { btn.disabled = false; }"
+        "});"
+        "</script>"
         "</div></body></html>"
     )
 
@@ -1203,6 +1236,40 @@ async def backtest():
         "</div></body></html>"
     )
 
+@app.get("/bullrun-guide", response_class=HTMLResponse)
+async def bullrun_guide():
+    return HTMLResponse(
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Bullrun Guide</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>📚 Bullrun Guide</h1><p>Comprendre les phases & indicateurs clés</p></div>"
+        + NAV +
+        "<div class='card'><h2>🧭 Les 4 phases (avec seuils indicatifs)</h2>"
+        "<ol style='line-height:1.7;padding-left:18px;color:#cbd5e1'>"
+        "<li><b>Phase 0 – Accumulation</b> : F&amp;G &lt; 55, funding modéré, cassure MM longues (SMA200J/EMA200 4H/1D).</li>"
+        "<li><b>Phase 1 – Bitcoin Season</b> : <b>BTC.D ≳ 48%</b>, dominance monte, ETF/inflows, F&amp;G ≈ 55–70.</li>"
+        "<li><b>Phase 2 – ETH & Large Caps</b> : <b>BTC.D 45–48%</b>, ETH/BTC en hausse, volumes top10–20, F&amp;G ≈ 60–75.</li>"
+        "<li><b>Phase 3 – Altseason</b> : <b>BTC.D ≲ 45%</b>, F&amp;G &gt; 75 (euphorie), volatilité élevée, rotations rapides.</li>"
+        "</ol>"
+        "<p style='color:#94a3b8;margin-top:10px'>⚠️ Ces seuils sont des repères. Toujours croiser avec la liquidité, open interest et volatilité implicite.</p>"
+        "</div>"
+        "<div class='card'><h2>📊 Ce que calcule la carte “Bull Run LIVE”</h2>"
+        "<ul style='line-height:1.8;color:#cbd5e1'>"
+        "<li><b>Dominance BTC</b> → détermine la phase 1/2/3.</li>"
+        "<li><b>Fear &amp; Greed</b> → ajuste la <i>confiance</i> (70/80/90).</li>"
+        "<li><b>BTC Price & Market Cap</b> → contexte macro du cycle.</li>"
+        "</ul>"
+        "</div>"
+        "<div class='card'><h2>🛠 Conseils de gestion du risque</h2>"
+        "<ul style='line-height:1.8;color:#cbd5e1'>"
+        "<li>Risque fixe par trade (ex: 1–2%), take-profit par paliers.</li>"
+        "<li>Éviter l’overexposure aux small caps en Phase 3.</li>"
+        "<li>Surveiller <i>funding rate</i> et <i>open interest</i> pour détecter l’euphorie.</li>"
+        "</ul>"
+        "</div>"
+        "</div></body></html>"
+    )
+
 @app.get("/patterns", response_class=HTMLResponse)
 async def patterns():
     patterns_list = detect_patterns(build_trade_rows(50))
@@ -1250,8 +1317,9 @@ if __name__ == "__main__":
     print("  • Equity Curve avec graphique")
     print("  • Journal de trading")
     print("  • Heatmap visuelle")
-    print("  • Configuration stratégie")
+    print("  • Configuration stratégie (test Telegram)")
     print("  • Backtest (interface)")
+    print("  • Bullrun Guide")
     print("\n📥 WEBHOOK:")
     print("  URL: http://localhost:8000/tv-webhook")
     print("\n🔔 TELEGRAM:")
