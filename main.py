@@ -13,6 +13,7 @@ import aiohttp
 import os
 import asyncio
 import random
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.0.1")
+app = FastAPI(title="Trading Dashboard", version="2.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +49,7 @@ class MarketDataCache:
         self.crypto_prices: Dict[str, Any] = {}
         self.global_data: Dict[str, Any] = {}
         self.last_update: Dict[str, datetime] = {}
-        self.update_interval = 300  # 5 min
+        self.update_interval = 300  # 5 minutes
 
     def needs_update(self, key: str) -> bool:
         if key not in self.last_update:
@@ -204,7 +205,7 @@ class TradingState:
                 trade['exit_price'] = exit_price
                 trade['close_timestamp'] = datetime.now()
 
-                entry = trade.get('entry', 0) or 0.0
+                entry = float(trade.get('entry', 0) or 0.0)
                 side = trade.get('side', 'LONG')
                 pnl = (exit_price - entry) if side == 'LONG' else (entry - exit_price)
                 pnl_percent = (pnl / entry) * 100 if entry > 0 else 0
@@ -212,7 +213,7 @@ class TradingState:
                 trade['pnl'] = pnl
                 trade['pnl_percent'] = pnl_percent
 
-                self.current_equity += pnl * 10
+                self.current_equity += pnl * 10  # levier 10x
                 self.equity_curve.append({"equity": self.current_equity, "timestamp": datetime.now()})
 
                 logger.info(f"🔒 Trade #{trade_id}: {result.upper()} P&L {pnl_percent:+.2f}%")
@@ -284,10 +285,11 @@ async def init_demo():
         })
     logger.info("✅ Démo initialisée")
 
-# IMPORTANT : créer les données en startup (et pas asyncio.create_task au niveau module)
+# IMPORTANT : créer les données à startup (pas de create_task au niveau module)
 @app.on_event("startup")
 async def _startup():
     await init_demo()
+
 # ============================================================================
 # TELEGRAM
 # ============================================================================
@@ -347,7 +349,7 @@ async def notify_sl_hit(trade: Dict[str, Any]) -> bool:
     return await send_telegram_message(message)
 
 # ============================================================================
-# CSS
+# CSS & NAV
 # ============================================================================
 CSS = """<style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -486,11 +488,19 @@ async def api_stats():
 
 @app.get("/api/equity-curve")
 async def api_equity_curve():
-    return {"ok": True, "equity_curve": trading_state.equity_curve}
+    # conversion minimale pour JSON
+    eq = [{"equity": e["equity"], "timestamp": e["timestamp"].isoformat()} for e in trading_state.equity_curve]
+    return {"ok": True, "equity_curve": eq}
 
 @app.get("/api/journal")
 async def api_journal():
-    return {"ok": True, "entries": trading_state.journal_entries}
+    entries = [{
+        "id": j["id"],
+        "timestamp": j["timestamp"].isoformat(),
+        "entry": j["entry"],
+        "trade_id": j["trade_id"]
+    } for j in trading_state.journal_entries]
+    return {"ok": True, "entries": entries}
 
 @app.post("/api/journal")
 async def api_add_journal(request: Request):
@@ -500,6 +510,7 @@ async def api_add_journal(request: Request):
         return {"ok": True}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
 # ============================================================================
 # HEATMAP
 # ============================================================================
@@ -826,7 +837,10 @@ async def webhook(request: Request):
                     trade.get('row_state') == 'normal' and
                     trade.get('side') == side):
 
-                    exit_price = payload.get('tp' if action == 'tp_hit' else 'sl') or trade.get('tp' if action == 'tp_hit' else 'sl')
+                    key = 'tp' if action == 'tp_hit' else 'sl'
+                    exit_price = payload.get(key) or trade.get(key)
+                    if exit_price is None:
+                        continue
                     result = 'tp' if action == 'tp_hit' else 'sl'
 
                     if trading_state.close_trade(trade['id'], result, float(exit_price)):
@@ -843,93 +857,111 @@ async def webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Webhook: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
 # ============================================================================
-# ROUTES HTML
+# ROUTES HTML (sans f-strings sur les gros blocs pour éviter les erreurs)
 # ============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Dashboard</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>🚀 Trading Dashboard</h1><p>Système complet <span class="live-badge">LIVE</span></p></div>{NAV}
-<div class="card" style="text-align:center;">
-<h2>Dashboard Professionnel</h2>
-<p style="color:#94a3b8;margin:20px 0;">✅ Données réelles • ✅ Telegram • ✅ Analytics</p>
-<a href="/trades" style="display:inline-block;padding:12px 24px;background:#6366f1;color:white;text-decoration:none;border-radius:8px;">Dashboard →</a>
-</div></div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Dashboard</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>🚀 Trading Dashboard</h1><p>Système complet <span class='live-badge'>LIVE</span></p></div>"
+        + NAV +
+        "<div class='card' style='text-align:center;'>"
+        "<h2>Dashboard Professionnel</h2>"
+        "<p style='color:#94a3b8;margin:20px 0;'>✅ Données réelles • ✅ Telegram • ✅ Analytics</p>"
+        "<a href='/trades' style='display:inline-block;padding:12px 24px;background:#6366f1;color:white;text-decoration:none;border-radius:8px;'>Dashboard →</a>"
+        "</div></div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades():
     rows = build_trade_rows(50)
     stats = trading_state.get_stats()
     patterns = detect_patterns(rows)
-    metrics = calc_metrics(rows)
 
     table = ""
     for r in rows[:20]:
-        badge = (
-            '<span class="badge badge-green">TP</span>' if r.get("row_state")=="tp" else
-            ('<span class="badge badge-red">SL</span>' if r.get("row_state")=="sl" else
-             '<span class="badge badge-yellow">En cours</span>')
-        )
+        if r.get("row_state") == "tp":
+            badge = '<span class="badge badge-green">TP</span>'
+        elif r.get("row_state") == "sl":
+            badge = '<span class="badge badge-red">SL</span>'
+        else:
+            badge = '<span class="badge badge-yellow">En cours</span>'
         pnl = ""
         if r.get('pnl_percent') is not None:
             color = '#10b981' if (r.get('pnl_percent') or 0) > 0 else '#ef4444'
             pnl = f'<span style="color:{color};font-weight:700">{(r.get("pnl_percent") or 0):+.2f}%</span>'
-        table += f"<tr><td>{r.get('symbol','N/A')}</td><td>{r.get('tf_label','N/A')}</td><td>{r.get('side','N/A')}</td><td>{r.get('entry') or 'N/A'}</td><td>{badge} {pnl}</td></tr>"
+        table += (
+            "<tr>"
+            f"<td>{r.get('symbol','N/A')}</td>"
+            f"<td>{r.get('tf_label','N/A')}</td>"
+            f"<td>{r.get('side','N/A')}</td>"
+            f"<td>{r.get('entry') or 'N/A'}</td>"
+            f"<td>{badge} {pnl}</td>"
+            "</tr>"
+        )
 
     patterns_html = "".join(f'<li style="padding:8px">{p}</li>' for p in patterns)
 
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><title>Dashboard</title><meta charset="UTF-8">{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📊 Dashboard</h1><p>Live <span class="live-badge">LIVE</span></p></div>{NAV}
-
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
-    <div class="card"><h2>😱 Fear & Greed <span class="live-badge">LIVE</span></h2><div id="fg" style="text-align:center;padding:40px">⏳</div></div>
-    <div class="card"><h2>🚀 Bull Run <span class="live-badge">LIVE</span></h2><div id="br" style="text-align:center;padding:40px">⏳</div></div>
-    <div class="card"><h2>🤖 Patterns</h2><ul class="list">{patterns_html}</ul></div>
-</div>
-
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-    <div class="metric"><div class="metric-label">Total</div><div class="metric-value">{stats['total_trades']}</div></div>
-    <div class="metric"><div class="metric-label">Actifs</div><div class="metric-value">{stats['active_trades']}</div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">{int(stats['win_rate'])}%</div></div>
-    <div class="metric"><div class="metric-label">Capital</div><div class="metric-value" style="font-size:24px">${stats['current_equity']:.0f}</div></div>
-    <div class="metric"><div class="metric-label">Return</div><div class="metric-value" style="color:{'#10b981' if stats['total_return']>=0 else '#ef4444'}">{stats['total_return']:+.1f}%</div></div>
-</div>
-
-<div class="card"><h2>📊 Trades</h2>
-<table><thead><tr><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>Status</th></tr></thead><tbody>{table}</tbody></table></div>
-
-<script>
-fetch('/api/fear-greed').then(r=>r.json()).then(d=>{
-  if(d.ok){
-    const f=d.fear_greed;
-    document.getElementById('fg').innerHTML=
-      `<div class="gauge"><div class="gauge-inner">
-         <div class="gauge-value" style="color:${f.color}">${f.value}</div>
-         <div class="gauge-label">/ 100</div>
-       </div></div>
-       <div style="text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${f.color}">${f.emoji} ${f.sentiment}</div>
-       <p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">${f.recommendation}</p>`;
-  }
-});
-
-fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{
-  if(d.ok){
-    const b=d.bullrun_phase;
-    document.getElementById('br').innerHTML=
-      `<div style="font-size:56px;margin-bottom:8px">${b.emoji}</div>
-       <div style="font-size:20px;font-weight:900;color:${b.color}">${b.phase_name}</div>
-       <p style="color:#64748b;font-size:12px;margin-top:8px">${b.description}</p>
-       <div style="margin-top:12px;font-size:12px;color:#10b981">
-         BTC: $${(b.btc_price||0).toLocaleString()} | MC: $${(b.market_cap/1e12).toFixed(2)}T
-       </div>`;
-  }
-});
-</script>
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><title>Dashboard</title><meta charset='UTF-8'>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>📊 Dashboard</h1><p>Live <span class='live-badge'>LIVE</span></p></div>"
+        + NAV +
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(300px,1fr))'>"
+            "<div class='card'><h2>😱 Fear & Greed <span class='live-badge'>LIVE</span></h2><div id='fg' style='text-align:center;padding:40px'>⏳</div></div>"
+            "<div class='card'><h2>🚀 Bull Run <span class='live-badge'>LIVE</span></h2><div id='br' style='text-align:center;padding:40px'>⏳</div></div>"
+            "<div class='card'><h2>🤖 Patterns</h2><ul class='list'>" + patterns_html + "</ul></div>"
+        "</div>"
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(200px,1fr))'>"
+            "<div class='metric'><div class='metric-label'>Total</div><div class='metric-value'>" + str(stats['total_trades']) + "</div></div>"
+            "<div class='metric'><div class='metric-label'>Actifs</div><div class='metric-value'>" + str(stats['active_trades']) + "</div></div>"
+            "<div class='metric'><div class='metric-label'>Win Rate</div><div class='metric-value'>" + str(int(stats['win_rate'])) + "%</div></div>"
+            "<div class='metric'><div class='metric-label'>Capital</div><div class='metric-value' style='font-size:24px'>$" + f"{stats['current_equity']:.0f}" + "</div></div>"
+            "<div class='metric'><div class='metric-label'>Return</div>"
+                "<div class='metric-value' style='color:" + ("#10b981" if stats['total_return']>=0 else "#ef4444") + "'>"
+                + f"{stats['total_return']:+.1f}%" +
+                "</div></div>"
+        "</div>"
+        "<div class='card'><h2>📊 Trades</h2>"
+        "<table><thead><tr><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>Status</th></tr></thead>"
+        "<tbody>" + table + "</tbody></table></div>"
+        "<script>"
+        "fetch('/api/fear-greed').then(r=>r.json()).then(d=>{"
+        "  if(d.ok){"
+        "    const f=d.fear_greed;"
+        "    document.getElementById('fg').innerHTML="
+        "      `<div class=\"gauge\"><div class=\"gauge-inner\">"
+        "         <div class=\"gauge-value\" style=\"color:${f.color}\">${f.value}</div>"
+        "         <div class=\"gauge-label\">/ 100</div>"
+        "       </div></div>"
+        "       <div style=\"text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${f.color}\">${f.emoji} ${f.sentiment}</div>"
+        "       <p style=\"color:#64748b;font-size:12px;text-align:center;margin-top:8px\">${f.recommendation}</p>`;"
+        "  }"
+        "});"
+        "fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{"
+        "  if(d.ok){"
+        "    const b=d.bullrun_phase;"
+        "    document.getElementById('br').innerHTML="
+        "      `<div style=\"font-size:56px;margin-bottom:8px\">${b.emoji}</div>"
+        "       <div style=\"font-size:20px;font-weight:900;color:${b.color}\">${b.phase_name}</div>"
+        "       <p style=\"color:#64748b;font-size:12px;margin-top:8px\">${b.description}</p>"
+        "       <div style=\"margin-top:12px;font-size:12px;color:#10b981\">"
+        "         BTC: $${(b.btc_price||0).toLocaleString()} | MC: $${(b.market_cap/1e12).toFixed(2)}T"
+        "       </div>`;"
+        "  }"
+        "});"
+        "</script>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/equity-curve", response_class=HTMLResponse)
 async def equity_curve():
@@ -938,322 +970,301 @@ async def equity_curve():
     labels = [c['timestamp'].strftime('%H:%M') for c in curve]
     values = [c['equity'] for c in curve]
 
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Equity</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📈 Equity Curve</h1></div>{NAV}
-
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-    <div class="metric"><div class="metric-label">Initial</div><div class="metric-value">${settings.INITIAL_CAPITAL}</div></div>
-    <div class="metric"><div class="metric-label">Actuel</div><div class="metric-value">${stats['current_equity']:.0f}</div></div>
-    <div class="metric"><div class="metric-label">Return</div><div class="metric-value" style="color:{'#10b981' if stats['total_return']>=0 else '#ef4444'}">{stats['total_return']:+.1f}%</div></div>
-</div>
-
-<div class="card"><h2>📊 Graphique</h2><canvas id="chart" width="800" height="400"></canvas></div>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<script>
-new Chart(document.getElementById('chart'), {
-  type: 'line',
-  data: {
-    labels: {labels},
-    datasets: [{
-      label: 'Equity',
-      data: {values},
-      borderColor: '#6366f1',
-      backgroundColor: 'rgba(99, 102, 241, 0.1)',
-      borderWidth: 3, fill: true, tension: 0.4
-    }]
-  },
-  options: {
-    responsive: true,
-    scales: {
-      y: { beginAtZero: false, ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } },
-      x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }
-    }
-  }
-});
-</script>
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Equity</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>📈 Equity Curve</h1></div>"
+        + NAV +
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(200px,1fr))'>"
+            "<div class='metric'><div class='metric-label'>Initial</div><div class='metric-value'>$" + str(settings.INITIAL_CAPITAL) + "</div></div>"
+            "<div class='metric'><div class='metric-label'>Actuel</div><div class='metric-value'>$" + f"{stats['current_equity']:.0f}" + "</div></div>"
+            "<div class='metric'><div class='metric-label'>Return</div><div class='metric-value' style='color:" + ("#10b981" if stats['total_return']>=0 else "#ef4444") + "'>" + f"{stats['total_return']:+.1f}%" + "</div></div>"
+        "</div>"
+        "<div class='card'><h2>📊 Graphique</h2><canvas id='chart' width='800' height='400'></canvas></div>"
+        "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
+        "<script>"
+        "new Chart(document.getElementById('chart'), {"
+        "  type: 'line',"
+        "  data: {"
+        "    labels: " + json.dumps(labels) + ","
+        "    datasets: [{ label: 'Equity', data: " + json.dumps(values) + ", borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', borderWidth: 3, fill: true, tension: 0.4 }]"
+        "  },"
+        "  options: { responsive: true, scales: { y: { beginAtZero: false, ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }, x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } } } }"
+        "});"
+        "</script>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/journal", response_class=HTMLResponse)
 async def journal():
     entries = trading_state.journal_entries
     entries_html = ""
     for entry in reversed(entries[-20:]):
-        entries_html += f"""<div class="journal-entry">
-<div class="journal-timestamp">{entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}{f" | Trade #{entry['trade_id']}" if entry.get('trade_id') else ""}</div>
-<div>{entry['entry']}</div></div>"""
+        trade_label = f" | Trade #{entry['trade_id']}" if entry.get('trade_id') else ""
+        entries_html += (
+            "<div class='journal-entry'>"
+            f"<div class='journal-timestamp'>{entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}{trade_label}</div>"
+            f"<div>{entry['entry']}</div>"
+            "</div>"
+        )
 
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Journal</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📝 Journal</h1></div>{NAV}
-
-<div class="card"><h2>✍️ Nouvelle Entrée</h2>
-<form id="form">
-<textarea id="text" placeholder="Votre analyse..."></textarea>
-<button type="submit" style="margin-top:12px">Ajouter</button>
-</form></div>
-
-<div class="card"><h2>📚 Entrées</h2>
-{entries_html if entries_html else '<p style="color:#64748b">Aucune entrée</p>'}
-</div>
-
-<script>
-document.getElementById('form').addEventListener('submit', async (e) => {{
-  e.preventDefault();
-  const text = document.getElementById('text').value;
-  if (!text) return;
-  await fetch('/api/journal', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{entry: text}})}});
-  location.reload();
-}});
-</script>
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Journal</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>📝 Journal</h1></div>"
+        + NAV +
+        "<div class='card'><h2>✍️ Nouvelle Entrée</h2>"
+        "<form id='form'>"
+        "<textarea id='text' placeholder='Votre analyse...'></textarea>"
+        "<button type='submit' style='margin-top:12px'>Ajouter</button>"
+        "</form></div>"
+        "<div class='card'><h2>📚 Entrées</h2>"
+        + (entries_html if entries_html else "<p style='color:#64748b'>Aucune entrée</p>") +
+        "</div>"
+        "<script>"
+        "document.getElementById('form').addEventListener('submit', async (e) => {"
+        "  e.preventDefault();"
+        "  const text = document.getElementById('text').value;"
+        "  if (!text) return;"
+        "  await fetch('/api/journal', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({entry: text})});"
+        "  location.reload();"
+        "});"
+        "</script>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/heatmap", response_class=HTMLResponse)
 async def heatmap():
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Heatmap</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>🔥 Heatmap</h1></div>{NAV}
-
-<div class="card"><h2>📊 Heatmap</h2><div id="hm">⏳</div></div>
-
-<script>
-fetch('/api/heatmap').then(r=>r.json()).then(d=>{
-  if(d.ok){
-    const hm = d.heatmap;
-    let html = '<table style="width:100%"><thead><tr><th>Jour</th>';
-    for(let h=8; h<20; h++) html += `<th>${h}:00</th>`;
-    html += '</tr></thead><tbody>';
-    ['Monday','Tuesday','Wednesday','Thursday','Friday'].forEach(day=>{
-      html += `<tr><td style="font-weight:700">${day.slice(0,3)}</td>`;
-      for(let h=8; h<20; h++){
-        const key = `${day}_${h.toString().padStart(2,'0')}:00`;
-        const cell = hm[key] || {winrate:0,trades:0};
-        const wr = cell.winrate;
-        const cls = wr>=70?'high':wr>=55?'medium':'low';
-        html += `<td class="heatmap-cell ${cls}" style="text-align:center"><div style="font-weight:700">${wr}%</div><div style="font-size:10px">${cell.trades}</div></td>`;
-      }
-      html += '</tr>';
-    });
-    html += '</tbody></table>';
-    document.getElementById('hm').innerHTML = html;
-  }
-});
-</script>
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Heatmap</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>🔥 Heatmap</h1></div>"
+        + NAV +
+        "<div class='card'><h2>📊 Heatmap</h2><div id='hm'>⏳</div></div>"
+        "<script>"
+        "fetch('/api/heatmap').then(r=>r.json()).then(d=>{"
+        "  if(d.ok){"
+        "    const hm = d.heatmap;"
+        "    let html = '<table style=\"width:100%\"><thead><tr><th>Jour</th>'; "
+        "    for(let h=8; h<20; h++) html += `<th>${h}:00</th>`;"
+        "    html += '</tr></thead><tbody>';"
+        "    ['Monday','Tuesday','Wednesday','Thursday','Friday'].forEach(day=>{"
+        "      html += `<tr><td style=\"font-weight:700\">${day.slice(0,3)}</td>`;"
+        "      for(let h=8; h<20; h++){"
+        "        const key = `${day}_${h.toString().padStart(2,'0')}:00`;"
+        "        const cell = hm[key] || {winrate:0,trades:0};"
+        "        const wr = cell.winrate;"
+        "        const cls = wr>=70?'high':wr>=55?'medium':'low';"
+        "        html += `<td class=\"heatmap-cell ${cls}\" style=\"text-align:center\"><div style=\"font-weight:700\">${wr}%</div><div style=\"font-size:10px\">${cell.trades}</div></td>`;"
+        "      }"
+        "      html += '</tr>';"
+        "    });"
+        "    html += '</tbody></table>';"
+        "    document.getElementById('hm').innerHTML = html;"
+        "  }"
+        "});"
+        "</script>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/strategie", response_class=HTMLResponse)
 async def strategie():
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Stratégie</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>⚙️ Stratégie</h1></div>{NAV}
-
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(350px,1fr))">
-  <div class="card"><h2>🎯 Paramètres</h2>
-    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Capital</span><span style="font-weight:700">${settings.INITIAL_CAPITAL}</span></div>
-    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Risk/Trade</span><span style="font-weight:700">2%</span></div>
-  </div>
-  <div class="card"><h2>📊 TP/SL</h2>
-    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>TP</span><span style="font-weight:700;color:#10b981">+3%</span></div>
-    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>SL</span><span style="font-weight:700;color:#ef4444">-2%</span></div>
-  </div>
-</div>
-
-<div class="card"><h2>🔔 Telegram</h2>
-<p style="color:{'#10b981' if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else '#ef4444'}">
-{'✅ Configuré' if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else '⚠️ Non configuré'}
-</p></div>
-
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Stratégie</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>⚙️ Stratégie</h1></div>"
+        + NAV +
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(350px,1fr))'>"
+        "  <div class='card'><h2>🎯 Paramètres</h2>"
+        "    <div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>Capital</span><span style='font-weight:700'>$" + str(settings.INITIAL_CAPITAL) + "</span></div>"
+        "    <div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>Risk/Trade</span><span style='font-weight:700'>2%</span></div>"
+        "  </div>"
+        "  <div class='card'><h2>📊 TP/SL</h2>"
+        "    <div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>TP</span><span style='font-weight:700;color:#10b981'>+3%</span></div>"
+        "    <div style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between'><span>SL</span><span style='font-weight:700;color:#ef4444'>-2%</span></div>"
+        "  </div>"
+        "</div>"
+        "<div class='card'><h2>🔔 Telegram</h2>"
+        "<p style='color:" + ("#10b981" if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else "#ef4444") + "'>"
+        + ("✅ Configuré" if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID else "⚠️ Non configuré") +
+        "</p></div>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/backtest", response_class=HTMLResponse)
 async def backtest():
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Backtest</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>⏮️ Backtest Engine</h1><p>Testez votre stratégie</p></div>{NAV}
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Backtest</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>⏮️ Backtest Engine</h1><p>Testez votre stratégie</p></div>"
+        + NAV +
+        "<div class='card'><h2>🎯 Paramètres Backtest</h2>"
+        "<div style='display:grid;gap:16px'>"
+        "<div>"
+        "  <label style='display:block;margin-bottom:8px;color:#64748b'>Symbole</label>"
+        "  <select id='symbol' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'>"
+        "    <option value='BTCUSDT'>BTCUSDT</option>"
+        "    <option value='ETHUSDT'>ETHUSDT</option>"
+        "    <option value='BNBUSDT'>BNBUSDT</option>"
+        "  </select>"
+        "</div>"
+        "<div>"
+        "  <label style='display:block;margin-bottom:8px;color:#64748b'>Bougies (limit)</label>"
+        "  <input type='number' id='limit' value='500' min='50' max='1000' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'>"
+        "</div>"
+        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:12px'>"
+        "  <div>"
+        "    <label style='display:block;margin-bottom:8px;color:#64748b'>Take Profit (%)</label>"
+        "    <input type='number' id='tp' value='3' step='0.1' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'>"
+        "  </div>"
+        "  <div>"
+        "    <label style='display:block;margin-bottom:8px;color:#64748b'>Stop Loss (%)</label>"
+        "    <input type='number' id='sl' value='2' step='0.1' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'>"
+        "  </div>"
+        "</div>"
+        "<button onclick='runBacktest()' id='runBtn'>🚀 Lancer Backtest</button>"
+        "</div></div>"
 
-<div class="card"><h2>🎯 Paramètres Backtest</h2>
-<div style="display:grid;gap:16px">
-<div>
-  <label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
-  <select id="symbol" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-    <option value="BTCUSDT">BTCUSDT</option>
-    <option value="ETHUSDT">ETHUSDT</option>
-    <option value="BNBUSDT">BNBUSDT</option>
-  </select>
-</div>
-<div>
-  <label style="display:block;margin-bottom:8px;color:#64748b">Bougies (limit)</label>
-  <input type="number" id="limit" value="500" min="50" max="1000" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-  <div>
-    <label style="display:block;margin-bottom:8px;color:#64748b">Take Profit (%)</label>
-    <input type="number" id="tp" value="3" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-  </div>
-  <div>
-    <label style="display:block;margin-bottom:8px;color:#64748b">Stop Loss (%)</label>
-    <input type="number" id="sl" value="2" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-  </div>
-</div>
-<button onclick="runBacktest()" id="runBtn">🚀 Lancer Backtest</button>
-</div></div>
+        "<div id='results' style='display:none'>"
+        "  <div class='card'><h2>📊 Résultats</h2>"
+        "    <div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(200px,1fr))'>"
+        "      <div class='metric'><div class='metric-label'>Total Trades</div><div class='metric-value' id='totalTrades'>-</div></div>"
+        "      <div class='metric'><div class='metric-label'>Wins / Losses</div><div class='metric-value' style='font-size:24px'><span id='wins' style='color:#10b981'>-</span> / <span id='losses' style='color:#ef4444'>-</span></div></div>"
+        "      <div class='metric'><div class='metric-label'>Win Rate</div><div class='metric-value' id='winRate'>-</div></div>"
+        "      <div class='metric'><div class='metric-label'>Return Total</div><div class='metric-value' id='totalReturn'>-</div></div>"
+        "      <div class='metric'><div class='metric-label'>Avg Win / Loss</div><div class='metric-value' style='font-size:24px'><span id='avgWin' style='color:#10b981'>-</span> / <span id='avgLoss' style='color:#ef4444'>-</span></div></div>"
+        "      <div class='metric'><div class='metric-label'>Max Drawdown</div><div class='metric-value' id='maxDD' style='color:#ef4444'>-</div></div>"
+        "      <div class='metric'><div class='metric-label'>Sharpe Ratio</div><div class='metric-value' id='sharpe'>-</div></div>"
+        "      <div class='metric'><div class='metric-label'>Final Equity</div><div class='metric-value' id='finalEquity' style='font-size:24px'>-</div></div>"
+        "    </div>"
+        "  </div>"
 
-<div id="results" style="display:none">
-  <div class="card"><h2>📊 Résultats</h2>
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-      <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value" id="totalTrades">-</div></div>
-      <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value" style="font-size:24px"><span id="wins" style="color:#10b981">-</span> / <span id="losses" style="color:#ef4444">-</span></div></div>
-      <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winRate">-</div></div>
-      <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" id="totalReturn">-</div></div>
-      <div class="metric"><div class="metric-label">Avg Win / Loss</div><div class="metric-value" style="font-size:24px"><span id="avgWin" style="color:#10b981">-</span> / <span id="avgLoss" style="color:#ef4444">-</span></div></div>
-      <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" id="maxDD" style="color:#ef4444">-</div></div>
-      <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value" id="sharpe">-</div></div>
-      <div class="metric"><div class="metric-label">Final Equity</div><div class="metric-value" id="finalEquity" style="font-size:24px">-</div></div>
-    </div>
-  </div>
+        "  <div class='card'><h2>📈 Equity Curve</h2>"
+        "    <canvas id='equityChart' width='800' height='400'></canvas>"
+        "  </div>"
 
-  <div class="card"><h2>📈 Equity Curve</h2>
-    <canvas id="equityChart" width="800" height="400"></canvas>
-  </div>
+        "  <div class='card'><h2>📋 Derniers Trades</h2>"
+        "    <div style='max-height:400px;overflow-y:auto'>"
+        "      <table id='tradesTable'>"
+        "        <thead><tr><th>Entry</th><th>Exit</th><th>Entry Px</th><th>Exit Px</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>"
+        "        <tbody id='tradesBody'></tbody>"
+        "      </table>"
+        "    </div>"
+        "  </div>"
+        "</div>"
 
-  <div class="card"><h2>📋 Derniers Trades</h2>
-    <div style="max-height:400px;overflow-y:auto">
-      <table id="tradesTable">
-        <thead><tr><th>Entry</th><th>Exit</th><th>Entry Px</th><th>Exit Px</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>
-        <tbody id="tradesBody"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<script>
-let chart = null;
-
-async function runBacktest() {{
-  const btn = document.getElementById('runBtn');
-  btn.disabled = true;
-  btn.textContent = '⏳ Calcul en cours...';
-
-  const symbol = document.getElementById('symbol').value;
-  const limit = document.getElementById('limit').value;
-  const tp = document.getElementById('tp').value;
-  const sl = document.getElementById('sl').value;
-
-  try {{
-    const response = await fetch(`/api/backtest?symbol=${{symbol}}&limit=${{limit}}&tp_percent=${{tp}}&sl_percent=${{sl}}`);
-    const data = await response.json();
-    if (data.ok) {{
-      displayResults(data.backtest);
-      document.getElementById('results').style.display = 'block';
-    }} else {{
-      alert(data.error || 'Erreur lors du backtest');
-    }}
-  }} catch (error) {{
-    alert('Erreur lors du backtest');
-    console.error(error);
-  }} finally {{
-    btn.disabled = false;
-    btn.textContent = '🚀 Lancer Backtest';
-  }}
-}}
-
-function displayResults(backtest) {{
-  const stats = backtest.stats;
-  // Statistiques
-  document.getElementById('totalTrades').textContent = stats.total_trades;
-  document.getElementById('wins').textContent = stats.wins;
-  document.getElementById('losses').textContent = stats.losses;
-  document.getElementById('winRate').textContent = stats.win_rate + '%';
-  document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';
-  document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-  document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';
-  document.getElementById('avgLoss').textContent = stats.avg_loss + '%';
-  document.getElementById('maxDD').textContent = stats.max_drawdown + '%';
-  document.getElementById('sharpe').textContent = stats.sharpe_ratio;
-  document.getElementById('finalEquity').textContent = stats.final_equity.toLocaleString();
-  document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-
-  // Graphique
-  const ctx = document.getElementById('equityChart').getContext('2d');
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, {{
-    type: 'line',
-    data: {{
-      labels: stats.equity_curve.map((_, i) => i),
-      datasets: [{{
-        label: 'Equity',
-        data: stats.equity_curve,
-        borderColor: '#6366f1',
-        backgroundColor: 'rgba(99, 102, 241, 0.1)',
-        borderWidth: 3, fill: true, tension: 0.4
-      }}]
-    }},
-    options: {{
-      responsive: true,
-      plugins: {{ legend: {{ display: false }} }},
-      scales: {{
-        y: {{ beginAtZero: false, ticks: {{ color: '#64748b', callback: v => v.toLocaleString() }}, grid: {{ color: 'rgba(99, 102, 241, 0.1)' }} }},
-        x: {{ ticks: {{ color: '#64748b' }}, grid: {{ color: 'rgba(99, 102, 241, 0.1)' }} }}
-      }}
-    }}
-  }});
-
-  // Table des trades
-  const tbody = document.getElementById('tradesBody');
-  tbody.innerHTML = '';
-  (backtest.trades || []).slice(-50).reverse().forEach(trade => {{
-    const row = document.createElement('tr');
-    const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';
-    const pnlColor = (trade.pnl_percent || 0) >= 0 ? '#10b981' : '#ef4444';
-    row.innerHTML = `
-      <td style="font-size:12px">${{trade.entry_time}}</td>
-      <td style="font-size:12px">${{trade.exit_time}}</td>
-      <td>${{trade.entry_price}}</td>
-      <td>${{trade.exit_price}}</td>
-      <td><span style="color:${{resultColor}};font-weight:700">${{trade.result}}</span></td>
-      <td style="color:${{pnlColor}};font-weight:700">${{trade.pnl_percent >= 0 ? '+' : ''}}${{trade.pnl_percent}}%</td>
-      <td>${{Number(trade.equity).toLocaleString()}}</td>
-    `;
-    tbody.appendChild(row);
-  }});
-}}
-
-window.addEventListener('load', () => setTimeout(runBacktest, 500));
-</script>
-</div></body></html>""")
+        "<script src='https://cdn.jsdelivr.net/npm/chart.js@4'></script>"
+        "<script>"
+        "let chart = null;"
+        "async function runBacktest(){"
+        "  const btn = document.getElementById('runBtn');"
+        "  btn.disabled = true; btn.textContent = '⏳ Calcul en cours...';"
+        "  const symbol = document.getElementById('symbol').value;"
+        "  const limit = document.getElementById('limit').value;"
+        "  const tp = document.getElementById('tp').value;"
+        "  const sl = document.getElementById('sl').value;"
+        "  try {"
+        "    const response = await fetch(`/api/backtest?symbol=${symbol}&limit=${limit}&tp_percent=${tp}&sl_percent=${sl}`);"
+        "    const data = await response.json();"
+        "    if (data.ok) { displayResults(data.backtest); document.getElementById('results').style.display = 'block'; }"
+        "    else { alert(data.error || 'Erreur lors du backtest'); }"
+        "  } catch (e) { console.error(e); alert('Erreur lors du backtest'); }"
+        "  finally { btn.disabled = false; btn.textContent = '🚀 Lancer Backtest'; }"
+        "}"
+        "function displayResults(backtest){"
+        "  const stats = backtest.stats;"
+        "  document.getElementById('totalTrades').textContent = stats.total_trades;"
+        "  document.getElementById('wins').textContent = stats.wins;"
+        "  document.getElementById('losses').textContent = stats.losses;"
+        "  document.getElementById('winRate').textContent = stats.win_rate + '%';"
+        "  document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';"
+        "  document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';"
+        "  document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';"
+        "  document.getElementById('avgLoss').textContent = stats.avg_loss + '%';"
+        "  document.getElementById('maxDD').textContent = stats.max_drawdown + '%';"
+        "  document.getElementById('sharpe').textContent = stats.sharpe_ratio;"
+        "  document.getElementById('finalEquity').textContent = Number(stats.final_equity).toLocaleString();"
+        "  document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';"
+        "  const ctx = document.getElementById('equityChart').getContext('2d');"
+        "  if (chart) chart.destroy();"
+        "  chart = new Chart(ctx, {"
+        "    type: 'line',"
+        "    data: { labels: stats.equity_curve.map((_, i) => i), datasets: [{ label: 'Equity', data: stats.equity_curve, borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', borderWidth: 3, fill: true, tension: 0.4 }]},"
+        "    options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: false, ticks: { color: '#64748b', callback: v => Number(v).toLocaleString() }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }, x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } } } }"
+        "  });"
+        "  const tbody = document.getElementById('tradesBody');"
+        "  tbody.innerHTML = '';"
+        "  (backtest.trades || []).slice(-50).reverse().forEach(trade => {"
+        "    const row = document.createElement('tr');"
+        "    const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';"
+        "    const pnlColor = (trade.pnl_percent || 0) >= 0 ? '#10b981' : '#ef4444';"
+        "    row.innerHTML = `"
+        "      <td style='font-size:12px'>${trade.entry_time}</td>"
+        "      <td style='font-size:12px'>${trade.exit_time}</td>"
+        "      <td>${trade.entry_price}</td>"
+        "      <td>${trade.exit_price}</td>"
+        "      <td><span style='color:${resultColor};font-weight:700'>${trade.result}</span></td>"
+        "      <td style='color:${pnlColor};font-weight:700'>${trade.pnl_percent >= 0 ? '+' : ''}${trade.pnl_percent}%</td>"
+        "      <td>${Number(trade.equity).toLocaleString()}</td>"
+        "    `;"
+        "    tbody.appendChild(row);"
+        "  });"
+        "}"
+        "window.addEventListener('load', () => setTimeout(runBacktest, 500));"
+        "</script>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/patterns", response_class=HTMLResponse)
 async def patterns():
     patterns_list = detect_patterns(build_trade_rows(50))
     patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Patterns</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>🤖 Patterns</h1></div>{NAV}
-<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
-</div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Patterns</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>🤖 Patterns</h1></div>"
+        + NAV +
+        "<div class='card'><h2>Patterns</h2><ul class='list'>" + patterns_html + "</ul></div>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(html)
 
 @app.get("/advanced-metrics", response_class=HTMLResponse)
 async def advanced_metrics():
     metrics = calc_metrics(build_trade_rows(50))
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Metrics</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📊 Metrics</h1></div>{NAV}
-<div class="card"><h2>Métriques</h2>
-<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
-  <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
-  <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
-  <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
-  <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
-</div></div></div></body></html>""")
+    html = (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset='UTF-8'><title>Metrics</title>"
+        + CSS +
+        "</head><body><div class='container'>"
+        "<div class='header'><h1>📊 Metrics</h1></div>"
+        + NAV +
+        "<div class='card'><h2>Métriques</h2>"
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>"
+        "  <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>" + str(metrics['sharpe_ratio']) + "</div></div>"
+        "  <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>" + str(metrics['sortino_ratio']) + "</div></div>"
+        "  <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>" + f"{metrics['expectancy']:.2f}" + "%</div></div>"
+        "  <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-" + f"{metrics['max_drawdown']:.1f}" + "%</div></div>"
+        "</div></div></div></body></html>"
+    )
+    return HTMLResponse(html)
 
 # ============================================================================
 # MAIN
