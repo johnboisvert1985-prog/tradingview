@@ -12,6 +12,7 @@ import logging
 import aiohttp
 import os
 import asyncio
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.0.0")
+app = FastAPI(title="Trading Dashboard", version="2.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +36,7 @@ class Settings:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     FEAR_GREED_API = "https://api.alternative.me/fng/"
     COINGECKO_API = "https://api.coingecko.com/api/v3"
-    
+
 settings = Settings()
 
 # ============================================================================
@@ -44,17 +45,17 @@ settings = Settings()
 class MarketDataCache:
     def __init__(self):
         self.fear_greed_data = None
-        self.crypto_prices = {}
-        self.global_data = {}
-        self.last_update = {}
-        self.update_interval = 300
-    
+        self.crypto_prices: Dict[str, Any] = {}
+        self.global_data: Dict[str, Any] = {}
+        self.last_update: Dict[str, datetime] = {}
+        self.update_interval = 300  # 5 min
+
     def needs_update(self, key: str) -> bool:
         if key not in self.last_update:
             return True
         elapsed = (datetime.now() - self.last_update[key]).total_seconds()
         return elapsed > self.update_interval
-    
+
     def update_timestamp(self, key: str):
         self.last_update[key] = datetime.now()
 
@@ -63,7 +64,6 @@ market_cache = MarketDataCache()
 # ============================================================================
 # APIs EXTERNES
 # ============================================================================
-
 async def fetch_real_fear_greed() -> Dict[str, Any]:
     try:
         async with aiohttp.ClientSession() as session:
@@ -73,7 +73,7 @@ async def fetch_real_fear_greed() -> Dict[str, Any]:
                     if data and 'data' in data and len(data['data']) > 0:
                         fg_data = data['data'][0]
                         value = int(fg_data.get('value', 50))
-                        
+
                         if value <= 25:
                             sentiment, emoji, color = "Extreme Fear", "😱", "#ef4444"
                             recommendation = "Opportunité d'achat"
@@ -89,7 +89,7 @@ async def fetch_real_fear_greed() -> Dict[str, Any]:
                         else:
                             sentiment, emoji, color = "Extreme Greed", "🤑", "#22c55e"
                             recommendation = "Attention corrections"
-                        
+
                         result = {
                             "value": value,
                             "sentiment": sentiment,
@@ -97,22 +97,25 @@ async def fetch_real_fear_greed() -> Dict[str, Any]:
                             "color": color,
                             "recommendation": recommendation,
                         }
-                        
+
                         market_cache.fear_greed_data = result
                         market_cache.update_timestamp('fear_greed')
                         logger.info(f"✅ Fear & Greed: {value}")
                         return result
     except Exception as e:
         logger.error(f"❌ Fear & Greed: {str(e)}")
-    
-    return market_cache.fear_greed_data or {"value": 50, "sentiment": "Neutral", "emoji": "😐", "color": "#64748b", "recommendation": "N/A"}
+
+    return market_cache.fear_greed_data or {
+        "value": 50, "sentiment": "Neutral", "emoji": "😐",
+        "color": "#64748b", "recommendation": "N/A"
+    }
 
 async def fetch_crypto_prices() -> Dict[str, Any]:
     try:
         coin_ids = "bitcoin,ethereum,binancecoin,solana"
         url = f"{settings.COINGECKO_API}/simple/price"
         params = {"ids": coin_ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-        
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
@@ -155,7 +158,7 @@ async def fetch_global_crypto_data() -> Dict[str, Any]:
 def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, Any]) -> Dict[str, Any]:
     btc_dominance = global_data.get('btc_dominance', 50)
     fg_value = fear_greed.get('value', 50)
-    
+
     if btc_dominance > 48:
         phase, phase_name, emoji, color = 1, "Phase 1: Bitcoin Season", "₿", "#f7931a"
         description = "Bitcoin domine"
@@ -165,9 +168,9 @@ def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, A
     else:
         phase, phase_name, emoji, color = 3, "Phase 3: Altcoin Season", "🚀", "#10b981"
         description = "Altcoins explosent"
-    
+
     confidence = 90 if fg_value > 75 else (80 if fg_value > 55 else 70)
-    
+
     return {
         "phase": phase,
         "phase_name": phase_name,
@@ -179,7 +182,7 @@ def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, A
     }
 
 # ============================================================================
-# STOCKAGE
+# STOCKAGE / ÉTAT
 # ============================================================================
 class TradingState:
     def __init__(self):
@@ -187,43 +190,43 @@ class TradingState:
         self.current_equity = settings.INITIAL_CAPITAL
         self.equity_curve: List[Dict[str, Any]] = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
         self.journal_entries: List[Dict[str, Any]] = []
-    
+
     def add_trade(self, trade: Dict[str, Any]):
         trade['id'] = len(self.trades) + 1
         trade['timestamp'] = datetime.now()
         self.trades.append(trade)
         logger.info(f"✅ Trade #{trade['id']}: {trade.get('symbol')}")
-    
+
     def close_trade(self, trade_id: int, result: str, exit_price: float):
         for trade in self.trades:
             if trade['id'] == trade_id and trade.get('row_state') == 'normal':
                 trade['row_state'] = result
                 trade['exit_price'] = exit_price
                 trade['close_timestamp'] = datetime.now()
-                
-                entry = trade.get('entry', 0)
+
+                entry = trade.get('entry', 0) or 0.0
                 side = trade.get('side', 'LONG')
                 pnl = (exit_price - entry) if side == 'LONG' else (entry - exit_price)
                 pnl_percent = (pnl / entry) * 100 if entry > 0 else 0
-                
+
                 trade['pnl'] = pnl
                 trade['pnl_percent'] = pnl_percent
-                
+
                 self.current_equity += pnl * 10
                 self.equity_curve.append({"equity": self.current_equity, "timestamp": datetime.now()})
-                
+
                 logger.info(f"🔒 Trade #{trade_id}: {result.upper()} P&L {pnl_percent:+.2f}%")
                 return True
         return False
-    
+
     def add_journal_entry(self, entry: str, trade_id: Optional[int] = None):
         self.journal_entries.append({
             'id': len(self.journal_entries) + 1,
             'timestamp': datetime.now(),
             'entry': entry,
-            'trade_id': trade_id
+            'trade_id': optional_int(trade_id)
         })
-    
+
     def get_stats(self) -> Dict[str, Any]:
         closed = [t for t in self.trades if t.get('row_state') in ('tp', 'sl')]
         active = [t for t in self.trades if t.get('row_state') == 'normal']
@@ -231,7 +234,7 @@ class TradingState:
         losses = [t for t in closed if t.get('row_state') == 'sl']
         win_rate = (len(wins) / len(closed) * 100) if closed else 0
         total_return = ((self.current_equity - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL) * 100
-        
+
         return {
             'total_trades': len(self.trades),
             'active_trades': len(active),
@@ -244,6 +247,12 @@ class TradingState:
             'total_return': total_return
         }
 
+def optional_int(v):
+    try:
+        return int(v) if v is not None else None
+    except:
+        return None
+
 trading_state = TradingState()
 
 async def init_demo():
@@ -255,40 +264,41 @@ async def init_demo():
             "binancecoin": {"price": 600},
             "solana": {"price": 140},
         }
-    
+
     symbols = [
         ("BTCUSDT", prices.get('bitcoin', {}).get('price', 65000)),
         ("ETHUSDT", prices.get('ethereum', {}).get('price', 3500)),
         ("BNBUSDT", prices.get('binancecoin', {}).get('price', 600)),
         ("SOLUSDT", prices.get('solana', {}).get('price', 140)),
     ]
-    
+
     for i, (symbol, price) in enumerate(symbols):
         trading_state.add_trade({
             'symbol': symbol,
             'tf_label': '15m',
             'side': 'LONG' if i % 2 == 0 else 'SHORT',
-            'entry': price,
-            'tp': price * 1.03,
-            'sl': price * 0.98,
+            'entry': float(price),
+            'tp': float(price) * 1.03,
+            'sl': float(price) * 0.98,
             'row_state': 'normal'
         })
     logger.info("✅ Démo initialisée")
 
-asyncio.create_task(init_demo())
-
+# IMPORTANT : créer les données en startup (et pas asyncio.create_task au niveau module)
+@app.on_event("startup")
+async def _startup():
+    await init_demo()
 # ============================================================================
 # TELEGRAM
 # ============================================================================
-
 async def send_telegram_message(message: str) -> bool:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.warning("⚠️ Telegram non configuré")
         return False
-    
+
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -296,40 +306,44 @@ async def send_telegram_message(message: str) -> bool:
                     logger.info("✅ Telegram envoyé")
                     return True
                 else:
-                    logger.error(f"❌ Telegram: {response.status}")
+                    text = await response.text()
+                    logger.error(f"❌ Telegram: {response.status} — {text}")
                     return False
     except Exception as e:
         logger.error(f"❌ Telegram: {str(e)}")
         return False
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
-    message = f"""🎯 <b>NOUVEAU TRADE</b>
-
-📊 {trade.get('symbol')}
-💰 Entry: {trade.get('entry')}
-🎯 TP: {trade.get('tp')}
-🛑 SL: {trade.get('sl')}
-📈 {trade.get('side')} | {trade.get('tf_label')}"""
+    message = (
+        "🎯 <b>NOUVEAU TRADE</b>\n\n"
+        f"📊 {trade.get('symbol')}\n"
+        f"💰 Entry: {trade.get('entry')}\n"
+        f"🎯 TP: {trade.get('tp')}\n"
+        f"🛑 SL: {trade.get('sl')}\n"
+        f"📈 {trade.get('side')} | {trade.get('tf_label')}"
+    )
     return await send_telegram_message(message)
 
 async def notify_tp_hit(trade: Dict[str, Any]) -> bool:
     pnl = trade.get('pnl_percent', 0)
-    message = f"""🎯 <b>TAKE PROFIT!</b> ✅
-
-📊 {trade.get('symbol')}
-💰 Entry: {trade.get('entry')}
-🎯 Exit: {trade.get('exit_price')}
-💵 P&L: <b>{pnl:+.2f}%</b>"""
+    message = (
+        "🎯 <b>TAKE PROFIT!</b> ✅\n\n"
+        f"📊 {trade.get('symbol')}\n"
+        f"💰 Entry: {trade.get('entry')}\n"
+        f"🎯 Exit: {trade.get('exit_price')}\n"
+        f"💵 P&L: <b>{pnl:+.2f}%</b>"
+    )
     return await send_telegram_message(message)
 
 async def notify_sl_hit(trade: Dict[str, Any]) -> bool:
     pnl = trade.get('pnl_percent', 0)
-    message = f"""🛑 <b>STOP LOSS</b> ⚠️
-
-📊 {trade.get('symbol')}
-💰 Entry: {trade.get('entry')}
-🛑 Exit: {trade.get('exit_price')}
-💵 P&L: <b>{pnl:+.2f}%</b>"""
+    message = (
+        "🛑 <b>STOP LOSS</b> ⚠️\n\n"
+        f"📊 {trade.get('symbol')}\n"
+        f"💰 Entry: {trade.get('entry')}\n"
+        f"🛑 Exit: {trade.get('exit_price')}\n"
+        f"💵 P&L: <b>{pnl:+.2f}%</b>"
+    )
     return await send_telegram_message(message)
 
 # ============================================================================
@@ -395,7 +409,6 @@ NAV = """<div class="nav">
 # ============================================================================
 # UTILS
 # ============================================================================
-
 def build_trade_rows(limit: int = 50):
     return trading_state.trades[:limit]
 
@@ -403,12 +416,10 @@ def detect_patterns(rows):
     patterns = []
     if not rows:
         return ["📊 Pas de données"]
-    symbols = {}
+    symbols: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         symbol = row.get('symbol', '')
-        if symbol not in symbols:
-            symbols[symbol] = []
-        symbols[symbol].append(row)
+        symbols.setdefault(symbol, []).append(row)
     for symbol, trades in symbols.items():
         if len(trades) >= 3:
             recent = trades[-3:]
@@ -435,9 +446,8 @@ def calc_metrics(rows):
     }
 
 # ============================================================================
-# API
+# API (JSON)
 # ============================================================================
-
 @app.get("/api/fear-greed")
 async def api_fear_greed():
     if market_cache.needs_update('fear_greed'):
@@ -448,29 +458,18 @@ async def api_fear_greed():
 
 @app.get("/api/bullrun-phase")
 async def api_bullrun_phase():
-    if market_cache.needs_update('global_data'):
-        gd = await fetch_global_crypto_data()
-    else:
-        gd = market_cache.global_data or await fetch_global_crypto_data()
-    
-    if market_cache.needs_update('fear_greed'):
-        fg = await fetch_real_fear_greed()
-    else:
-        fg = market_cache.fear_greed_data or await fetch_real_fear_greed()
-    
-    if market_cache.needs_update('crypto_prices'):
-        pr = await fetch_crypto_prices()
-    else:
-        pr = market_cache.crypto_prices or await fetch_crypto_prices()
-    
+    gd = market_cache.global_data if not market_cache.needs_update('global_data') else await fetch_global_crypto_data()
+    fg = market_cache.fear_greed_data if not market_cache.needs_update('fear_greed') else await fetch_real_fear_greed()
+    pr = market_cache.crypto_prices if not market_cache.needs_update('crypto_prices') else await fetch_crypto_prices()
+
     phase = calculate_bullrun_phase(gd, fg)
     btc_price = pr.get('bitcoin', {}).get('price', 0)
-    
+
     return {
         "ok": True,
         "bullrun_phase": {
             **phase,
-            "btc_price": int(btc_price),
+            "btc_price": int(btc_price or 0),
             "market_cap": gd.get('total_market_cap', 0),
             "details": {
                 "btc": {"performance_30d": pr.get('bitcoin', {}).get('change_24h', 0), "dominance": phase.get('btc_dominance', 0)},
@@ -501,70 +500,60 @@ async def api_add_journal(request: Request):
         return {"ok": True}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-
+# ============================================================================
+# HEATMAP
+# ============================================================================
 @app.get("/api/heatmap")
 async def api_heatmap():
     days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     hours = [f"{h:02d}:00" for h in range(8, 20)]
-    heatmap = {}
-    
-    # Initialiser avec des données aléatoires réalistes
-    import random
+    heatmap: Dict[str, Dict[str, int]] = {}
+
+    # Données pseudo-réalistes
     for day in days:
         for hour in hours:
             key = f"{day}_{hour}"
-            # Générer des données réalistes : meilleur winrate aux heures de trading actives
             h = int(hour.split(':')[0])
-            if 9 <= h <= 11 or 14 <= h <= 16:  # Heures actives
+            if 9 <= h <= 11 or 14 <= h <= 16:
                 winrate = random.randint(60, 75)
                 trades = random.randint(10, 30)
-            elif 8 <= h <= 12 or 13 <= h <= 17:  # Heures normales
+            elif 8 <= h <= 12 or 13 <= h <= 17:
                 winrate = random.randint(50, 65)
                 trades = random.randint(5, 15)
-            else:  # Heures calmes
+            else:
                 winrate = random.randint(40, 55)
                 trades = random.randint(0, 8)
-            
             heatmap[key] = {"winrate": winrate, "trades": trades}
-    
-    # Ajouter les vrais trades s'il y en a
+
     for trade in trading_state.trades:
         if 'timestamp' in trade and trade.get('row_state') in ('tp', 'sl'):
             ts = trade['timestamp']
             key = f"{ts.strftime('%A')}_{ts.hour:02d}:00"
-            
             if key in heatmap:
                 heatmap[key]['trades'] += 1
-                # Recalculer le winrate avec le vrai trade
+                current_trades = heatmap[key]['trades']
                 if trade.get('row_state') == 'tp':
-                    current_trades = heatmap[key]['trades']
                     heatmap[key]['winrate'] = int((heatmap[key]['winrate'] * (current_trades - 1) + 100) / current_trades)
-                elif trade.get('row_state') == 'sl':
-                    current_trades = heatmap[key]['trades']
+                else:
                     heatmap[key]['winrate'] = int((heatmap[key]['winrate'] * (current_trades - 1) + 0) / current_trades)
-    
+
     return {"ok": True, "heatmap": heatmap}
 
 # ============================================================================
-# BACKTEST ENGINE AVEC VRAIES DONNÉES
+# BACKTEST ENGINE AVEC VRAIES DONNÉES (Binance)
 # ============================================================================
-
-async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000):
-    """Récupère les vraies données historiques depuis Binance"""
+async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 500):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {
             "symbol": symbol,
             "interval": interval,
-            "limit": min(limit, 1000)  # Max 1000 par requête
+            "limit": max(1, min(limit, 1000))
         }
-        
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    
-                    # Format: [timestamp, open, high, low, close, volume, ...]
                     klines = []
                     for k in data:
                         klines.append({
@@ -575,86 +564,77 @@ async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1
                             "close": float(k[4]),
                             "volume": float(k[5])
                         })
-                    
                     logger.info(f"✅ Binance: {len(klines)} klines pour {symbol}")
                     return klines
                 else:
-                    logger.error(f"❌ Binance API: {response.status}")
+                    text = await response.text()
+                    logger.error(f"❌ Binance API: {response.status} — {text}")
                     return None
     except Exception as e:
         logger.error(f"❌ Binance: {str(e)}")
         return None
 
-
 def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: float, initial_capital: float = 10000):
-    """Exécute un backtest avec une stratégie donnée"""
     if not klines or len(klines) < 2:
         return None
-    
+
     trades = []
     equity = initial_capital
     equity_curve = [equity]
     in_position = False
-    entry_price = 0
+    entry_price = 0.0
     entry_index = 0
-    
-    # Stratégie simple: Achète quand le prix monte, vend sur TP/SL
+
     for i in range(1, len(klines)):
         current = klines[i]
         prev = klines[i-1]
-        
+
         if not in_position:
-            # Signal d'entrée: prix ferme au-dessus du précédent (momentum haussier)
             if current['close'] > prev['close'] and current['volume'] > prev['volume']:
                 in_position = True
                 entry_price = current['close']
                 entry_index = i
         else:
-            # Vérifier TP et SL
             tp_price = entry_price * (1 + tp_percent / 100)
             sl_price = entry_price * (1 - sl_percent / 100)
-            
             hit_tp = current['high'] >= tp_price
             hit_sl = current['low'] <= sl_price
-            
+
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 result = "TP" if hit_tp else "SL"
-                
-                # Calculer P&L (2% de risque par trade, leverage 10x)
+
                 position_size = equity * 0.02
                 pnl_percent = ((exit_price - entry_price) / entry_price) * 100
-                pnl_amount = position_size * (pnl_percent / 100) * 10
-                
+                pnl_amount = position_size * (pnl_percent / 100) * 10  # levier 10x
+
                 equity += pnl_amount
                 equity_curve.append(equity)
-                
+
                 trades.append({
-                    "entry_time": klines[entry_index]['timestamp'],
-                    "exit_time": current['timestamp'],
+                    "entry_time": klines[entry_index]['timestamp'].strftime("%Y-%m-%d %H:%M"),
+                    "exit_time": current['timestamp'].strftime("%Y-%m-%d %H:%M"),
                     "entry_price": round(entry_price, 2),
                     "exit_price": round(exit_price, 2),
                     "result": result,
                     "pnl_percent": round(pnl_percent, 2),
                     "equity": round(equity, 2)
                 })
-                
+
                 in_position = False
-    
-    # Calculer les statistiques
+
     if not trades:
         return None
-    
+
     wins = [t for t in trades if t["result"] == "TP"]
     losses = [t for t in trades if t["result"] == "SL"]
-    
+
     win_rate = len(wins) / len(trades) * 100 if trades else 0
     total_return = (equity - initial_capital) / initial_capital * 100
-    
+
     avg_win = sum(t["pnl_percent"] for t in wins) / len(wins) if wins else 0
     avg_loss = sum(t["pnl_percent"] for t in losses) / len(losses) if losses else 0
-    
-    # Max Drawdown
+
     peak = initial_capital
     max_dd = 0
     for e in equity_curve:
@@ -663,15 +643,12 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
         dd = (e - peak) / peak * 100
         if dd < max_dd:
             max_dd = dd
-    
-    # Sharpe Ratio simplifié
+
     sharpe = 1.5 + (win_rate / 100 * 2) if trades else 0
-    
-    # Profit Factor
     total_profit = sum(abs(t["pnl_percent"]) for t in wins)
     total_loss = sum(abs(t["pnl_percent"]) for t in losses)
     profit_factor = total_profit / total_loss if total_loss > 0 else 0
-    
+
     return {
         "trades": trades,
         "total_trades": len(trades),
@@ -689,7 +666,6 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
         "equity_curve": [round(e, 2) for e in equity_curve]
     }
 
-
 @app.get("/api/backtest")
 async def api_backtest(
     symbol: str = "BTCUSDT",
@@ -698,26 +674,14 @@ async def api_backtest(
     tp_percent: float = 3.0,
     sl_percent: float = 2.0
 ):
-    """Backtest avec VRAIES données Binance"""
-    
-    # Récupérer les données historiques
     klines = await fetch_binance_klines(symbol, interval, limit)
-    
     if not klines:
-        return {
-            "ok": False,
-            "error": "Impossible de récupérer les données Binance"
-        }
-    
-    # Exécuter le backtest
+        return {"ok": False, "error": "Impossible de récupérer les données Binance"}
+
     results = run_backtest_strategy(klines, tp_percent, sl_percent, settings.INITIAL_CAPITAL)
-    
     if not results:
-        return {
-            "ok": False,
-            "error": "Aucun trade généré avec ces paramètres"
-        }
-    
+        return {"ok": False, "error": "Aucun trade généré avec ces paramètres"}
+
     return {
         "ok": True,
         "backtest": {
@@ -728,10 +692,10 @@ async def api_backtest(
             "tp_percent": tp_percent,
             "sl_percent": sl_percent,
             "stats": results,
+            "trades": results["trades"],
             "data_source": "Binance API (Real Data)"
         }
     }
-
 
 @app.get("/api/backtest-compare")
 async def api_backtest_compare(
@@ -739,22 +703,17 @@ async def api_backtest_compare(
     interval: str = "1h",
     limit: int = 500
 ):
-    """Compare plusieurs stratégies TP/SL"""
-    
-    # Récupérer les données
     klines = await fetch_binance_klines(symbol, interval, limit)
-    
     if not klines:
         return {"ok": False, "error": "Données indisponibles"}
-    
-    # Définir les stratégies à comparer
+
     strategies = [
         {"name": "Conservative", "tp": 2.0, "sl": 1.5},
         {"name": "Balanced", "tp": 3.0, "sl": 2.0},
         {"name": "Aggressive", "tp": 5.0, "sl": 2.5},
         {"name": "High Risk", "tp": 8.0, "sl": 3.0},
     ]
-    
+
     results = []
     for strat in strategies:
         result = run_backtest_strategy(klines, strat["tp"], strat["sl"], settings.INITIAL_CAPITAL)
@@ -766,10 +725,9 @@ async def api_backtest_compare(
                 "risk_reward": round(strat["tp"] / strat["sl"], 2),
                 **result
             })
-    
-    # Trier par return total
+
     results.sort(key=lambda x: x["total_return"], reverse=True)
-    
+
     return {
         "ok": True,
         "comparison": {
@@ -781,46 +739,32 @@ async def api_backtest_compare(
         }
     }
 
-
 @app.get("/api/backtest-optimize")
 async def api_backtest_optimize(
     symbol: str = "BTCUSDT",
     interval: str = "1h",
     limit: int = 500
 ):
-    """Optimisation automatique: trouve les meilleurs TP/SL"""
-    
     klines = await fetch_binance_klines(symbol, interval, limit)
-    
     if not klines:
         return {"ok": False, "error": "Données indisponibles"}
-    
-    # Tester différentes combinaisons
+
     best_result = None
-    best_score = -999999
+    best_score = -1e9
     all_results = []
-    
-    # Range de TP et SL à tester
+
     tp_range = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0]
     sl_range = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
-    
+
     logger.info(f"🔍 Optimisation: test de {len(tp_range) * len(sl_range)} combinaisons...")
-    
+
     for tp in tp_range:
         for sl in sl_range:
-            # Skip si RR ratio < 1 (pas logique)
             if tp / sl < 1.2:
                 continue
-            
             result = run_backtest_strategy(klines, tp, sl, settings.INITIAL_CAPITAL)
-            
-            if result and result["total_trades"] >= 10:  # Minimum 10 trades
-                # Score = Return * Win Rate * Profit Factor - Max DD
-                score = (result["total_return"] * 
-                        result["win_rate"] / 100 * 
-                        result["profit_factor"] - 
-                        abs(result["max_drawdown"]))
-                
+            if result and result["total_trades"] >= 10:
+                score = (result["total_return"] * result["win_rate"] / 100 * result["profit_factor"] - abs(result["max_drawdown"]))
                 result_data = {
                     "tp": tp,
                     "sl": sl,
@@ -828,18 +772,13 @@ async def api_backtest_optimize(
                     "score": round(score, 2),
                     **result
                 }
-                
                 all_results.append(result_data)
-                
                 if score > best_score:
                     best_score = score
                     best_result = result_data
-    
-    # Trier tous les résultats par score
+
     all_results.sort(key=lambda x: x["score"], reverse=True)
-    
-    logger.info(f"✅ Meilleure stratégie: TP={best_result['tp']}% SL={best_result['sl']}% Score={best_score:.2f}")
-    
+
     return {
         "ok": True,
         "optimization": {
@@ -857,17 +796,16 @@ async def api_backtest_optimize(
 # ============================================================================
 # WEBHOOK
 # ============================================================================
-
 @app.post("/tv-webhook")
 async def webhook(request: Request):
     try:
         payload = await request.json()
         logger.info(f"📥 Webhook: {payload}")
-        
+
         action = payload.get("action")
         symbol = payload.get("symbol")
         side = payload.get("side", "LONG")
-        
+
         if action == "entry":
             new_trade = {
                 'symbol': symbol,
@@ -881,35 +819,33 @@ async def webhook(request: Request):
             trading_state.add_trade(new_trade)
             await notify_new_trade(new_trade)
             return JSONResponse({"status": "ok", "trade_id": new_trade.get('id')})
-            
+
         elif action in ["tp_hit", "sl_hit"]:
             for trade in trading_state.trades:
-                if (trade.get('symbol') == symbol and 
+                if (trade.get('symbol') == symbol and
                     trade.get('row_state') == 'normal' and
                     trade.get('side') == side):
-                    
-                    exit_price = payload.get('tp' if action == 'tp_hit' else 'sl')
+
+                    exit_price = payload.get('tp' if action == 'tp_hit' else 'sl') or trade.get('tp' if action == 'tp_hit' else 'sl')
                     result = 'tp' if action == 'tp_hit' else 'sl'
-                    
-                    if trading_state.close_trade(trade['id'], result, exit_price or trade.get(result)):
+
+                    if trading_state.close_trade(trade['id'], result, float(exit_price)):
                         if action == 'tp_hit':
                             await notify_tp_hit(trade)
                         else:
                             await notify_sl_hit(trade)
                         return JSONResponse({"status": "ok", "trade_id": trade['id']})
-            
+
             return JSONResponse({"status": "warning", "message": f"Trade non trouvé: {symbol}"})
-        
+
         return JSONResponse({"status": "error", "message": f"Action inconnue: {action}"}, status_code=400)
-    
+
     except Exception as e:
         logger.error(f"❌ Webhook: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
 # ============================================================================
 # ROUTES HTML
 # ============================================================================
-
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse(f"""<!DOCTYPE html>
@@ -928,18 +864,22 @@ async def trades():
     stats = trading_state.get_stats()
     patterns = detect_patterns(rows)
     metrics = calc_metrics(rows)
-    
+
     table = ""
     for r in rows[:20]:
-        badge = f'<span class="badge badge-green">TP</span>' if r.get("row_state")=="tp" else (f'<span class="badge badge-red">SL</span>' if r.get("row_state")=="sl" else f'<span class="badge badge-yellow">En cours</span>')
+        badge = (
+            '<span class="badge badge-green">TP</span>' if r.get("row_state")=="tp" else
+            ('<span class="badge badge-red">SL</span>' if r.get("row_state")=="sl" else
+             '<span class="badge badge-yellow">En cours</span>')
+        )
         pnl = ""
-        if r.get('pnl_percent'):
-            color = '#10b981' if r['pnl_percent'] > 0 else '#ef4444'
-            pnl = f'<span style="color:{color};font-weight:700">{r["pnl_percent"]:+.2f}%</span>'
+        if r.get('pnl_percent') is not None:
+            color = '#10b981' if (r.get('pnl_percent') or 0) > 0 else '#ef4444'
+            pnl = f'<span style="color:{color};font-weight:700">{(r.get("pnl_percent") or 0):+.2f}%</span>'
         table += f"<tr><td>{r.get('symbol','N/A')}</td><td>{r.get('tf_label','N/A')}</td><td>{r.get('side','N/A')}</td><td>{r.get('entry') or 'N/A'}</td><td>{badge} {pnl}</td></tr>"
-    
+
     patterns_html = "".join(f'<li style="padding:8px">{p}</li>' for p in patterns)
-    
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><title>Dashboard</title><meta charset="UTF-8">{CSS}</head>
 <body><div class="container">
@@ -963,11 +903,31 @@ async def trades():
 <table><thead><tr><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>Status</th></tr></thead><tbody>{table}</tbody></table></div>
 
 <script>
-fetch('/api/fear-greed').then(r=>r.json()).then(d=>{{if(d.ok){{const f=d.fear_greed;
-document.getElementById('fg').innerHTML=`<div class="gauge"><div class="gauge-inner"><div class="gauge-value" style="color:${{f.color}}">${{f.value}}</div><div class="gauge-label">/ 100</div></div></div><div style="text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${{f.color}}">${{f.emoji}} ${{f.sentiment}}</div><p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">${{f.recommendation}}</p>`;}}}});
+fetch('/api/fear-greed').then(r=>r.json()).then(d=>{
+  if(d.ok){
+    const f=d.fear_greed;
+    document.getElementById('fg').innerHTML=
+      `<div class="gauge"><div class="gauge-inner">
+         <div class="gauge-value" style="color:${f.color}">${f.value}</div>
+         <div class="gauge-label">/ 100</div>
+       </div></div>
+       <div style="text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${f.color}">${f.emoji} ${f.sentiment}</div>
+       <p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">${f.recommendation}</p>`;
+  }
+});
 
-fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{{if(d.ok){{const b=d.bullrun_phase;
-document.getElementById('br').innerHTML=`<div style="font-size:56px;margin-bottom:8px">${{b.emoji}}</div><div style="font-size:20px;font-weight:900;color:${{b.color}}">${{b.phase_name}}</div><p style="color:#64748b;font-size:12px;margin-top:8px">${{b.description}}</p><div style="margin-top:12px;font-size:12px;color:#10b981">BTC: $${{b.btc_price?.toLocaleString()}} | MC: $${{(b.market_cap/1e12).toFixed(2)}}T</div>`;}}}});
+fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{
+  if(d.ok){
+    const b=d.bullrun_phase;
+    document.getElementById('br').innerHTML=
+      `<div style="font-size:56px;margin-bottom:8px">${b.emoji}</div>
+       <div style="font-size:20px;font-weight:900;color:${b.color}">${b.phase_name}</div>
+       <p style="color:#64748b;font-size:12px;margin-top:8px">${b.description}</p>
+       <div style="margin-top:12px;font-size:12px;color:#10b981">
+         BTC: $${(b.btc_price||0).toLocaleString()} | MC: $${(b.market_cap/1e12).toFixed(2)}T
+       </div>`;
+  }
+});
 </script>
 </div></body></html>""")
 
@@ -977,7 +937,7 @@ async def equity_curve():
     curve = trading_state.equity_curve
     labels = [c['timestamp'].strftime('%H:%M') for c in curve]
     values = [c['equity'] for c in curve]
-    
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Equity</title>{CSS}</head>
 <body><div class="container">
@@ -993,14 +953,26 @@ async def equity_curve():
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
-new Chart(document.getElementById('chart'), {{
-    type: 'line',
-    data: {{
-        labels: {labels},
-        datasets: [{{label: 'Equity', data: {values}, borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', borderWidth: 3, fill: true, tension: 0.4}}]
-    }},
-    options: {{responsive: true, scales: {{y: {{beginAtZero: false, ticks: {{color: '#64748b'}}, grid: {{color: 'rgba(99, 102, 241, 0.1)'}}}}, x: {{ticks: {{color: '#64748b'}}, grid: {{color: 'rgba(99, 102, 241, 0.1)'}}}}}}}}
-}});
+new Chart(document.getElementById('chart'), {
+  type: 'line',
+  data: {
+    labels: {labels},
+    datasets: [{
+      label: 'Equity',
+      data: {values},
+      borderColor: '#6366f1',
+      backgroundColor: 'rgba(99, 102, 241, 0.1)',
+      borderWidth: 3, fill: true, tension: 0.4
+    }]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { beginAtZero: false, ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } },
+      x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }
+    }
+  }
+});
 </script>
 </div></body></html>""")
 
@@ -1012,7 +984,7 @@ async def journal():
         entries_html += f"""<div class="journal-entry">
 <div class="journal-timestamp">{entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}{f" | Trade #{entry['trade_id']}" if entry.get('trade_id') else ""}</div>
 <div>{entry['entry']}</div></div>"""
-    
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Journal</title>{CSS}</head>
 <body><div class="container">
@@ -1030,11 +1002,11 @@ async def journal():
 
 <script>
 document.getElementById('form').addEventListener('submit', async (e) => {{
-    e.preventDefault();
-    const text = document.getElementById('text').value;
-    if (!text) return;
-    await fetch('/api/journal', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{entry: text}})}});
-    location.reload();
+  e.preventDefault();
+  const text = document.getElementById('text').value;
+  if (!text) return;
+  await fetch('/api/journal', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{entry: text}})}});
+  location.reload();
 }});
 </script>
 </div></body></html>""")
@@ -1049,27 +1021,27 @@ async def heatmap():
 <div class="card"><h2>📊 Heatmap</h2><div id="hm">⏳</div></div>
 
 <script>
-fetch('/api/heatmap').then(r=>r.json()).then(d=>{{
-    if(d.ok){{
-        const hm = d.heatmap;
-        let html = '<table style="width:100%"><thead><tr><th>Jour</th>';
-        for(let h=8; h<20; h++) html += `<th>${{h}}:00</th>`;
-        html += '</tr></thead><tbody>';
-        ['Monday','Tuesday','Wednesday','Thursday','Friday'].forEach(day=>{{
-            html += `<tr><td style="font-weight:700">${{day.slice(0,3)}}</td>`;
-            for(let h=8; h<20; h++){{
-                const key = `${{day}}_${{h.toString().padStart(2,'0')}}:00`;
-                const cell = hm[key] || {{winrate:0,trades:0}};
-                const wr = cell.winrate;
-                const cls = wr>=70?'high':wr>=55?'medium':'low';
-                html += `<td class="heatmap-cell ${{cls}}" style="text-align:center"><div style="font-weight:700">${{wr}}%</div><div style="font-size:10px">${{cell.trades}}</div></td>`;
-            }}
-            html += '</tr>';
-        }});
-        html += '</tbody></table>';
-        document.getElementById('hm').innerHTML = html;
-    }}
-}});
+fetch('/api/heatmap').then(r=>r.json()).then(d=>{
+  if(d.ok){
+    const hm = d.heatmap;
+    let html = '<table style="width:100%"><thead><tr><th>Jour</th>';
+    for(let h=8; h<20; h++) html += `<th>${h}:00</th>`;
+    html += '</tr></thead><tbody>';
+    ['Monday','Tuesday','Wednesday','Thursday','Friday'].forEach(day=>{
+      html += `<tr><td style="font-weight:700">${day.slice(0,3)}</td>`;
+      for(let h=8; h<20; h++){
+        const key = `${day}_${h.toString().padStart(2,'0')}:00`;
+        const cell = hm[key] || {winrate:0,trades:0};
+        const wr = cell.winrate;
+        const cls = wr>=70?'high':wr>=55?'medium':'low';
+        html += `<td class="heatmap-cell ${cls}" style="text-align:center"><div style="font-weight:700">${wr}%</div><div style="font-size:10px">${cell.trades}</div></td>`;
+      }
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('hm').innerHTML = html;
+  }
+});
 </script>
 </div></body></html>""")
 
@@ -1081,14 +1053,14 @@ async def strategie():
 <div class="header"><h1>⚙️ Stratégie</h1></div>{NAV}
 
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(350px,1fr))">
-    <div class="card"><h2>🎯 Paramètres</h2>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Capital</span><span style="font-weight:700">${settings.INITIAL_CAPITAL}</span></div>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Risk/Trade</span><span style="font-weight:700">2%</span></div>
-    </div>
-    <div class="card"><h2>📊 TP/SL</h2>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>TP</span><span style="font-weight:700;color:#10b981">+3%</span></div>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>SL</span><span style="font-weight:700;color:#ef4444">-2%</span></div>
-    </div>
+  <div class="card"><h2>🎯 Paramètres</h2>
+    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Capital</span><span style="font-weight:700">${settings.INITIAL_CAPITAL}</span></div>
+    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Risk/Trade</span><span style="font-weight:700">2%</span></div>
+  </div>
+  <div class="card"><h2>📊 TP/SL</h2>
+    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>TP</span><span style="font-weight:700;color:#10b981">+3%</span></div>
+    <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>SL</span><span style="font-weight:700;color:#ef4444">-2%</span></div>
+  </div>
 </div>
 
 <div class="card"><h2>🔔 Telegram</h2>
@@ -1108,56 +1080,56 @@ async def backtest():
 <div class="card"><h2>🎯 Paramètres Backtest</h2>
 <div style="display:grid;gap:16px">
 <div>
-    <label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
-    <select id="symbol" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-        <option value="BTCUSDT">BTCUSDT</option>
-        <option value="ETHUSDT">ETHUSDT</option>
-        <option value="BNBUSDT">BNBUSDT</option>
-    </select>
+  <label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
+  <select id="symbol" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+    <option value="BTCUSDT">BTCUSDT</option>
+    <option value="ETHUSDT">ETHUSDT</option>
+    <option value="BNBUSDT">BNBUSDT</option>
+  </select>
 </div>
 <div>
-    <label style="display:block;margin-bottom:8px;color:#64748b">Période (jours)</label>
-    <input type="number" id="days" value="30" min="1" max="365" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+  <label style="display:block;margin-bottom:8px;color:#64748b">Bougies (limit)</label>
+  <input type="number" id="limit" value="500" min="50" max="1000" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
 </div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-    <div>
-        <label style="display:block;margin-bottom:8px;color:#64748b">Take Profit (%)</label>
-        <input type="number" id="tp" value="3" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-    </div>
-    <div>
-        <label style="display:block;margin-bottom:8px;color:#64748b">Stop Loss (%)</label>
-        <input type="number" id="sl" value="2" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-    </div>
+  <div>
+    <label style="display:block;margin-bottom:8px;color:#64748b">Take Profit (%)</label>
+    <input type="number" id="tp" value="3" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+  </div>
+  <div>
+    <label style="display:block;margin-bottom:8px;color:#64748b">Stop Loss (%)</label>
+    <input type="number" id="sl" value="2" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+  </div>
 </div>
 <button onclick="runBacktest()" id="runBtn">🚀 Lancer Backtest</button>
 </div></div>
 
 <div id="results" style="display:none">
-<div class="card"><h2>📊 Résultats</h2>
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-    <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value" id="totalTrades">-</div></div>
-    <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value" style="font-size:24px"><span id="wins" style="color:#10b981">-</span> / <span id="losses" style="color:#ef4444">-</span></div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winRate">-</div></div>
-    <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" id="totalReturn">-</div></div>
-    <div class="metric"><div class="metric-label">Avg Win / Loss</div><div class="metric-value" style="font-size:24px"><span id="avgWin" style="color:#10b981">-</span> / <span id="avgLoss" style="color:#ef4444">-</span></div></div>
-    <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" id="maxDD" style="color:#ef4444">-</div></div>
-    <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value" id="sharpe">-</div></div>
-    <div class="metric"><div class="metric-label">Final Equity</div><div class="metric-value" id="finalEquity" style="font-size:24px">-</div></div>
-</div>
-</div>
+  <div class="card"><h2>📊 Résultats</h2>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+      <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value" id="totalTrades">-</div></div>
+      <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value" style="font-size:24px"><span id="wins" style="color:#10b981">-</span> / <span id="losses" style="color:#ef4444">-</span></div></div>
+      <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winRate">-</div></div>
+      <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" id="totalReturn">-</div></div>
+      <div class="metric"><div class="metric-label">Avg Win / Loss</div><div class="metric-value" style="font-size:24px"><span id="avgWin" style="color:#10b981">-</span> / <span id="avgLoss" style="color:#ef4444">-</span></div></div>
+      <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" id="maxDD" style="color:#ef4444">-</div></div>
+      <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value" id="sharpe">-</div></div>
+      <div class="metric"><div class="metric-label">Final Equity</div><div class="metric-value" id="finalEquity" style="font-size:24px">-</div></div>
+    </div>
+  </div>
 
-<div class="card"><h2>📈 Equity Curve</h2>
-<canvas id="equityChart" width="800" height="400"></canvas>
-</div>
+  <div class="card"><h2>📈 Equity Curve</h2>
+    <canvas id="equityChart" width="800" height="400"></canvas>
+  </div>
 
-<div class="card"><h2>📋 Derniers Trades</h2>
-<div style="max-height:400px;overflow-y:auto">
-<table id="tradesTable">
-<thead><tr><th>Date</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>
-<tbody id="tradesBody"></tbody>
-</table>
-</div>
-</div>
+  <div class="card"><h2>📋 Derniers Trades</h2>
+    <div style="max-height:400px;overflow-y:auto">
+      <table id="tradesTable">
+        <thead><tr><th>Entry</th><th>Exit</th><th>Entry Px</th><th>Exit Px</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>
+        <tbody id="tradesBody"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
@@ -1165,237 +1137,96 @@ async def backtest():
 let chart = null;
 
 async function runBacktest() {{
-    const btn = document.getElementById('runBtn');
-    btn.disabled = true;
-    btn.textContent = '⏳ Calcul en cours...';
-    
-    const symbol = document.getElementById('symbol').value;
-    const days = document.getElementById('days').value;
-    const tp = document.getElementById('tp').value;
-    const sl = document.getElementById('sl').value;
-    
-    try {{
-        const response = await fetch(`/api/backtest?symbol=${{symbol}}&days=${{days}}&tp_percent=${{tp}}&sl_percent=${{sl}}`);
-        const data = await response.json();
-        
-        if (data.ok) {{
-            displayResults(data.backtest);
-            document.getElementById('results').style.display = 'block';
-        }}
-    }} catch (error) {{
-        alert('Erreur lors du backtest');
-        console.error(error);
-    }} finally {{
-        btn.disabled = false;
-        btn.textContent = '🚀 Lancer Backtest';
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Calcul en cours...';
+
+  const symbol = document.getElementById('symbol').value;
+  const limit = document.getElementById('limit').value;
+  const tp = document.getElementById('tp').value;
+  const sl = document.getElementById('sl').value;
+
+  try {{
+    const response = await fetch(`/api/backtest?symbol=${{symbol}}&limit=${{limit}}&tp_percent=${{tp}}&sl_percent=${{sl}}`);
+    const data = await response.json();
+    if (data.ok) {{
+      displayResults(data.backtest);
+      document.getElementById('results').style.display = 'block';
+    }} else {{
+      alert(data.error || 'Erreur lors du backtest');
     }}
+  }} catch (error) {{
+    alert('Erreur lors du backtest');
+    console.error(error);
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = '🚀 Lancer Backtest';
+  }}
 }}
 
-function displayResults(results) {{
-    const stats = results.stats;
-    
-    // Statistiques
-    document.getElementById('totalTrades').textContent = stats.total_trades;
-    document.getElementById('wins').textContent = stats.wins;
-    document.getElementById('losses').textContent = stats.losses;
-    document.getElementById('winRate').textContent = stats.win_rate + '%';
-    document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';
-    document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-    document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';
-    document.getElementById('avgLoss').textContent = stats.avg_loss + '%';
-    document.getElementById('maxDD').textContent = stats.max_drawdown + '%';
-    document.getElementById('sharpe').textContent = stats.sharpe_ratio;
-    document.getElementById('finalEquity').textContent = '
+function displayResults(backtest) {{
+  const stats = backtest.stats;
+  // Statistiques
+  document.getElementById('totalTrades').textContent = stats.total_trades;
+  document.getElementById('wins').textContent = stats.wins;
+  document.getElementById('losses').textContent = stats.losses;
+  document.getElementById('winRate').textContent = stats.win_rate + '%';
+  document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';
+  document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
+  document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';
+  document.getElementById('avgLoss').textContent = stats.avg_loss + '%';
+  document.getElementById('maxDD').textContent = stats.max_drawdown + '%';
+  document.getElementById('sharpe').textContent = stats.sharpe_ratio;
+  document.getElementById('finalEquity').textContent = stats.final_equity.toLocaleString();
+  document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
 
-@app.get("/patterns", response_class=HTMLResponse)
-async def patterns():
-    patterns_list = detect_patterns(build_trade_rows(50))
-    patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Patterns</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>🤖 Patterns</h1></div>{NAV}
-<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
-</div></body></html>""")
+  // Graphique
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  if (chart) chart.destroy();
+  chart = new Chart(ctx, {{
+    type: 'line',
+    data: {{
+      labels: stats.equity_curve.map((_, i) => i),
+      datasets: [{{
+        label: 'Equity',
+        data: stats.equity_curve,
+        borderColor: '#6366f1',
+        backgroundColor: 'rgba(99, 102, 241, 0.1)',
+        borderWidth: 3, fill: true, tension: 0.4
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      plugins: {{ legend: {{ display: false }} }},
+      scales: {{
+        y: {{ beginAtZero: false, ticks: {{ color: '#64748b', callback: v => v.toLocaleString() }}, grid: {{ color: 'rgba(99, 102, 241, 0.1)' }} }},
+        x: {{ ticks: {{ color: '#64748b' }}, grid: {{ color: 'rgba(99, 102, 241, 0.1)' }} }}
+      }}
+    }}
+  }});
 
-@app.get("/advanced-metrics", response_class=HTMLResponse)
-async def advanced_metrics():
-    metrics = calc_metrics(build_trade_rows(50))
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Metrics</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📊 Metrics</h1></div>{NAV}
-<div class="card"><h2>Métriques</h2>
-<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
-    <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
-    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
-</div></div></div></body></html>""")
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD - VERSION FINALE")
-    print("="*70)
-    print(f"📍 http://localhost:8000")
-    print(f"📊 Dashboard: http://localhost:8000/trades")
-    print(f"\n✅ PAGES COMPLÈTES:")
-    print(f"  • Dashboard avec données LIVE")
-    print(f"  • Equity Curve avec graphique")
-    print(f"  • Journal de trading")
-    print(f"  • Heatmap visuelle")
-    print(f"  • Configuration stratégie")
-    print(f"  • Backtest (interface)")
-    
-    print(f"\n📥 WEBHOOK:")
-    print(f"  URL: http://localhost:8000/tv-webhook")
-    
-    print(f"\n🔔 TELEGRAM:")
-    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
-        print(f"  ✅ CONFIGURÉ ET ACTIF")
-    else:
-        print(f"  ⚠️  NON CONFIGURÉ")
-        print(f"  export TELEGRAM_BOT_TOKEN='...'")
-        print(f"  export TELEGRAM_CHAT_ID='...'")
-    
-    print("="*70 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
- + stats.final_equity.toLocaleString();
-    document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-    
-    // Graphique
-    const ctx = document.getElementById('equityChart').getContext('2d');
-    if (chart) chart.destroy();
-    
-    chart = new Chart(ctx, {{
-        type: 'line',
-        data: {{
-            labels: stats.equity_curve.map((_, i) => i),
-            datasets: [{{
-                label: 'Equity',
-                data: stats.equity_curve,
-                borderColor: '#6366f1',
-                backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                borderWidth: 3,
-                fill: true,
-                tension: 0.4
-            }}]
-        }},
-        options: {{
-            responsive: true,
-            plugins: {{
-                legend: {{ display: false }},
-                title: {{ display: false }}
-            }},
-            scales: {{
-                y: {{
-                    beginAtZero: false,
-                    ticks: {{ color: '#64748b', callback: value => '
-
-@app.get("/patterns", response_class=HTMLResponse)
-async def patterns():
-    patterns_list = detect_patterns(build_trade_rows(50))
-    patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Patterns</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>🤖 Patterns</h1></div>{NAV}
-<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
-</div></body></html>""")
-
-@app.get("/advanced-metrics", response_class=HTMLResponse)
-async def advanced_metrics():
-    metrics = calc_metrics(build_trade_rows(50))
-    return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Metrics</title>{CSS}</head>
-<body><div class="container">
-<div class="header"><h1>📊 Metrics</h1></div>{NAV}
-<div class="card"><h2>Métriques</h2>
-<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
-    <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
-    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
-</div></div></div></body></html>""")
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD - VERSION FINALE")
-    print("="*70)
-    print(f"📍 http://localhost:8000")
-    print(f"📊 Dashboard: http://localhost:8000/trades")
-    print(f"\n✅ PAGES COMPLÈTES:")
-    print(f"  • Dashboard avec données LIVE")
-    print(f"  • Equity Curve avec graphique")
-    print(f"  • Journal de trading")
-    print(f"  • Heatmap visuelle")
-    print(f"  • Configuration stratégie")
-    print(f"  • Backtest (interface)")
-    
-    print(f"\n📥 WEBHOOK:")
-    print(f"  URL: http://localhost:8000/tv-webhook")
-    
-    print(f"\n🔔 TELEGRAM:")
-    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
-        print(f"  ✅ CONFIGURÉ ET ACTIF")
-    else:
-        print(f"  ⚠️  NON CONFIGURÉ")
-        print(f"  export TELEGRAM_BOT_TOKEN='...'")
-        print(f"  export TELEGRAM_CHAT_ID='...'")
-    
-    print("="*70 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
- + value.toLocaleString() }},
-                    grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
-                }},
-                x: {{
-                    ticks: {{ color: '#64748b' }},
-                    grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
-                }}
-            }}
-        }}
-    }});
-    
-    // Table des trades (derniers 50)
-    const tbody = document.getElementById('tradesBody');
-    tbody.innerHTML = '';
-    results.trades.slice(-50).reverse().forEach(trade => {{
-        const row = document.createElement('tr');
-        const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';
-        const pnlColor = trade.pnl_percent >= 0 ? '#10b981' : '#ef4444';
-        
-        row.innerHTML = `
-            <td style="font-size:12px">${{trade.timestamp}}</td>
-            <td>${{trade.entry}}</td>
-            <td>${{trade.exit}}</td>
-            <td><span style="color:${{resultColor}};font-weight:700">${{trade.result}}</span></td>
-            <td style="color:${{pnlColor}};font-weight:700">${{trade.pnl_percent >= 0 ? '+' : ''}}${{trade.pnl_percent}}%</td>
-            <td>${{trade.equity.toLocaleString()}}</td>
-        `;
-        tbody.appendChild(row);
-    }});
+  // Table des trades
+  const tbody = document.getElementById('tradesBody');
+  tbody.innerHTML = '';
+  (backtest.trades || []).slice(-50).reverse().forEach(trade => {{
+    const row = document.createElement('tr');
+    const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';
+    const pnlColor = (trade.pnl_percent || 0) >= 0 ? '#10b981' : '#ef4444';
+    row.innerHTML = `
+      <td style="font-size:12px">${{trade.entry_time}}</td>
+      <td style="font-size:12px">${{trade.exit_time}}</td>
+      <td>${{trade.entry_price}}</td>
+      <td>${{trade.exit_price}}</td>
+      <td><span style="color:${{resultColor}};font-weight:700">${{trade.result}}</span></td>
+      <td style="color:${{pnlColor}};font-weight:700">${{trade.pnl_percent >= 0 ? '+' : ''}}${{trade.pnl_percent}}%</td>
+      <td>${{Number(trade.equity).toLocaleString()}}</td>
+    `;
+    tbody.appendChild(row);
+  }});
 }}
 
-// Lancer un backtest par défaut au chargement
-window.addEventListener('load', () => {{
-    setTimeout(runBacktest, 500);
-}});
+window.addEventListener('load', () => setTimeout(runBacktest, 500));
 </script>
-
 </div></body></html>""")
 
 @app.get("/patterns", response_class=HTMLResponse)
@@ -1418,43 +1249,37 @@ async def advanced_metrics():
 <div class="header"><h1>📊 Metrics</h1></div>{NAV}
 <div class="card"><h2>Métriques</h2>
 <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
-    <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
-    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
+  <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
+  <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
+  <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
+  <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
 </div></div></div></body></html>""")
 
 # ============================================================================
 # MAIN
 # ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
-    
     print("\n" + "="*70)
     print("🚀 TRADING DASHBOARD - VERSION FINALE")
     print("="*70)
-    print(f"📍 http://localhost:8000")
-    print(f"📊 Dashboard: http://localhost:8000/trades")
-    print(f"\n✅ PAGES COMPLÈTES:")
-    print(f"  • Dashboard avec données LIVE")
-    print(f"  • Equity Curve avec graphique")
-    print(f"  • Journal de trading")
-    print(f"  • Heatmap visuelle")
-    print(f"  • Configuration stratégie")
-    print(f"  • Backtest (interface)")
-    
-    print(f"\n📥 WEBHOOK:")
-    print(f"  URL: http://localhost:8000/tv-webhook")
-    
-    print(f"\n🔔 TELEGRAM:")
+    print("📍 http://localhost:8000")
+    print("📊 Dashboard: http://localhost:8000/trades")
+    print("\n✅ PAGES COMPLÈTES:")
+    print("  • Dashboard avec données LIVE")
+    print("  • Equity Curve avec graphique")
+    print("  • Journal de trading")
+    print("  • Heatmap visuelle")
+    print("  • Configuration stratégie")
+    print("  • Backtest (interface)")
+    print("\n📥 WEBHOOK:")
+    print("  URL: http://localhost:8000/tv-webhook")
+    print("\n🔔 TELEGRAM:")
     if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
-        print(f"  ✅ CONFIGURÉ ET ACTIF")
+        print("  ✅ CONFIGURÉ ET ACTIF")
     else:
-        print(f"  ⚠️  NON CONFIGURÉ")
-        print(f"  export TELEGRAM_BOT_TOKEN='...'")
-        print(f"  export TELEGRAM_CHAT_ID='...'")
-    
+        print("  ⚠️  NON CONFIGURÉ")
+        print("  export TELEGRAM_BOT_TOKEN='...'")
+        print("  export TELEGRAM_CHAT_ID='...'")
     print("="*70 + "\n")
-    
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
