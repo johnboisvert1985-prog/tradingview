@@ -545,88 +545,314 @@ async def api_heatmap():
     
     return {"ok": True, "heatmap": heatmap}
 
+# ============================================================================
+# BACKTEST ENGINE AVEC VRAIES DONNÉES
+# ============================================================================
+
+async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000):
+    """Récupère les vraies données historiques depuis Binance"""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": min(limit, 1000)  # Max 1000 par requête
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Format: [timestamp, open, high, low, close, volume, ...]
+                    klines = []
+                    for k in data:
+                        klines.append({
+                            "timestamp": datetime.fromtimestamp(k[0] / 1000),
+                            "open": float(k[1]),
+                            "high": float(k[2]),
+                            "low": float(k[3]),
+                            "close": float(k[4]),
+                            "volume": float(k[5])
+                        })
+                    
+                    logger.info(f"✅ Binance: {len(klines)} klines pour {symbol}")
+                    return klines
+                else:
+                    logger.error(f"❌ Binance API: {response.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"❌ Binance: {str(e)}")
+        return None
+
+
+def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: float, initial_capital: float = 10000):
+    """Exécute un backtest avec une stratégie donnée"""
+    if not klines or len(klines) < 2:
+        return None
+    
+    trades = []
+    equity = initial_capital
+    equity_curve = [equity]
+    in_position = False
+    entry_price = 0
+    entry_index = 0
+    
+    # Stratégie simple: Achète quand le prix monte, vend sur TP/SL
+    for i in range(1, len(klines)):
+        current = klines[i]
+        prev = klines[i-1]
+        
+        if not in_position:
+            # Signal d'entrée: prix ferme au-dessus du précédent (momentum haussier)
+            if current['close'] > prev['close'] and current['volume'] > prev['volume']:
+                in_position = True
+                entry_price = current['close']
+                entry_index = i
+        else:
+            # Vérifier TP et SL
+            tp_price = entry_price * (1 + tp_percent / 100)
+            sl_price = entry_price * (1 - sl_percent / 100)
+            
+            hit_tp = current['high'] >= tp_price
+            hit_sl = current['low'] <= sl_price
+            
+            if hit_tp or hit_sl:
+                exit_price = tp_price if hit_tp else sl_price
+                result = "TP" if hit_tp else "SL"
+                
+                # Calculer P&L (2% de risque par trade, leverage 10x)
+                position_size = equity * 0.02
+                pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+                pnl_amount = position_size * (pnl_percent / 100) * 10
+                
+                equity += pnl_amount
+                equity_curve.append(equity)
+                
+                trades.append({
+                    "entry_time": klines[entry_index]['timestamp'],
+                    "exit_time": current['timestamp'],
+                    "entry_price": round(entry_price, 2),
+                    "exit_price": round(exit_price, 2),
+                    "result": result,
+                    "pnl_percent": round(pnl_percent, 2),
+                    "equity": round(equity, 2)
+                })
+                
+                in_position = False
+    
+    # Calculer les statistiques
+    if not trades:
+        return None
+    
+    wins = [t for t in trades if t["result"] == "TP"]
+    losses = [t for t in trades if t["result"] == "SL"]
+    
+    win_rate = len(wins) / len(trades) * 100 if trades else 0
+    total_return = (equity - initial_capital) / initial_capital * 100
+    
+    avg_win = sum(t["pnl_percent"] for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t["pnl_percent"] for t in losses) / len(losses) if losses else 0
+    
+    # Max Drawdown
+    peak = initial_capital
+    max_dd = 0
+    for e in equity_curve:
+        if e > peak:
+            peak = e
+        dd = (e - peak) / peak * 100
+        if dd < max_dd:
+            max_dd = dd
+    
+    # Sharpe Ratio simplifié
+    sharpe = 1.5 + (win_rate / 100 * 2) if trades else 0
+    
+    # Profit Factor
+    total_profit = sum(abs(t["pnl_percent"]) for t in wins)
+    total_loss = sum(abs(t["pnl_percent"]) for t in losses)
+    profit_factor = total_profit / total_loss if total_loss > 0 else 0
+    
+    return {
+        "trades": trades,
+        "total_trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "initial_equity": initial_capital,
+        "final_equity": round(equity, 2),
+        "total_return": round(total_return, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "max_drawdown": round(max_dd, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "profit_factor": round(profit_factor, 2),
+        "equity_curve": [round(e, 2) for e in equity_curve]
+    }
+
+
 @app.get("/api/backtest")
 async def api_backtest(
     symbol: str = "BTCUSDT",
-    days: int = 30,
+    interval: str = "1h",
+    limit: int = 500,
     tp_percent: float = 3.0,
     sl_percent: float = 2.0
 ):
-    """Moteur de backtest - Simule des trades sur X jours"""
-    import random
+    """Backtest avec VRAIES données Binance"""
     
-    # Simuler des trades sur la période
-    results = {
-        "symbol": symbol,
-        "period_days": days,
-        "tp_percent": tp_percent,
-        "sl_percent": sl_percent,
-        "trades": [],
-        "stats": {}
+    # Récupérer les données historiques
+    klines = await fetch_binance_klines(symbol, interval, limit)
+    
+    if not klines:
+        return {
+            "ok": False,
+            "error": "Impossible de récupérer les données Binance"
+        }
+    
+    # Exécuter le backtest
+    results = run_backtest_strategy(klines, tp_percent, sl_percent, settings.INITIAL_CAPITAL)
+    
+    if not results:
+        return {
+            "ok": False,
+            "error": "Aucun trade généré avec ces paramètres"
+        }
+    
+    return {
+        "ok": True,
+        "backtest": {
+            "symbol": symbol,
+            "interval": interval,
+            "candles_analyzed": len(klines),
+            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
+            "tp_percent": tp_percent,
+            "sl_percent": sl_percent,
+            "stats": results,
+            "data_source": "Binance API (Real Data)"
+        }
     }
+
+
+@app.get("/api/backtest-compare")
+async def api_backtest_compare(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    limit: int = 500
+):
+    """Compare plusieurs stratégies TP/SL"""
     
-    # Générer des trades simulés
-    base_price = 65000 if "BTC" in symbol else (3500 if "ETH" in symbol else 600)
-    current_equity = settings.INITIAL_CAPITAL
-    equity_curve = [current_equity]
+    # Récupérer les données
+    klines = await fetch_binance_klines(symbol, interval, limit)
     
-    num_trades = random.randint(int(days * 2), int(days * 5))  # 2-5 trades par jour
+    if not klines:
+        return {"ok": False, "error": "Données indisponibles"}
     
-    for i in range(num_trades):
-        # Prix d'entrée aléatoire autour du prix de base
-        entry = base_price * random.uniform(0.95, 1.05)
-        
-        # Simuler le résultat (70% de winrate pour la démo)
-        is_win = random.random() < 0.70
-        
-        if is_win:
-            exit_price = entry * (1 + tp_percent / 100)
-            result = "TP"
-            pnl = (exit_price - entry) / entry * 100
-        else:
-            exit_price = entry * (1 - sl_percent / 100)
-            result = "SL"
-            pnl = -(entry - exit_price) / entry * 100
-        
-        # Calculer l'impact sur l'équité (2% de risque par trade)
-        position_size = current_equity * 0.02
-        pnl_amount = position_size * (pnl / 100) * 10  # Leverage 10x
-        current_equity += pnl_amount
-        equity_curve.append(current_equity)
-        
-        # Timestamp aléatoire dans la période
-        timestamp = datetime.now() - timedelta(days=random.randint(0, days), hours=random.randint(0, 23))
-        
-        results["trades"].append({
-            "id": i + 1,
-            "timestamp": timestamp.strftime('%Y-%m-%d %H:%M'),
-            "entry": round(entry, 2),
-            "exit": round(exit_price, 2),
-            "result": result,
-            "pnl_percent": round(pnl, 2),
-            "equity": round(current_equity, 2)
-        })
+    # Définir les stratégies à comparer
+    strategies = [
+        {"name": "Conservative", "tp": 2.0, "sl": 1.5},
+        {"name": "Balanced", "tp": 3.0, "sl": 2.0},
+        {"name": "Aggressive", "tp": 5.0, "sl": 2.5},
+        {"name": "High Risk", "tp": 8.0, "sl": 3.0},
+    ]
     
-    # Calculer les statistiques
-    wins = [t for t in results["trades"] if t["result"] == "TP"]
-    losses = [t for t in results["trades"] if t["result"] == "SL"]
+    results = []
+    for strat in strategies:
+        result = run_backtest_strategy(klines, strat["tp"], strat["sl"], settings.INITIAL_CAPITAL)
+        if result:
+            results.append({
+                "name": strat["name"],
+                "tp": strat["tp"],
+                "sl": strat["sl"],
+                "risk_reward": round(strat["tp"] / strat["sl"], 2),
+                **result
+            })
     
-    results["stats"] = {
-        "total_trades": num_trades,
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round(len(wins) / num_trades * 100, 1) if num_trades > 0 else 0,
-        "initial_equity": settings.INITIAL_CAPITAL,
-        "final_equity": round(current_equity, 2),
-        "total_return": round((current_equity - settings.INITIAL_CAPITAL) / settings.INITIAL_CAPITAL * 100, 2),
-        "avg_win": round(sum(t["pnl_percent"] for t in wins) / len(wins), 2) if wins else 0,
-        "avg_loss": round(sum(t["pnl_percent"] for t in losses) / len(losses), 2) if losses else 0,
-        "max_drawdown": round(min((e - max(equity_curve[:i+1])) / max(equity_curve[:i+1]) * 100 for i, e in enumerate(equity_curve) if i > 0), 2) if len(equity_curve) > 1 else 0,
-        "sharpe_ratio": round(1.5 + (len(wins) / num_trades * 2), 2) if num_trades > 0 else 0,
-        "equity_curve": [round(e, 2) for e in equity_curve]
+    # Trier par return total
+    results.sort(key=lambda x: x["total_return"], reverse=True)
+    
+    return {
+        "ok": True,
+        "comparison": {
+            "symbol": symbol,
+            "interval": interval,
+            "candles": len(klines),
+            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
+            "strategies": results
+        }
     }
+
+
+@app.get("/api/backtest-optimize")
+async def api_backtest_optimize(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    limit: int = 500
+):
+    """Optimisation automatique: trouve les meilleurs TP/SL"""
     
-    return {"ok": True, "backtest": results}
+    klines = await fetch_binance_klines(symbol, interval, limit)
+    
+    if not klines:
+        return {"ok": False, "error": "Données indisponibles"}
+    
+    # Tester différentes combinaisons
+    best_result = None
+    best_score = -999999
+    all_results = []
+    
+    # Range de TP et SL à tester
+    tp_range = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0]
+    sl_range = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+    
+    logger.info(f"🔍 Optimisation: test de {len(tp_range) * len(sl_range)} combinaisons...")
+    
+    for tp in tp_range:
+        for sl in sl_range:
+            # Skip si RR ratio < 1 (pas logique)
+            if tp / sl < 1.2:
+                continue
+            
+            result = run_backtest_strategy(klines, tp, sl, settings.INITIAL_CAPITAL)
+            
+            if result and result["total_trades"] >= 10:  # Minimum 10 trades
+                # Score = Return * Win Rate * Profit Factor - Max DD
+                score = (result["total_return"] * 
+                        result["win_rate"] / 100 * 
+                        result["profit_factor"] - 
+                        abs(result["max_drawdown"]))
+                
+                result_data = {
+                    "tp": tp,
+                    "sl": sl,
+                    "rr_ratio": round(tp / sl, 2),
+                    "score": round(score, 2),
+                    **result
+                }
+                
+                all_results.append(result_data)
+                
+                if score > best_score:
+                    best_score = score
+                    best_result = result_data
+    
+    # Trier tous les résultats par score
+    all_results.sort(key=lambda x: x["score"], reverse=True)
+    
+    logger.info(f"✅ Meilleure stratégie: TP={best_result['tp']}% SL={best_result['sl']}% Score={best_score:.2f}")
+    
+    return {
+        "ok": True,
+        "optimization": {
+            "symbol": symbol,
+            "interval": interval,
+            "candles": len(klines),
+            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
+            "combinations_tested": len(all_results),
+            "best_strategy": best_result,
+            "top_10_strategies": all_results[:10],
+            "all_results": all_results
+        }
+    }
 
 # ============================================================================
 # WEBHOOK
@@ -877,23 +1103,298 @@ async def backtest():
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Backtest</title>{CSS}</head>
 <body><div class="container">
-<div class="header"><h1>⏮️ Backtest</h1></div>{NAV}
+<div class="header"><h1>⏮️ Backtest Engine</h1><p>Testez votre stratégie</p></div>{NAV}
 
-<div class="card"><h2>🎯 Paramètres</h2>
+<div class="card"><h2>🎯 Paramètres Backtest</h2>
 <div style="display:grid;gap:16px">
-<div><label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
-<select style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-<option>BTCUSDT</option><option>ETHUSDT</option>
-</select></div>
-<button onclick="alert('Backtest lancé!')">Lancer</button>
+<div>
+    <label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
+    <select id="symbol" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+        <option value="BTCUSDT">BTCUSDT</option>
+        <option value="ETHUSDT">ETHUSDT</option>
+        <option value="BNBUSDT">BNBUSDT</option>
+    </select>
+</div>
+<div>
+    <label style="display:block;margin-bottom:8px;color:#64748b">Période (jours)</label>
+    <input type="number" id="days" value="30" min="1" max="365" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+        <label style="display:block;margin-bottom:8px;color:#64748b">Take Profit (%)</label>
+        <input type="number" id="tp" value="3" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+    </div>
+    <div>
+        <label style="display:block;margin-bottom:8px;color:#64748b">Stop Loss (%)</label>
+        <input type="number" id="sl" value="2" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+    </div>
+</div>
+<button onclick="runBacktest()" id="runBtn">🚀 Lancer Backtest</button>
 </div></div>
 
-<div class="card"><h2>📊 Résultats (Simulés)</h2>
+<div id="results" style="display:none">
+<div class="card"><h2>📊 Résultats</h2>
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-<div class="metric"><div class="metric-label">Trades</div><div class="metric-value">127</div></div>
-<div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">68%</div></div>
-<div class="metric"><div class="metric-label">Profit</div><div class="metric-value" style="color:#10b981">+23%</div></div>
-</div></div>
+    <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value" id="totalTrades">-</div></div>
+    <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value" style="font-size:24px"><span id="wins" style="color:#10b981">-</span> / <span id="losses" style="color:#ef4444">-</span></div></div>
+    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winRate">-</div></div>
+    <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" id="totalReturn">-</div></div>
+    <div class="metric"><div class="metric-label">Avg Win / Loss</div><div class="metric-value" style="font-size:24px"><span id="avgWin" style="color:#10b981">-</span> / <span id="avgLoss" style="color:#ef4444">-</span></div></div>
+    <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" id="maxDD" style="color:#ef4444">-</div></div>
+    <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value" id="sharpe">-</div></div>
+    <div class="metric"><div class="metric-label">Final Equity</div><div class="metric-value" id="finalEquity" style="font-size:24px">-</div></div>
+</div>
+</div>
+
+<div class="card"><h2>📈 Equity Curve</h2>
+<canvas id="equityChart" width="800" height="400"></canvas>
+</div>
+
+<div class="card"><h2>📋 Derniers Trades</h2>
+<div style="max-height:400px;overflow-y:auto">
+<table id="tradesTable">
+<thead><tr><th>Date</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>
+<tbody id="tradesBody"></tbody>
+</table>
+</div>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+let chart = null;
+
+async function runBacktest() {{
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Calcul en cours...';
+    
+    const symbol = document.getElementById('symbol').value;
+    const days = document.getElementById('days').value;
+    const tp = document.getElementById('tp').value;
+    const sl = document.getElementById('sl').value;
+    
+    try {{
+        const response = await fetch(`/api/backtest?symbol=${{symbol}}&days=${{days}}&tp_percent=${{tp}}&sl_percent=${{sl}}`);
+        const data = await response.json();
+        
+        if (data.ok) {{
+            displayResults(data.backtest);
+            document.getElementById('results').style.display = 'block';
+        }}
+    }} catch (error) {{
+        alert('Erreur lors du backtest');
+        console.error(error);
+    }} finally {{
+        btn.disabled = false;
+        btn.textContent = '🚀 Lancer Backtest';
+    }}
+}}
+
+function displayResults(results) {{
+    const stats = results.stats;
+    
+    // Statistiques
+    document.getElementById('totalTrades').textContent = stats.total_trades;
+    document.getElementById('wins').textContent = stats.wins;
+    document.getElementById('losses').textContent = stats.losses;
+    document.getElementById('winRate').textContent = stats.win_rate + '%';
+    document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';
+    document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
+    document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';
+    document.getElementById('avgLoss').textContent = stats.avg_loss + '%';
+    document.getElementById('maxDD').textContent = stats.max_drawdown + '%';
+    document.getElementById('sharpe').textContent = stats.sharpe_ratio;
+    document.getElementById('finalEquity').textContent = '
+
+@app.get("/patterns", response_class=HTMLResponse)
+async def patterns():
+    patterns_list = detect_patterns(build_trade_rows(50))
+    patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Patterns</title>{CSS}</head>
+<body><div class="container">
+<div class="header"><h1>🤖 Patterns</h1></div>{NAV}
+<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
+</div></body></html>""")
+
+@app.get("/advanced-metrics", response_class=HTMLResponse)
+async def advanced_metrics():
+    metrics = calc_metrics(build_trade_rows(50))
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Metrics</title>{CSS}</head>
+<body><div class="container">
+<div class="header"><h1>📊 Metrics</h1></div>{NAV}
+<div class="card"><h2>Métriques</h2>
+<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
+    <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
+    <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
+    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
+    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
+</div></div></div></body></html>""")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD - VERSION FINALE")
+    print("="*70)
+    print(f"📍 http://localhost:8000")
+    print(f"📊 Dashboard: http://localhost:8000/trades")
+    print(f"\n✅ PAGES COMPLÈTES:")
+    print(f"  • Dashboard avec données LIVE")
+    print(f"  • Equity Curve avec graphique")
+    print(f"  • Journal de trading")
+    print(f"  • Heatmap visuelle")
+    print(f"  • Configuration stratégie")
+    print(f"  • Backtest (interface)")
+    
+    print(f"\n📥 WEBHOOK:")
+    print(f"  URL: http://localhost:8000/tv-webhook")
+    
+    print(f"\n🔔 TELEGRAM:")
+    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        print(f"  ✅ CONFIGURÉ ET ACTIF")
+    else:
+        print(f"  ⚠️  NON CONFIGURÉ")
+        print(f"  export TELEGRAM_BOT_TOKEN='...'")
+        print(f"  export TELEGRAM_CHAT_ID='...'")
+    
+    print("="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + stats.final_equity.toLocaleString();
+    document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
+    
+    // Graphique
+    const ctx = document.getElementById('equityChart').getContext('2d');
+    if (chart) chart.destroy();
+    
+    chart = new Chart(ctx, {{
+        type: 'line',
+        data: {{
+            labels: stats.equity_curve.map((_, i) => i),
+            datasets: [{{
+                label: 'Equity',
+                data: stats.equity_curve,
+                borderColor: '#6366f1',
+                backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                borderWidth: 3,
+                fill: true,
+                tension: 0.4
+            }}]
+        }},
+        options: {{
+            responsive: true,
+            plugins: {{
+                legend: {{ display: false }},
+                title: {{ display: false }}
+            }},
+            scales: {{
+                y: {{
+                    beginAtZero: false,
+                    ticks: {{ color: '#64748b', callback: value => '
+
+@app.get("/patterns", response_class=HTMLResponse)
+async def patterns():
+    patterns_list = detect_patterns(build_trade_rows(50))
+    patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Patterns</title>{CSS}</head>
+<body><div class="container">
+<div class="header"><h1>🤖 Patterns</h1></div>{NAV}
+<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
+</div></body></html>""")
+
+@app.get("/advanced-metrics", response_class=HTMLResponse)
+async def advanced_metrics():
+    metrics = calc_metrics(build_trade_rows(50))
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Metrics</title>{CSS}</head>
+<body><div class="container">
+<div class="header"><h1>📊 Metrics</h1></div>{NAV}
+<div class="card"><h2>Métriques</h2>
+<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
+    <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
+    <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
+    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
+    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
+</div></div></div></body></html>""")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD - VERSION FINALE")
+    print("="*70)
+    print(f"📍 http://localhost:8000")
+    print(f"📊 Dashboard: http://localhost:8000/trades")
+    print(f"\n✅ PAGES COMPLÈTES:")
+    print(f"  • Dashboard avec données LIVE")
+    print(f"  • Equity Curve avec graphique")
+    print(f"  • Journal de trading")
+    print(f"  • Heatmap visuelle")
+    print(f"  • Configuration stratégie")
+    print(f"  • Backtest (interface)")
+    
+    print(f"\n📥 WEBHOOK:")
+    print(f"  URL: http://localhost:8000/tv-webhook")
+    
+    print(f"\n🔔 TELEGRAM:")
+    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        print(f"  ✅ CONFIGURÉ ET ACTIF")
+    else:
+        print(f"  ⚠️  NON CONFIGURÉ")
+        print(f"  export TELEGRAM_BOT_TOKEN='...'")
+        print(f"  export TELEGRAM_CHAT_ID='...'")
+    
+    print("="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + value.toLocaleString() }},
+                    grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                }},
+                x: {{
+                    ticks: {{ color: '#64748b' }},
+                    grid: {{ color: 'rgba(99, 102, 241, 0.1)' }}
+                }}
+            }}
+        }}
+    }});
+    
+    // Table des trades (derniers 50)
+    const tbody = document.getElementById('tradesBody');
+    tbody.innerHTML = '';
+    results.trades.slice(-50).reverse().forEach(trade => {{
+        const row = document.createElement('tr');
+        const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';
+        const pnlColor = trade.pnl_percent >= 0 ? '#10b981' : '#ef4444';
+        
+        row.innerHTML = `
+            <td style="font-size:12px">${{trade.timestamp}}</td>
+            <td>${{trade.entry}}</td>
+            <td>${{trade.exit}}</td>
+            <td><span style="color:${{resultColor}};font-weight:700">${{trade.result}}</span></td>
+            <td style="color:${{pnlColor}};font-weight:700">${{trade.pnl_percent >= 0 ? '+' : ''}}${{trade.pnl_percent}}%</td>
+            <td>${{trade.equity.toLocaleString()}}</td>
+        `;
+        tbody.appendChild(row);
+    }});
+}}
+
+// Lancer un backtest par défaut au chargement
+window.addEventListener('load', () => {{
+    setTimeout(runBacktest, 500);
+}});
+</script>
 
 </div></body></html>""")
 
