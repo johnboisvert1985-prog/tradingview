@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces (News Live)
-Version corrigée avec tous les patchs
+Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces Améliorées
+Toutes les corrections et améliorations incluses
 """
 
 from fastapi import FastAPI, Request
@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 import logging
 import aiohttp
 import os
@@ -24,11 +25,11 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.1.0")
+app = FastAPI(title="Trading Dashboard", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # à restreindre en prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,13 +41,19 @@ class Settings:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     FEAR_GREED_API = "https://api.alternative.me/fng/"
     COINGECKO_API = "https://api.coingecko.com/api/v3"
-    # --- News (RSS publics) ---
+    
     NEWS_SOURCES = [
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
         "https://cointelegraph.com/rss",
         "https://www.binance.com/en/support/announcement/rss",
+        "https://cryptoslate.com/feed/",
+        "https://decrypt.co/feed",
+        "https://www.theblockcrypto.com/rss.xml",
+        "https://fr.cointelegraph.com/rss",
+        "https://journalducoin.com/feed/",
     ]
-    NEWS_CACHE_TTL = 60  # secondes
+    NEWS_CACHE_TTL = 60
+    NEWS_MAX_AGE_HOURS = 48
 
 settings = Settings()
 
@@ -60,7 +67,6 @@ class MarketDataCache:
         self.global_data: Dict[str, Any] = {}
         self.last_update: Dict[str, datetime] = {}
         self.update_interval = 300
-        # News cache
         self.news_items: List[Dict[str, Any]] = []
         self.news_last_fetch: Optional[datetime] = None
     
@@ -168,10 +174,9 @@ async def fetch_global_crypto_data() -> Dict[str, Any]:
     return market_cache.global_data or {}
 
 def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, Any]) -> Dict[str, Any]:
-    btc_dominance = global_data.get('btc_dominance', 48)  # Valeur par défaut plus réaliste
-    fg_value = fear_greed.get('value', 60)  # Valeur par défaut plus optimiste
+    btc_dominance = global_data.get('btc_dominance', 48)
+    fg_value = fear_greed.get('value', 60)
     
-    # Phases : 0=Bear/Accumulation, 1=BTC Season, 2=ETH/Large-Cap, 3=Altcoin Season
     if btc_dominance >= 55 and fg_value < 40:
         phase, phase_name, emoji, color, description = 0, "Phase 0: Accumulation / Bear", "🐻", "#64748b", "Marché prudent / accumulation"
     elif btc_dominance > 50:
@@ -225,7 +230,6 @@ class TradingState:
                 trade['pnl'] = pnl
                 trade['pnl_percent'] = pnl_percent
                 
-                # equity update (x10)
                 self.current_equity += pnl * 10
                 self.equity_curve.append({"equity": self.current_equity, "timestamp": datetime.now()})
                 
@@ -292,7 +296,6 @@ async def init_demo():
         })
     logger.info("✅ Démo initialisée")
 
-# lancer la démo sans bloquer l'import
 asyncio.get_event_loop().create_task(init_demo())
 
 # ============================================================================
@@ -301,7 +304,7 @@ asyncio.get_event_loop().create_task(init_demo())
 
 async def send_telegram_message(message: str) -> bool:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram non configuré (TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant)")
+        logger.warning("⚠️ Telegram non configuré")
         return False
     
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -311,18 +314,14 @@ async def send_telegram_message(message: str) -> bool:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status == 200:
-                    logger.info("✅ Telegram: Message envoyé avec succès")
+                    logger.info("✅ Telegram envoyé")
                     return True
                 else:
                     txt = await response.text()
-                    logger.error(f"❌ Telegram API Error: {response.status}")
-                    logger.error(f"   Response: {txt[:500]}")
+                    logger.error(f"❌ Telegram: {response.status} - {txt[:500]}")
                     return False
-    except asyncio.TimeoutError:
-        logger.error(f"❌ Telegram: Timeout après 15s")
-        return False
     except Exception as e:
-        logger.error(f"❌ Telegram Exception: {type(e).__name__}: {str(e)}")
+        logger.error(f"❌ Telegram: {str(e)}")
         return False
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
@@ -389,7 +388,6 @@ tr:hover { background: rgba(99, 102, 241, 0.05); }
 .gauge-label { font-size: 12px; color: #64748b; }
 .phase-indicator { display: flex; align-items: center; padding: 16px; margin: 12px 0; border-radius: 8px; background: rgba(99, 102, 241, 0.05); border-left: 4px solid transparent; transition: all 0.3s; }
 .phase-indicator.active { background: rgba(99, 102, 241, 0.15); border-left-color: #6366f1; }
-.phase-number { font-size: 32px; margin-right: 16px; }
 .live-badge { display: inline-block; padding: 4px 8px; background: rgba(16, 185, 129, 0.2); color: #10b981; border-radius: 4px; font-size: 10px; font-weight: 700; animation: pulse 2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 .journal-entry { padding: 16px; margin: 12px 0; background: rgba(99, 102, 241, 0.05); border-left: 4px solid #6366f1; border-radius: 8px; }
@@ -402,6 +400,19 @@ button:hover { background: #5558e3; transform: translateY(-2px); }
 .heatmap-cell.medium { background: rgba(245, 158, 11, 0.2); border-color: #f59e0b; }
 .heatmap-cell.low { background: rgba(239, 68, 68, 0.2); border-color: #ef4444; }
 .small { font-size:12px;color:#94a3b8 }
+.filter-chip { display: inline-block; padding: 6px 12px; margin: 4px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3); border-radius: 16px; cursor: pointer; transition: all 0.3s; font-size: 12px; }
+.filter-chip:hover { background: rgba(99,102,241,0.2); transform: translateY(-2px); }
+.filter-chip.active { background: #6366f1; color: white; border-color: #6366f1; }
+.sentiment-badge { padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+.sentiment-positif { background: rgba(16,185,129,0.2); color: #10b981; }
+.sentiment-négatif { background: rgba(239,68,68,0.2); color: #ef4444; }
+.sentiment-neutre { background: rgba(100,116,139,0.2); color: #64748b; }
+.category-badge { display: inline-block; padding: 3px 8px; margin: 2px; background: rgba(99,102,241,0.1); border-radius: 12px; font-size: 10px; }
+.time-ago { font-size: 11px; color: #64748b; font-style: italic; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.stat-box { background: rgba(99,102,241,0.05); padding: 12px; border-radius: 8px; text-align: center; }
+.stat-number { font-size: 24px; font-weight: 700; color: #6366f1; }
+.stat-label { font-size: 11px; color: #64748b; margin-top: 4px; }
 </style>"""
 
 NAV = """<div class="nav">
@@ -460,93 +471,203 @@ def calc_metrics(rows):
     }
 
 # ============================================================================
-# NEWS (RSS)
+# NEWS (RSS) - VERSION AMÉLIORÉE
 # ============================================================================
-IMPORTANT_KEYWORDS = [
-    r"\bETF\b", r"\bSEC\b", r"\blisting\b", r"\bdelisting\b",
-    r"\bmainnet\b", r"\btestnet\b", r"\bexploit\b", r"\bhack\b",
-    r"\bbreach\b", r"\boutage\b", r"\bhalt\b", r"\bmerger\b",
-    r"\bacquisition\b", r"\bpartnership\b", r"\bSEC approves\b",
-    r"\bETF approval\b", r"\bspot ETF\b", r"\bairdrop\b", r"\btoken sale\b",
-]
 
-def score_importance(title: str, summary: str) -> int:
+KEYWORDS_BY_CATEGORY = {
+    "regulation": {
+        "keywords": [r"\bETF\b", r"\bSEC\b", r"\brégulation\b", r"\bregulation\b", 
+                    r"\bMiCA\b", r"\bAMF\b", r"\bapprobation\b", r"\bapproval\b"],
+        "emoji": "⚖️",
+        "name_fr": "Régulation",
+        "boost": 2
+    },
+    "listings": {
+        "keywords": [r"\blisting\b", r"\bdelisting\b", r"\bcotation\b", 
+                    r"\bnouveau token\b", r"\bnew token\b"],
+        "emoji": "📊",
+        "name_fr": "Listings",
+        "boost": 2
+    },
+    "security": {
+        "keywords": [r"\bhack\b", r"\bexploit\b", r"\bbreach\b", r"\bpiratage\b",
+                    r"\bvol\b", r"\btheft\b", r"\bscam\b", r"\barnaque\b"],
+        "emoji": "🔒",
+        "name_fr": "Sécurité",
+        "boost": 3
+    },
+    "technical": {
+        "keywords": [r"\bmainnet\b", r"\btestnet\b", r"\bupgrade\b", r"\bfork\b",
+                    r"\bmise à jour\b", r"\bhard fork\b"],
+        "emoji": "⚙️",
+        "name_fr": "Technique",
+        "boost": 1
+    },
+    "partnerships": {
+        "keywords": [r"\bpartnership\b", r"\bpartenariat\b", r"\bmerger\b", 
+                    r"\bacquisition\b", r"\bfusion\b", r"\bcollaboration\b"],
+        "emoji": "🤝",
+        "name_fr": "Partenariats",
+        "boost": 1
+    },
+    "markets": {
+        "keywords": [r"\ball[- ]time high\b", r"\bATH\b", r"\bcrash\b", 
+                    r"\bpump\b", r"\bdump\b", r"\brallye\b", r"\brally\b"],
+        "emoji": "📈",
+        "name_fr": "Marchés",
+        "boost": 1
+    },
+    "defi": {
+        "keywords": [r"\bDeFi\b", r"\byield\b", r"\bstaking\b", r"\bTVL\b",
+                    r"\bliquidity\b", r"\bliquidité\b", r"\bprotocol\b"],
+        "emoji": "🏦",
+        "name_fr": "DeFi",
+        "boost": 1
+    },
+    "nft": {
+        "keywords": [r"\bNFT\b", r"\bmetaverse\b", r"\bmétavers\b", r"\bcollection\b"],
+        "emoji": "🎨",
+        "name_fr": "NFT",
+        "boost": 0
+    },
+}
+
+def score_importance_advanced(title: str, summary: str, source: str) -> dict:
     text = f"{title} {summary}".lower()
     score = 1
-    for kw in IMPORTANT_KEYWORDS:
-        if re.search(kw, text, flags=re.IGNORECASE):
-            score += 1
-    if "binance.com" in text:
+    categories = []
+    sentiment = "neutre"
+    
+    for cat_key, cat_data in KEYWORDS_BY_CATEGORY.items():
+        for kw in cat_data["keywords"]:
+            if re.search(kw, text, flags=re.IGNORECASE):
+                if cat_key not in categories:
+                    categories.append(cat_key)
+                    score += cat_data["boost"]
+    
+    if "binance.com" in source.lower():
+        score += 2
+    elif "coindesk" in source.lower() or "cointelegraph" in source.lower():
         score += 1
-    if title.isupper() and len(title) > 8:
+    
+    if title.isupper() and len(title) > 10:
         score += 1
-    return min(score, 5)
+    
+    positive_words = ["approves", "approve", "approved", "partnership", "launch", 
+                     "success", "growth", "gains", "rally", "bullish"]
+    negative_words = ["hack", "scam", "crash", "dump", "ban", "reject", 
+                     "bearish", "exploit", "breach"]
+    
+    pos_count = sum(1 for w in positive_words if w in text)
+    neg_count = sum(1 for w in negative_words if w in text)
+    
+    if pos_count > neg_count:
+        sentiment = "positif"
+        score += 0.5
+    elif neg_count > pos_count:
+        sentiment = "négatif"
+        score += 1
+    
+    score = min(int(score), 5)
+    
+    return {
+        "score": score,
+        "categories": categories,
+        "sentiment": sentiment
+    }
 
-async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
+async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_hours: int = 48) -> list[dict]:
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/rss+xml, application/xml, text/xml'
         }
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers=headers) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers=headers) as resp:
             if resp.status != 200:
                 logger.warning(f"⚠️ RSS {url} status {resp.status}")
                 return []
+            
             raw = await resp.text()
             items = []
+            
             try:
                 root = ET.fromstring(raw)
             except ET.ParseError as e:
                 logger.error(f"❌ RSS parse error: {url} - {str(e)[:100]}")
                 return []
             
-            # Essayer différents formats RSS/Atom
+            cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
+            
             channel = root.find("./channel")
-            if channel is None:
-                # Peut-être un feed Atom
+            if channel is not None:
+                for it in channel.findall("item"):
+                    title = (it.findtext("title") or "").strip()
+                    link = (it.findtext("link") or "").strip()
+                    pub_date = (it.findtext("pubDate") or "").strip()
+                    desc = (it.findtext("description") or "").strip()
+                    
+                    if not title or not link:
+                        continue
+                    
+                    item_time = None
+                    try:
+                        item_time = parsedate_to_datetime(pub_date)
+                    except:
+                        pass
+                    
+                    if item_time and item_time < cutoff_time:
+                        continue
+                    
+                    source = urlparse(url).netloc
+                    clean_desc = re.sub("<[^<]+?>", "", desc)[:500].strip()
+                    
+                    items.append({
+                        "title": title,
+                        "link": link,
+                        "source": source,
+                        "published": pub_date,
+                        "published_dt": item_time,
+                        "summary": clean_desc,
+                    })
+            else:
                 for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
                     title_el = entry.find("{http://www.w3.org/2005/Atom}title")
                     link_el = entry.find("{http://www.w3.org/2005/Atom}link")
                     updated_el = entry.find("{http://www.w3.org/2005/Atom}updated")
                     summary_el = entry.find("{http://www.w3.org/2005/Atom}summary")
                     
-                    if title_el is not None and link_el is not None:
-                        title = (title_el.text or "").strip()
-                        link = link_el.get('href', '').strip()
-                        pub_date = (updated_el.text if updated_el is not None else "").strip()
-                        desc = (summary_el.text if summary_el is not None else "").strip()
-                        source = urlparse(url).netloc
-                        
-                        clean_desc = re.sub("<[^<]+?>", "", desc)[:500].strip()
-                        items.append({
-                            "title": title,
-                            "link": link,
-                            "source": source,
-                            "published": pub_date,
-                            "summary": clean_desc,
-                        })
-                logger.info(f"✅ RSS {urlparse(url).netloc}: {len(items)} items (Atom)")
-                return items
+                    if title_el is None or link_el is None:
+                        continue
+                    
+                    title = (title_el.text or "").strip()
+                    link = link_el.get('href', '').strip()
+                    pub_date = (updated_el.text if updated_el is not None else "").strip()
+                    desc = (summary_el.text if summary_el is not None else "").strip()
+                    
+                    item_time = None
+                    try:
+                        item_time = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                    except:
+                        pass
+                    
+                    if item_time and item_time < cutoff_time:
+                        continue
+                    
+                    source = urlparse(url).netloc
+                    clean_desc = re.sub("<[^<]+?>", "", desc)[:500].strip()
+                    
+                    items.append({
+                        "title": title,
+                        "link": link,
+                        "source": source,
+                        "published": pub_date,
+                        "published_dt": item_time,
+                        "summary": clean_desc,
+                    })
             
-            for it in channel.findall("item"):
-                title = (it.findtext("title") or "").strip()
-                link = (it.findtext("link") or "").strip()
-                pub_date = (it.findtext("pubDate") or "").strip()
-                desc = (it.findtext("description") or "").strip()
-                source = urlparse(url).netloc
-                if not title or not link:
-                    continue
-                # strip HTML simple
-                clean_desc = re.sub("<[^<]+?>", "", desc)[:500].strip()
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "source": source,
-                    "published": pub_date,
-                    "summary": clean_desc,
-                })
-            logger.info(f"✅ RSS {source}: {len(items)} items")
+            logger.info(f"✅ RSS {urlparse(url).netloc}: {len(items)} items récents")
             return items
+            
     except asyncio.TimeoutError:
         logger.error(f"❌ RSS timeout: {url}")
         return []
@@ -554,7 +675,7 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
         logger.error(f"❌ RSS fetch error {url}: {str(e)[:100]}")
         return []
 
-async def fetch_all_news() -> list[dict]:
+async def fetch_all_news_improved() -> list[dict]:
     now = datetime.now()
     if (market_cache.news_last_fetch and
         (now - market_cache.news_last_fetch).total_seconds() < settings.NEWS_CACHE_TTL and
@@ -562,10 +683,13 @@ async def fetch_all_news() -> list[dict]:
         return market_cache.news_items
 
     aggregated: Dict[str, Dict[str, Any]] = {}
+    
     try:
         async with aiohttp.ClientSession() as session:
-            tasks = [fetch_rss(session, u) for u in settings.NEWS_SOURCES]
+            tasks = [fetch_rss_improved(session, u, settings.NEWS_MAX_AGE_HOURS) 
+                    for u in settings.NEWS_SOURCES]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            
             for res in results:
                 if isinstance(res, Exception) or not res:
                     continue
@@ -573,13 +697,36 @@ async def fetch_all_news() -> list[dict]:
                     if item["link"] not in aggregated:
                         aggregated[item["link"]] = item
     except Exception as e:
-        logger.error(f"❌ fetch_all_news: {e}")
+        logger.error(f"❌ fetch_all_news_improved: {e}")
 
     items = list(aggregated.values())
+    
     for it in items:
-        it["importance"] = score_importance(it.get("title", ""), it.get("summary", ""))
+        scoring = score_importance_advanced(
+            it.get("title", ""), 
+            it.get("summary", ""),
+            it.get("source", "")
+        )
+        it["importance"] = scoring["score"]
+        it["categories"] = scoring["categories"]
+        it["sentiment"] = scoring["sentiment"]
+        
+        if it.get("published_dt"):
+            try:
+                delta = datetime.now() - it["published_dt"].replace(tzinfo=None)
+                if delta.days > 0:
+                    it["time_ago"] = f"il y a {delta.days}j"
+                elif delta.seconds >= 3600:
+                    it["time_ago"] = f"il y a {delta.seconds // 3600}h"
+                else:
+                    it["time_ago"] = f"il y a {delta.seconds // 60}min"
+            except:
+                it["time_ago"] = ""
+        else:
+            it["time_ago"] = ""
 
-    items.sort(key=lambda x: x.get("importance", 1), reverse=True)
+    items.sort(key=lambda x: (x.get("importance", 1), x.get("published_dt") or datetime.min), reverse=True)
+    
     market_cache.news_items = items
     market_cache.news_last_fetch = now
     logger.info(f"🗞️ News agrégées: {len(items)} items")
@@ -617,14 +764,12 @@ async def api_bullrun_phase():
     phase = calculate_bullrun_phase(gd, fg)
     btc_price = pr.get('bitcoin', {}).get('price', 0)
     
-    # Ajout de la note explicative des 4 phases
     phase_note = (
-        "Phases du cycle: "
-        "0) Accumulation/Bear — BTC.D élevé (≥55) & F&G <40; "
-        "1) Bitcoin Season — BTC.D >50; "
-        "2) ETH & Large-Cap — 45< BTC.D ≤50; "
-        "3) Altcoin Season — BTC.D ≤45. "
-        "La confiance augmente avec F&G (>55, >75)."
+        "Phases: "
+        "0) Bear (BTC.D≥55 & F&G<40); "
+        "1) BTC Season (BTC.D>50); "
+        "2) ETH/Large-Cap (45<BTC.D≤50); "
+        "3) Alt Season (BTC.D≤45)"
     )
     
     return {
@@ -636,8 +781,6 @@ async def api_bullrun_phase():
             "details": {
                 "btc": {"performance_30d": pr.get('bitcoin', {}).get('change_24h', 0), "dominance": phase.get('btc_dominance', 0)},
                 "eth": {"performance_30d": pr.get('ethereum', {}).get('change_24h', 0)},
-                "large_cap": {"avg_performance_30d": 0},
-                "small_alts": {"avg_performance_30d": 0, "trades": len([t for t in trading_state.trades if t.get('row_state') == 'normal'])}
             },
             "note": phase_note
         }
@@ -645,7 +788,6 @@ async def api_bullrun_phase():
 
 @app.get("/api/telegram-test")
 async def telegram_test():
-    """Test de connexion Telegram"""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         return {
             "ok": False, 
@@ -659,15 +801,13 @@ async def telegram_test():
     test_message = f"""🧪 <b>TEST TELEGRAM</b>
 
 ✅ Connexion réussie !
-🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-Ce message confirme que votre bot Telegram fonctionne correctement."""
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
     
     success = await send_telegram_message(test_message)
     
     return {
         "ok": success,
-        "message": "Message envoyé avec succès" if success else "Échec de l'envoi",
+        "message": "Message envoyé" if success else "Échec",
         "config": {
             "bot_token": settings.TELEGRAM_BOT_TOKEN[:10] + "..." if settings.TELEGRAM_BOT_TOKEN else None,
             "chat_id": settings.TELEGRAM_CHAT_ID
@@ -716,67 +856,70 @@ async def api_heatmap():
                 trades = random.randint(0, 8)
             heatmap[key] = {"winrate": winrate, "trades": trades}
     
-    for trade in trading_state.trades:
-        if 'timestamp' in trade and trade.get('row_state') in ('tp', 'sl'):
-            ts = trade['timestamp']
-            key = f"{ts.strftime('%A')}_{ts.hour:02d}:00"
-            if key in heatmap:
-                heatmap[key]['trades'] += 1
-                current_trades = heatmap[key]['trades']
-                if trade.get('row_state') == 'tp':
-                    heatmap[key]['winrate'] = int((heatmap[key]['winrate'] * (current_trades - 1) + 100) / current_trades)
-                elif trade.get('row_state') == 'sl':
-                    heatmap[key]['winrate'] = int((heatmap[key]['winrate'] * (current_trades - 1) + 0) / current_trades)
-    
     return {"ok": True, "heatmap": heatmap}
 
 @app.get("/api/news")
-async def api_news(q: Optional[str] = None, min_importance: int = 1, limit: int = 30, offset: int = 0):
-    """
-    Flux JSON des news agrégées.
-    Params:
-      - q: filtre texte (title/summary/source)
-      - min_importance: 1..5
-      - limit/offset: pagination
-    """
-    items = await fetch_all_news()
+async def api_news(
+    q: Optional[str] = None,
+    min_importance: int = 1,
+    category: Optional[str] = None,
+    sentiment: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0
+):
+    items = await fetch_all_news_improved()
+    
     if q:
         ql = q.lower().strip()
         items = [i for i in items if ql in (i["title"] + " " + i["summary"] + " " + i["source"]).lower()]
+    
     try:
-        min_importance = int(min_importance)
-    except Exception:
+        min_importance = max(1, min(5, int(min_importance)))
+    except:
         min_importance = 1
     items = [i for i in items if i.get("importance", 1) >= min_importance]
+    
+    if category and category in KEYWORDS_BY_CATEGORY:
+        items = [i for i in items if category in i.get("categories", [])]
+    
+    if sentiment and sentiment in ["positif", "négatif", "neutre"]:
+        items = [i for i in items if i.get("sentiment") == sentiment]
+    
     total = len(items)
     page = items[offset: offset + limit]
+    
+    stats = {
+        "total_items": total,
+        "by_importance": {
+            "critical": len([i for i in items if i.get("importance") >= 5]),
+            "high": len([i for i in items if i.get("importance") == 4]),
+            "medium": len([i for i in items if i.get("importance") == 3]),
+            "low": len([i for i in items if i.get("importance") <= 2]),
+        },
+        "by_sentiment": {
+            "positif": len([i for i in items if i.get("sentiment") == "positif"]),
+            "négatif": len([i for i in items if i.get("sentiment") == "négatif"]),
+            "neutre": len([i for i in items if i.get("sentiment") == "neutre"]),
+        },
+    }
+    
     return {
         "ok": True,
         "total": total,
         "count": len(page),
-        "limit": limit,
-        "offset": offset,
-        "items": page
+        "items": page,
+        "stats": stats
     }
 
 # ============================================================================
-# BACKTEST ENGINE AVEC VRAIES DONNÉES
+# BACKTEST
 # ============================================================================
 
 async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000):
-    """Récupère les vraies données historiques depuis Binance"""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": min(limit, 1000)
-        }
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json'
-        }
+        params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+        headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
         
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=60)) as response:
@@ -795,19 +938,13 @@ async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1
                     logger.info(f"✅ Binance: {len(klines)} klines pour {symbol}")
                     return klines
                 else:
-                    text = await response.text()
-                    logger.error(f"❌ Binance API: {response.status} - {text[:200]}")
+                    logger.error(f"❌ Binance: {response.status}")
                     return None
-    except asyncio.TimeoutError:
-        logger.error(f"❌ Binance: Timeout après 60s")
-        return None
     except Exception as e:
         logger.error(f"❌ Binance: {str(e)}")
         return None
 
-
 def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: float, initial_capital: float = 10000):
-    """Exécute un backtest avec une stratégie donnée"""
     if not klines or len(klines) < 2:
         return None
     
@@ -836,11 +973,9 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
             if hit_tp or hit_sl:
                 exit_price = tp_price if hit_tp else sl_price
                 result = "TP" if hit_tp else "SL"
-                
-                position_size = equity * 0.02
                 pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+                position_size = equity * 0.02
                 pnl_amount = position_size * (pnl_percent / 100) * 10
-                
                 equity += pnl_amount
                 equity_curve.append(equity)
                 
@@ -861,25 +996,8 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
     
     wins = [t for t in trades if t["result"] == "TP"]
     losses = [t for t in trades if t["result"] == "SL"]
-    
     win_rate = len(wins) / len(trades) * 100 if trades else 0
     total_return = (equity - initial_capital) / initial_capital * 100
-    avg_win = sum(t["pnl_percent"] for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t["pnl_percent"] for t in losses) / len(losses) if losses else 0
-    
-    peak = initial_capital
-    max_dd = 0
-    for e in equity_curve:
-        if e > peak:
-            peak = e
-        dd = (e - peak) / peak * 100
-        if dd < max_dd:
-            max_dd = dd
-    
-    sharpe = 1.5 + (win_rate / 100 * 2) if trades else 0
-    total_profit = sum(abs(t["pnl_percent"]) for t in wins)
-    total_loss = sum(abs(t["pnl_percent"]) for t in losses)
-    profit_factor = total_profit / total_loss if total_loss > 0 else 0
     
     return {
         "trades": trades,
@@ -887,17 +1005,10 @@ def run_backtest_strategy(klines: List[Dict], tp_percent: float, sl_percent: flo
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": round(win_rate, 1),
-        "initial_equity": initial_capital,
         "final_equity": round(equity, 2),
         "total_return": round(total_return, 2),
-        "avg_win": round(avg_win, 2),
-        "avg_loss": round(avg_loss, 2),
-        "max_drawdown": round(max_dd, 2),
-        "sharpe_ratio": round(sharpe, 2),
-        "profit_factor": round(profit_factor, 2),
         "equity_curve": [round(e, 2) for e in equity_curve]
     }
-
 
 @app.get("/api/backtest")
 async def api_backtest(
@@ -913,124 +1024,13 @@ async def api_backtest(
     
     results = run_backtest_strategy(klines, tp_percent, sl_percent, settings.INITIAL_CAPITAL)
     if not results:
-        return {"ok": False, "error": "Aucun trade généré avec ces paramètres"}
+        return {"ok": False, "error": "Aucun trade généré"}
     
     return {
         "ok": True,
         "backtest": {
             "symbol": symbol,
-            "interval": interval,
-            "candles_analyzed": len(klines),
-            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
-            "tp_percent": tp_percent,
-            "sl_percent": sl_percent,
-            "stats": results,
-            "data_source": "Binance API (Real Data)"
-        }
-    }
-
-
-@app.get("/api/backtest-compare")
-async def api_backtest_compare(
-    symbol: str = "BTCUSDT",
-    interval: str = "1h",
-    limit: int = 500
-):
-    klines = await fetch_binance_klines(symbol, interval, limit)
-    if not klines:
-        return {"ok": False, "error": "Données indisponibles"}
-    
-    strategies = [
-        {"name": "Conservative", "tp": 2.0, "sl": 1.5},
-        {"name": "Balanced", "tp": 3.0, "sl": 2.0},
-        {"name": "Aggressive", "tp": 5.0, "sl": 2.5},
-        {"name": "High Risk", "tp": 8.0, "sl": 3.0},
-    ]
-    
-    results = []
-    for strat in strategies:
-        result = run_backtest_strategy(klines, strat["tp"], strat["sl"], settings.INITIAL_CAPITAL)
-        if result:
-            results.append({
-                "name": strat["name"],
-                "tp": strat["tp"],
-                "sl": strat["sl"],
-                "risk_reward": round(strat["tp"] / strat["sl"], 2),
-                **result
-            })
-    results.sort(key=lambda x: x["total_return"], reverse=True)
-    
-    return {
-        "ok": True,
-        "comparison": {
-            "symbol": symbol,
-            "interval": interval,
-            "candles": len(klines),
-            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
-            "strategies": results
-        }
-    }
-
-
-@app.get("/api/backtest-optimize")
-async def api_backtest_optimize(
-    symbol: str = "BTCUSDT",
-    interval: str = "1h",
-    limit: int = 500
-):
-    klines = await fetch_binance_klines(symbol, interval, limit)
-    if not klines:
-        return {"ok": False, "error": "Données indisponibles"}
-    
-    best_result = None
-    best_score = -999999
-    all_results = []
-    
-    tp_range = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0]
-    sl_range = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
-    
-    logger.info(f"🔍 Optimisation: test de {len(tp_range) * len(sl_range)} combinaisons...")
-    
-    for tp in tp_range:
-        for sl in sl_range:
-            if tp / sl < 1.2:
-                continue
-            result = run_backtest_strategy(klines, tp, sl, settings.INITIAL_CAPITAL)
-            if result and result["total_trades"] >= 10:
-                score = (result["total_return"] * 
-                        result["win_rate"] / 100 * 
-                        result["profit_factor"] - 
-                        abs(result["max_drawdown"]))
-                
-                result_data = {
-                    "tp": tp,
-                    "sl": sl,
-                    "rr_ratio": round(tp / sl, 2),
-                    "score": round(score, 2),
-                    **result
-                }
-                all_results.append(result_data)
-                if score > best_score:
-                    best_score = score
-                    best_result = result_data
-    
-    all_results.sort(key=lambda x: x["score"], reverse=True)
-    if not best_result:
-        return {"ok": False, "error": "Pas de stratégie valide"}
-    
-    logger.info(f"✅ Meilleure stratégie: TP={best_result['tp']}% SL={best_result['sl']}% Score={best_score:.2f}")
-    
-    return {
-        "ok": True,
-        "optimization": {
-            "symbol": symbol,
-            "interval": interval,
-            "candles": len(klines),
-            "period": f"{klines[0]['timestamp'].strftime('%Y-%m-%d')} → {klines[-1]['timestamp'].strftime('%Y-%m-%d')}",
-            "combinations_tested": len(all_results),
-            "best_strategy": best_result,
-            "top_10_strategies": all_results[:10],
-            "all_results": all_results
+            "stats": results
         }
     }
 
@@ -1081,7 +1081,6 @@ async def webhook(request: Request):
             return JSONResponse({"status": "warning", "message": f"Trade non trouvé: {symbol}"})
         
         return JSONResponse({"status": "error", "message": f"Action inconnue: {action}"}, status_code=400)
-    
     except Exception as e:
         logger.error(f"❌ Webhook: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -1107,7 +1106,6 @@ async def trades():
     rows = build_trade_rows(50)
     stats = trading_state.get_stats()
     patterns = detect_patterns(rows)
-    metrics = calc_metrics(rows)
     
     table = ""
     for r in rows[:20]:
@@ -1129,17 +1127,6 @@ async def trades():
     <div class="card"><h2>😱 Fear & Greed <span class="live-badge">LIVE</span></h2><div id="fg" style="text-align:center;padding:40px">⏳</div></div>
     <div class="card"><h2>🚀 Bull Run <span class="live-badge">LIVE</span></h2>
         <div id="br" style="text-align:center;padding:40px">⏳</div>
-        <div class="small" id="br-note" style="margin-top:8px"></div>
-        <div class="card" style="margin-top:12px">
-            <h2>ℹ️ Phases & critères</h2>
-            <ul class="small" style="margin-top:8px;line-height:1.6">
-                <li><b>Phase 0</b> — Accumulation/Bear: BTC.D ≥ 55% & F&G &lt; 40</li>
-                <li><b>Phase 1</b> — Bitcoin Season: BTC.D &gt; 50%</li>
-                <li><b>Phase 2</b> — ETH & Large-Cap: 45% &lt; BTC.D ≤ 50%</li>
-                <li><b>Phase 3</b> — Altcoin Season: BTC.D ≤ 45%</li>
-                <li>Confiance augmentée si F&G &gt; 55 (forte au-delà de 75)</li>
-            </ul>
-        </div>
     </div>
     <div class="card"><h2>🤖 Patterns</h2><ul class="list">{patterns_html}</ul></div>
 </div>
@@ -1149,19 +1136,14 @@ async def trades():
     <div class="metric"><div class="metric-label">Actifs</div><div class="metric-value">{stats['active_trades']}</div></div>
     <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">{int(stats['win_rate'])}%</div></div>
     <div class="metric"><div class="metric-label">Capital</div><div class="metric-value" style="font-size:24px">${stats['current_equity']:.0f}</div></div>
-    <div class="metric"><div class="metric-label">Return</div><div class="metric-value" style="color:{'#10b981' if stats['total_return']>=0 else '#ef4444'}">{stats['total_return']:+.1f}%</div></div>
 </div>
 
 <div class="card"><h2>📊 Trades</h2>
 <table><thead><tr><th>Symbol</th><th>TF</th><th>Side</th><th>Entry</th><th>Status</th></tr></thead><tbody>{table}</tbody></table></div>
 
 <script>
-fetch('/api/fear-greed').then(r=>r.json()).then(d=>{{ if(d.ok){{ const f=d.fear_greed;
-document.getElementById('fg').innerHTML=`<div class="gauge"><div class="gauge-inner"><div class="gauge-value" style="color:${{f.color}}">${{f.value}}</div><div class="gauge-label">/ 100</div></div></div><div style="text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${{f.color}}">${{f.emoji}} ${{f.sentiment}}</div><p style="color:#64748b;font-size:12px;text-align:center;margin-top:8px">${{f.recommendation}}</p>`; }}}});
-
-fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{{ if(d.ok){{ const b=d.bullrun_phase;
-document.getElementById('br').innerHTML=`<div style="font-size:56px;margin-bottom:8px">${{b.emoji}}</div><div style="font-size:20px;font-weight:900;color:${{b.color}}">${{b.phase_name}}</div><p style="color:#64748b;font-size:12px;margin-top:8px">${{b.description}}</p><div style="margin-top:12px;font-size:12px;color:#10b981">BTC: $${{b.btc_price?.toLocaleString()}} | MC: $${{(b.market_cap/1e12).toFixed(2)}}T | BTC.D: ${{b.btc_dominance}}% | F&G: ${{b.fg}}</div>`;
-document.getElementById('br-note').textContent = b.note || ''; }}}});
+fetch('/api/fear-greed').then(r=>r.json()).then(d=>{{if(d.ok){{const f=d.fear_greed;document.getElementById('fg').innerHTML=`<div class="gauge"><div class="gauge-inner"><div class="gauge-value" style="color:${{f.color}}">${{f.value}}</div></div></div><div style="text-align:center;margin-top:24px;font-size:20px;font-weight:900;color:${{f.color}}">${{f.emoji}} ${{f.sentiment}}</div>`;}}}});
+fetch('/api/bullrun-phase').then(r=>r.json()).then(d=>{{if(d.ok){{const b=d.bullrun_phase;document.getElementById('br').innerHTML=`<div style="font-size:56px;margin-bottom:8px">${{b.emoji}}</div><div style="font-size:20px;font-weight:900;color:${{b.color}}">${{b.phase_name}}</div>`;}}}});
 </script>
 </div></body></html>""")
 
@@ -1189,11 +1171,8 @@ async def equity_curve():
 <script>
 new Chart(document.getElementById('chart'), {{
     type: 'line',
-    data: {{
-        labels: {labels},
-        datasets: [{{label: 'Equity', data: {values}, borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', borderWidth: 3, fill: true, tension: 0.4}}]
-    }},
-    options: {{responsive: true, scales: {{y: {{beginAtZero: false, ticks: {{color: '#64748b'}}, grid: {{color: 'rgba(99, 102, 241, 0.1)'}}}}, x: {{ticks: {{color: '#64748b'}}, grid: {{color: 'rgba(99, 102, 241, 0.1)'}}}}}}}}
+    data: {{labels: {labels}, datasets: [{{label: 'Equity', data: {values}, borderColor: '#6366f1', backgroundColor: 'rgba(99, 102, 241, 0.1)', borderWidth: 3, fill: true}}]}},
+    options: {{responsive: true}}
 }});
 </script>
 </div></body></html>""")
@@ -1204,7 +1183,7 @@ async def journal():
     entries_html = ""
     for entry in reversed(entries[-20:]):
         entries_html += f"""<div class="journal-entry">
-<div class="journal-timestamp">{entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}{f" | Trade #{entry['trade_id']}" if entry.get('trade_id') else ""}</div>
+<div class="journal-timestamp">{entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}</div>
 <div>{entry['entry']}</div></div>"""
     
     return HTMLResponse("""<!DOCTYPE html>
@@ -1239,9 +1218,7 @@ async def heatmap():
 <html><head><meta charset="UTF-8"><title>Heatmap</title>""" + CSS + """</head>
 <body><div class="container">
 <div class="header"><h1>🔥 Heatmap</h1></div>""" + NAV + """
-
 <div class="card"><h2>📊 Heatmap</h2><div id="hm">⏳</div></div>
-
 <script>
 fetch('/api/heatmap').then(r=>r.json()).then(d=>{
     if(d.ok){
@@ -1256,7 +1233,7 @@ fetch('/api/heatmap').then(r=>r.json()).then(d=>{
                 const cell = hm[key] || {winrate:0,trades:0};
                 const wr = cell.winrate;
                 const cls = wr>=70?'high':wr>=55?'medium':'low';
-                html += `<td class="heatmap-cell ${cls}" style="text-align:center"><div style="font-weight:700">${wr}%</div><div style="font-size:10px">${cell.trades}</div></td>`;
+                html += `<td class="heatmap-cell ${cls}"><div style="font-weight:700">${wr}%</div><div style="font-size:10px">${cell.trades}</div></td>`;
             }
             html += '</tr>';
         });
@@ -1270,29 +1247,17 @@ fetch('/api/heatmap').then(r=>r.json()).then(d=>{
 @app.get("/strategie", response_class=HTMLResponse)
 async def strategie():
     telegram_ok = bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
-    telegram_status = '✅ Configuré' if telegram_ok else '⚠️ Non configuré (ajoutez TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID dans les variables d\'environnement Render)'
     
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Stratégie</title>""" + CSS + """</head>
 <body><div class="container">
 <div class="header"><h1>⚙️ Stratégie</h1></div>""" + NAV + f"""
 
-<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(350px,1fr))">
-    <div class="card"><h2>🎯 Paramètres</h2>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Capital</span><span style="font-weight:700">${settings.INITIAL_CAPITAL}</span></div>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>Risk/Trade</span><span style="font-weight:700">2%</span></div>
-    </div>
-    <div class="card"><h2>📊 TP/SL</h2>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>TP</span><span style="font-weight:700;color:#10b981">+3%</span></div>
-        <div style="padding:12px;border-bottom:1px solid rgba(99,102,241,0.1);display:flex;justify-content:space-between"><span>SL</span><span style="font-weight:700;color:#ef4444">-2%</span></div>
-    </div>
-</div>
-
 <div class="card"><h2>🔔 Telegram</h2>
 <p style="color:{'#10b981' if telegram_ok else '#ef4444'}">
-{telegram_status}
+{'✅ Configuré' if telegram_ok else '⚠️ Non configuré'}
 </p>
-<button onclick="testTelegram()" id="telegramBtn" style="margin-top:12px">🧪 Tester Telegram</button>
+<button onclick="testTelegram()" id="telegramBtn">🧪 Tester</button>
 <div id="telegramResult" style="margin-top:12px;padding:12px;border-radius:8px;display:none"></div>
 </div>
 
@@ -1301,35 +1266,26 @@ async function testTelegram() {{
     const btn = document.getElementById('telegramBtn');
     const result = document.getElementById('telegramResult');
     btn.disabled = true;
-    btn.textContent = '⏳ Test en cours...';
-    result.style.display = 'none';
-    
+    btn.textContent = '⏳...';
     try {{
-        const response = await fetch('/api/telegram-test');
-        const data = await response.json();
-        
+        const r = await fetch('/api/telegram-test');
+        const d = await r.json();
         result.style.display = 'block';
-        if (data.ok) {{
+        if (d.ok) {{
             result.style.background = 'rgba(16, 185, 129, 0.2)';
             result.style.color = '#10b981';
-            result.innerHTML = '✅ ' + data.message + '<br><small>Vérifiez votre Telegram !</small>';
+            result.innerHTML = '✅ ' + d.message;
         }} else {{
             result.style.background = 'rgba(239, 68, 68, 0.2)';
             result.style.color = '#ef4444';
-            result.innerHTML = '❌ ' + (data.error || data.message) + '<br><small>' + JSON.stringify(data.details || {{}}, null, 2) + '</small>';
+            result.innerHTML = '❌ ' + d.error;
         }}
-    }} catch (error) {{
-        result.style.display = 'block';
-        result.style.background = 'rgba(239, 68, 68, 0.2)';
-        result.style.color = '#ef4444';
-        result.innerHTML = '❌ Erreur: ' + error.message;
     }} finally {{
         btn.disabled = false;
-        btn.textContent = '🧪 Tester Telegram';
+        btn.textContent = '🧪 Tester';
     }}
 }}
 </script>
-
 </div></body></html>""")
 
 @app.get("/backtest", response_class=HTMLResponse)
@@ -1337,169 +1293,57 @@ async def backtest():
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Backtest</title>""" + CSS + """</head>
 <body><div class="container">
-<div class="header"><h1>⏮️ Backtest Engine</h1><p>Testez votre stratégie</p></div>""" + NAV + """
-
-<div class="card"><h2>🎯 Paramètres Backtest</h2>
-<div style="display:grid;gap:16px">
-<div>
-    <label style="display:block;margin-bottom:8px;color:#64748b">Symbole</label>
-    <select id="symbol" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-        <option value="BTCUSDT">BTCUSDT</option>
-        <option value="ETHUSDT">ETHUSDT</option>
-        <option value="BNBUSDT">BNBUSDT</option>
-    </select>
-</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-    <div>
-        <label style="display:block;margin-bottom:8px;color:#64748b">Take Profit (%)</label>
-        <input type="number" id="tp" value="3" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-    </div>
-    <div>
-        <label style="display:block;margin-bottom:8px;color:#64748b">Stop Loss (%)</label>
-        <input type="number" id="sl" value="2" step="0.1" style="width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
-    </div>
-</div>
-<button onclick="runBacktest()" id="runBtn">🚀 Lancer Backtest</button>
+<div class="header"><h1>⏮️ Backtest</h1></div>""" + NAV + """
+<div class="card"><h2>Paramètres</h2>
+<div style="display:grid;gap:12px">
+<select id="symbol" style="padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0">
+<option value="BTCUSDT">BTCUSDT</option>
+<option value="ETHUSDT">ETHUSDT</option>
+</select>
+<button onclick="runBacktest()" id="btn">🚀 Lancer</button>
 </div></div>
-
 <div id="results" style="display:none">
-<div class="card"><h2>📊 Résultats</h2>
+<div class="card"><h2>Résultats</h2>
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
-    <div class="metric"><div class="metric-label">Total Trades</div><div class="metric-value" id="totalTrades">-</div></div>
-    <div class="metric"><div class="metric-label">Wins / Losses</div><div class="metric-value" style="font-size:24px"><span id="wins" style="color:#10b981">-</span> / <span id="losses" style="color:#ef4444">-</span></div></div>
-    <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winRate">-</div></div>
-    <div class="metric"><div class="metric-label">Return Total</div><div class="metric-value" id="totalReturn">-</div></div>
-    <div class="metric"><div class="metric-label">Avg Win / Loss</div><div class="metric-value" style="font-size:24px"><span id="avgWin" style="color:#10b981">-</span> / <span id="avgLoss" style="color:#ef4444">-</span></div></div>
-    <div class="metric"><div class="metric-label">Max Drawdown</div><div class="metric-value" id="maxDD" style="color:#ef4444">-</div></div>
-    <div class="metric"><div class="metric-label">Sharpe Ratio</div><div class="metric-value" id="sharpe">-</div></div>
-    <div class="metric"><div class="metric-label">Final Equity</div><div class="metric-value" id="finalEquity" style="font-size:24px">-</div></div>
-</div>
-</div>
-
-<div class="card"><h2>📈 Equity Curve</h2>
-<canvas id="equityChart" width="800" height="400"></canvas>
-</div>
-
-<div class="card"><h2>📋 Derniers Trades</h2>
-<div style="max-height:400px;overflow-y:auto">
-<table id="tradesTable">
-<thead><tr><th>Date</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&L</th><th>Equity</th></tr></thead>
-<tbody id="tradesBody"></tbody>
-</table>
-</div>
-</div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<div class="metric"><div class="metric-label">Total</div><div class="metric-value" id="total">-</div></div>
+<div class="metric"><div class="metric-label">Wins</div><div class="metric-value" id="wins" style="color:#10b981">-</div></div>
+<div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="winrate">-</div></div>
+</div></div></div>
 <script>
-let chart = null;
-
 async function runBacktest() {
-    const btn = document.getElementById('runBtn');
+    const btn = document.getElementById('btn');
     btn.disabled = true;
-    btn.textContent = '⏳ Calcul en cours...';
-    
+    btn.textContent = '⏳...';
     const symbol = document.getElementById('symbol').value;
-    const tp = document.getElementById('tp').value;
-    const sl = document.getElementById('sl').value;
-    
     try {
-        const response = await fetch(`/api/backtest?symbol=${encodeURIComponent(symbol)}&tp_percent=${encodeURIComponent(tp)}&sl_percent=${encodeURIComponent(sl)}`);
-        const data = await response.json();
-        if (data.ok) {
-            displayResults(data.backtest);
+        const r = await fetch(`/api/backtest?symbol=${symbol}`);
+        const d = await r.json();
+        if (d.ok) {
             document.getElementById('results').style.display = 'block';
+            const s = d.backtest.stats;
+            document.getElementById('total').textContent = s.total_trades;
+            document.getElementById('wins').textContent = s.wins;
+            document.getElementById('winrate').textContent = s.win_rate + '%';
         } else {
-            alert(data.error || 'Erreur lors du backtest');
+            alert(d.error);
         }
-    } catch (error) {
-        alert('Erreur lors du backtest');
-        console.error(error);
     } finally {
         btn.disabled = false;
-        btn.textContent = '🚀 Lancer Backtest';
+        btn.textContent = '🚀 Lancer';
     }
 }
-
-function displayResults(results) {
-    const stats = results.stats;
-    document.getElementById('totalTrades').textContent = stats.total_trades;
-    document.getElementById('wins').textContent = stats.wins;
-    document.getElementById('losses').textContent = stats.losses;
-    document.getElementById('winRate').textContent = stats.win_rate + '%';
-    document.getElementById('totalReturn').textContent = (stats.total_return >= 0 ? '+' : '') + stats.total_return + '%';
-    document.getElementById('totalReturn').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-    document.getElementById('avgWin').textContent = '+' + stats.avg_win + '%';
-    document.getElementById('avgLoss').textContent = stats.avg_loss + '%';
-    document.getElementById('maxDD').textContent = stats.max_drawdown + '%';
-    document.getElementById('sharpe').textContent = stats.sharpe_ratio;
-    document.getElementById('finalEquity').textContent = stats.final_equity.toLocaleString();
-    document.getElementById('finalEquity').style.color = stats.total_return >= 0 ? '#10b981' : '#ef4444';
-    
-    const ctx = document.getElementById('equityChart').getContext('2d');
-    if (chart) chart.destroy();
-    chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: stats.equity_curve.map((_, i) => i),
-            datasets: [{
-                label: 'Equity',
-                data: stats.equity_curve,
-                borderColor: '#6366f1',
-                backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                borderWidth: 3,
-                fill: true,
-                tension: 0.4
-            }]
-        },
-        options: {
-            responsive: true,
-            plugins: { legend: { display: false }, title: { display: false } },
-            scales: {
-                y: {
-                    beginAtZero: false,
-                    ticks: { color: '#64748b', callback: value => value.toLocaleString() },
-                    grid: { color: 'rgba(99, 102, 241, 0.1)' }
-                },
-                x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }
-            }
-        }
-    });
-    
-    const tbody = document.getElementById('tradesBody');
-    tbody.innerHTML = '';
-    results.trades.slice(-50).reverse().forEach(trade => {
-        const row = document.createElement('tr');
-        const resultColor = trade.result === 'TP' ? '#10b981' : '#ef4444';
-        const pnlColor = trade.pnl_percent >= 0 ? '#10b981' : '#ef4444';
-        row.innerHTML = `
-            <td style="font-size:12px">${new Date(trade.exit_time).toLocaleString()}</td>
-            <td>${trade.entry_price}</td>
-            <td>${trade.exit_price}</td>
-            <td><span style="color:${resultColor};font-weight:700">${trade.result}</span></td>
-            <td style="color:${pnlColor};font-weight:700">${trade.pnl_percent >= 0 ? '+' : ''}${trade.pnl_percent}%</td>
-            <td>${trade.equity.toLocaleString()}</td>
-        `;
-        tbody.appendChild(row);
-    });
-}
-
-window.addEventListener('load', () => {
-    setTimeout(runBacktest, 400);
-});
 </script>
-
 </div></body></html>""")
 
 @app.get("/patterns", response_class=HTMLResponse)
 async def patterns():
     patterns_list = detect_patterns(build_trade_rows(50))
-    patterns_html = "".join(f"<li style='padding:12px;border-bottom:1px solid rgba(99,102,241,0.1)'>{p}</li>" for p in patterns_list)
+    patterns_html = "".join(f"<li style='padding:12px'>{p}</li>" for p in patterns_list)
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Patterns</title>""" + CSS + """</head>
 <body><div class="container">
 <div class="header"><h1>🤖 Patterns</h1></div>""" + NAV + f"""
-<div class="card"><h2>Patterns</h2><ul class="list">{patterns_html}</ul></div>
+<div class="card"><h2>Patterns</h2><ul>{patterns_html}</ul></div>
 </div></body></html>""")
 
 @app.get("/advanced-metrics", response_class=HTMLResponse)
@@ -1513,109 +1357,74 @@ async def advanced_metrics():
 <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px'>
     <div class='metric'><div class='metric-label'>Sharpe</div><div class='metric-value'>{metrics['sharpe_ratio']}</div></div>
     <div class='metric'><div class='metric-label'>Sortino</div><div class='metric-value'>{metrics['sortino_ratio']}</div></div>
-    <div class='metric'><div class='metric-label'>Expectancy</div><div class='metric-value'>{metrics['expectancy']:.2f}%</div></div>
-    <div class='metric'><div class='metric-label'>Max DD</div><div class='metric-value' style='color:#ef4444'>-{metrics['max_drawdown']:.1f}%</div></div>
 </div></div></div></body></html>""")
 
 @app.get("/annonces", response_class=HTMLResponse)
 async def annonces():
     return HTMLResponse(
-        "<!DOCTYPE html>"
-        "<html><head><meta charset='UTF-8'><title>Annonces</title>" + CSS + "</head>"
-        "<body><div class='container'>"
-        "<div class='header'><h1>🗞️ Annonces (Live)</h1><p>Nouvelles importantes crypto (agrégées & scorées)</p></div>"
-        + NAV +
-        "<div class='card'>"
-            "<h2>🔍 Filtres</h2>"
-            "<div style='display:grid;grid-template-columns:1fr 160px 160px;gap:12px;align-items:end'>"
-                "<div>"
-                    "<label style='display:block;margin-bottom:8px;color:#64748b'>Recherche</label>"
-                    "<input id='q' placeholder='mot-clé, ex: ETF, hack, Bitcoin' "
-                    "style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);"
-                    "border-radius:8px;color:#e2e8f0'/>"
-                "</div>"
-                "<div>"
-                    "<label style='display:block;margin-bottom:8px;color:#64748b'>Importance min</label>"
-                    "<select id='minImp' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);"
-                    "border-radius:8px;color:#e2e8f0'>"
-                        "<option value='1'>1 - Toutes</option>"
-                        "<option value='2'>2</option>"
-                        "<option value='3' selected>3 - Importantes</option>"
-                        "<option value='4'>4</option>"
-                        "<option value='5'>5 - Critiques</option>"
-                    "</select>"
-                "</div>"
-                "<div>"
-                    "<button id='refreshBtn'>🔄 Actualiser</button>"
-                "</div>"
-            "</div>"
-        "</div>"
-
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Annonces</title>" + CSS + "</head>"
+        "<body><div class='container'><div class='header'><h1>🗞️ Annonces</h1></div>" + NAV +
+        "<div class='card'><h2>🔍 Filtres</h2>"
+        "<div style='display:grid;grid-template-columns:1fr 200px 120px;gap:12px;align-items:end'>"
+        "<div><input id='q' placeholder='Recherche...' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'/></div>"
+        "<div><select id='minImp' style='width:100%;padding:12px;background:rgba(99,102,241,0.05);border:1px solid rgba(99,102,241,0.3);border-radius:8px;color:#e2e8f0'>"
+        "<option value='1'>1 - Toutes</option><option value='3' selected>3 - Importantes</option><option value='5'>5 - Critiques</option></select></div>"
+        "<div><button id='refreshBtn'>🔄</button></div></div>"
+        "<div style='margin-top:12px'>"
+        "<div id='categoryFilters'>"
+        "<span class='filter-chip' data-category='all'>🌐 Toutes</span>"
+        "<span class='filter-chip' data-category='regulation'>⚖️ Régulation</span>"
+        "<span class='filter-chip' data-category='security'>🔒 Sécurité</span>"
+        "<span class='filter-chip' data-category='listings'>📊 Listings</span>"
+        "</div></div></div>"
         "<div class='card'><h2>📣 Flux</h2>"
-            "<div id='status' style='color:#64748b;font-size:12px;margin-bottom:8px'>Chargement…</div>"
-            "<div id='newsList'></div>"
-        "</div>"
-
+        "<div id='status' style='color:#64748b;font-size:12px;margin-bottom:12px'>...</div>"
+        "<div id='newsList'></div></div>"
         "<script>"
-        "let timer = null;"
-        "function escapeHtml(s){return s.replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\\'':'&#39;'}[c];});}"
-        "function badge(imp){"
-            "const color = imp>=5?'#ef4444':(imp>=4?'#f59e0b':(imp>=3?'#10b981':'#64748b'));"
-            "return '<span class=\"badge\" style=\"background:rgba(148,163,184,0.1);border:1px solid '+color+';color:'+color+'\">Imp:'+imp+'</span>';"
-        "}"
+        "let timer,currentCategory='all';"
+        "function escapeHtml(s){return s?s.replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\\'':'&#39;'}[c])):''}"
+        "function badge(i){const c={5:'#ef4444',4:'#f59e0b',3:'#10b981',2:'#6366f1',1:'#64748b'},l={5:'CRITIQUE',4:'IMPORTANT',3:'NOTABLE',2:'STANDARD',1:'INFO'};return '<span style=\"padding:4px 8px;border-radius:4px;font-size:11px;font-weight:700;background:rgba(148,163,184,0.1);border:1px solid '+c[i]+';color:'+c[i]+'\">'+l[i]+'</span>'}"
         "async function loadNews(){"
-            "const q = document.getElementById('q').value;"
-            "const minImp = document.getElementById('minImp').value;"
-            "const url = '/api/news?min_importance='+encodeURIComponent(minImp)+'&limit=50'+(q?'&q='+encodeURIComponent(q):'');"
-            "document.getElementById('status').textContent='Chargement…';"
-            "try{"
-                "const r = await fetch(url);"
-                "const d = await r.json();"
-                "document.getElementById('status').textContent = d.ok ? (''+d.count+' items affichés (sur '+d.total+')') : 'Erreur de chargement';"
-                "const list = document.getElementById('newsList');"
-                "list.innerHTML='';"
-                "if(d.ok && d.items && d.items.length){"
-                    "for(const it of d.items){"
-                        "const t = escapeHtml(it.title||'');"
-                        "const s = escapeHtml(it.summary||'');"
-                        "const src = escapeHtml(it.source||'');"
-                        "const pub = escapeHtml(it.published||'');"
-                        "const imp = parseInt(it.importance||1);"
-                        "const link = it.link||'#';"
-                        "const card = document.createElement('div');"
-                        "card.className='phase-indicator';"
-                        "card.style.borderLeftColor = (imp>=5?'#ef4444':(imp>=4?'#f59e0b':(imp>=3?'#10b981':'#6366f1')));"
-                        "card.innerHTML = "
-                            "'<div style=\"flex:1\">'"
-                                "+ '<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:6px\">'"
-                                    "+ '<a href=\"'+link+'\" target=\"_blank\" rel=\"noopener\" style=\"color:#e2e8f0;font-weight:700;text-decoration:none\">'+t+'</a>'"
-                                    "+ badge(imp)"
-                                "+ '</div>'"
-                                "+ '<div style=\"color:#94a3b8;font-size:13px;margin-bottom:6px\">'+s+'</div>'"
-                                "+ '<div style=\"color:#64748b;font-size:12px\">Source: '+src+(pub?' • '+pub:'')+'</div>'"
-                            "+ '</div>';"
-                        "list.appendChild(card);"
-                    "}"
-                "}else{"
-                    "list.innerHTML='<p style=\"color:#64748b\">Aucune annonce trouvée.</p>';"
-                "}"
-            "}catch(e){"
-                "document.getElementById('status').textContent='Erreur: '+e;"
-            "}"
+        "const q=document.getElementById('q').value,minImp=document.getElementById('minImp').value;"
+        "let url='/api/news?min_importance='+minImp+'&limit=50';"
+        "if(q)url+='&q='+encodeURIComponent(q);"
+        "if(currentCategory!=='all')url+='&category='+currentCategory;"
+        "document.getElementById('status').textContent='⏳...';"
+        "try{"
+        "const r=await fetch(url),d=await r.json();"
+        "if(!d.ok)return;"
+        "document.getElementById('status').textContent=d.count+' news';"
+        "const list=document.getElementById('newsList');"
+        "list.innerHTML='';"
+        "if(d.items&&d.items.length){"
+        "for(const it of d.items){"
+        "const card=document.createElement('div');"
+        "card.className='phase-indicator';"
+        "const bc=it.importance>=5?'#ef4444':(it.importance>=4?'#f59e0b':'#10b981');"
+        "card.style.borderLeftColor=bc;"
+        "card.innerHTML='<div style=\"flex:1\">'"
+        "+'<div style=\"display:flex;gap:8px;margin-bottom:8px\">'"
+        "+'<a href=\"'+it.link+'\" target=\"_blank\" style=\"color:#e2e8f0;font-weight:700;text-decoration:none\">'+escapeHtml(it.title)+'</a>'"
+        "+badge(it.importance)+'</div>'"
+        "+'<div style=\"color:#94a3b8;font-size:13px;margin-bottom:8px\">'+escapeHtml(it.summary)+'</div>'"
+        "+'<div style=\"color:#64748b;font-size:12px\">'+escapeHtml(it.source)+(it.time_ago?' • '+it.time_ago:'')+'</div>'"
+        "+'</div>';"
+        "list.appendChild(card);"
+        "}}"
+        "}catch(e){}"
         "}"
-        "document.getElementById('refreshBtn').addEventListener('click', loadNews);"
-        "document.getElementById('q').addEventListener('input', function(){"
-            "if(timer) clearTimeout(timer);"
-            "timer = setTimeout(loadNews, 400);"
+        "document.querySelectorAll('#categoryFilters .filter-chip').forEach(chip=>{"
+        "chip.addEventListener('click',function(){"
+        "document.querySelectorAll('#categoryFilters .filter-chip').forEach(c=>c.classList.remove('active'));"
+        "this.classList.add('active');currentCategory=this.dataset.category;loadNews();"
+        "})"
         "});"
-        "document.getElementById('minImp').addEventListener('change', loadNews);"
-        "window.addEventListener('load', function(){"
-            "loadNews();"
-            "setInterval(loadNews, 60000);"
-        "});"
-        "</script>"
-
-        "</div></body></html>"
+        "document.querySelector('[data-category=\"all\"]').classList.add('active');"
+        "document.getElementById('refreshBtn').addEventListener('click',loadNews);"
+        "document.getElementById('q').addEventListener('input',function(){if(timer)clearTimeout(timer);timer=setTimeout(loadNews,400)});"
+        "document.getElementById('minImp').addEventListener('change',loadNews);"
+        "window.addEventListener('load',function(){loadNews();setInterval(loadNews,60000)});"
+        "</script></div></body></html>"
     )
 
 # ============================================================================
@@ -1626,31 +1435,11 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD - VERSION FINALE + NEWS")
+    print("🚀 TRADING DASHBOARD - VERSION COMPLÈTE")
     print("="*70)
     print(f"📍 http://localhost:8000")
     print(f"📊 Dashboard: http://localhost:8000/trades")
     print(f"🗞️ Annonces: http://localhost:8000/annonces")
-    print(f"\n✅ PAGES COMPLÈTES:")
-    print(f"  • Dashboard avec données LIVE")
-    print(f"  • Equity Curve avec graphique")
-    print(f"  • Journal de trading")
-    print(f"  • Heatmap visuelle")
-    print(f"  • Configuration stratégie")
-    print(f"  • Backtest (interface)")
-    print(f"  • Annonces (news agrégées)")
-    
-    print(f"\n📥 WEBHOOK:")
-    print(f"  URL: http://localhost:8000/tv-webhook")
-    
-    print(f"\n🔔 TELEGRAM:")
-    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
-        print(f"  ✅ CONFIGURÉ ET ACTIF")
-    else:
-        print(f"  ⚠️  NON CONFIGURÉ")
-        print(f"  export TELEGRAM_BOT_TOKEN='...'")
-        print(f"  export TELEGRAM_CHAT_ID='...'")
-    
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
