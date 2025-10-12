@@ -2,7 +2,7 @@
 """
 Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces Améliorées + PATCHES
 Toutes les corrections et améliorations incluses
-"""
+""
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
