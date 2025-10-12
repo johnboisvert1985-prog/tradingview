@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces (News Live)
-Collez ce fichier entier dans main.py
+Version corrigée avec tous les patchs
 """
 
 from fastapi import FastAPI, Request
@@ -168,13 +168,13 @@ async def fetch_global_crypto_data() -> Dict[str, Any]:
     return market_cache.global_data or {}
 
 def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, Any]) -> Dict[str, Any]:
-    btc_dominance = global_data.get('btc_dominance', 50)
-    fg_value = fear_greed.get('value', 50)
+    btc_dominance = global_data.get('btc_dominance', 48)  # Valeur par défaut plus réaliste
+    fg_value = fear_greed.get('value', 60)  # Valeur par défaut plus optimiste
     
     # Phases : 0=Bear/Accumulation, 1=BTC Season, 2=ETH/Large-Cap, 3=Altcoin Season
-    if btc_dominance >= 50 and fg_value < 45:
+    if btc_dominance >= 55 and fg_value < 40:
         phase, phase_name, emoji, color, description = 0, "Phase 0: Accumulation / Bear", "🐻", "#64748b", "Marché prudent / accumulation"
-    elif btc_dominance > 48:
+    elif btc_dominance > 50:
         phase, phase_name, emoji, color, description = 1, "Phase 1: Bitcoin Season", "₿", "#f7931a", "Bitcoin domine"
     elif btc_dominance > 45:
         phase, phase_name, emoji, color, description = 2, "Phase 2: ETH & Large-Cap", "💎", "#627eea", "Rotation vers ETH & large caps"
@@ -301,7 +301,7 @@ asyncio.get_event_loop().create_task(init_demo())
 
 async def send_telegram_message(message: str) -> bool:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram non configuré")
+        logger.warning("⚠️ Telegram non configuré (TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant)")
         return False
     
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -309,16 +309,20 @@ async def send_telegram_message(message: str) -> bool:
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status == 200:
-                    logger.info("✅ Telegram envoyé")
+                    logger.info("✅ Telegram: Message envoyé avec succès")
                     return True
                 else:
                     txt = await response.text()
-                    logger.error(f"❌ Telegram: {response.status} {txt}")
+                    logger.error(f"❌ Telegram API Error: {response.status}")
+                    logger.error(f"   Response: {txt[:500]}")
                     return False
+    except asyncio.TimeoutError:
+        logger.error(f"❌ Telegram: Timeout après 15s")
+        return False
     except Exception as e:
-        logger.error(f"❌ Telegram: {str(e)}")
+        logger.error(f"❌ Telegram Exception: {type(e).__name__}: {str(e)}")
         return False
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
@@ -480,7 +484,11 @@ def score_importance(title: str, summary: str) -> int:
 
 async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/rss+xml, application/xml, text/xml'
+        }
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), headers=headers) as resp:
             if resp.status != 200:
                 logger.warning(f"⚠️ RSS {url} status {resp.status}")
                 return []
@@ -488,12 +496,38 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
             items = []
             try:
                 root = ET.fromstring(raw)
-            except ET.ParseError:
-                logger.error(f"❌ RSS parse error: {url}")
+            except ET.ParseError as e:
+                logger.error(f"❌ RSS parse error: {url} - {str(e)[:100]}")
                 return []
+            
+            # Essayer différents formats RSS/Atom
             channel = root.find("./channel")
             if channel is None:
+                # Peut-être un feed Atom
+                for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
+                    title_el = entry.find("{http://www.w3.org/2005/Atom}title")
+                    link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                    updated_el = entry.find("{http://www.w3.org/2005/Atom}updated")
+                    summary_el = entry.find("{http://www.w3.org/2005/Atom}summary")
+                    
+                    if title_el is not None and link_el is not None:
+                        title = (title_el.text or "").strip()
+                        link = link_el.get('href', '').strip()
+                        pub_date = (updated_el.text if updated_el is not None else "").strip()
+                        desc = (summary_el.text if summary_el is not None else "").strip()
+                        source = urlparse(url).netloc
+                        
+                        clean_desc = re.sub("<[^<]+?>", "", desc)[:500].strip()
+                        items.append({
+                            "title": title,
+                            "link": link,
+                            "source": source,
+                            "published": pub_date,
+                            "summary": clean_desc,
+                        })
+                logger.info(f"✅ RSS {urlparse(url).netloc}: {len(items)} items (Atom)")
                 return items
+            
             for it in channel.findall("item"):
                 title = (it.findtext("title") or "").strip()
                 link = (it.findtext("link") or "").strip()
@@ -511,9 +545,13 @@ async def fetch_rss(session: aiohttp.ClientSession, url: str) -> list[dict]:
                     "published": pub_date,
                     "summary": clean_desc,
                 })
+            logger.info(f"✅ RSS {source}: {len(items)} items")
             return items
+    except asyncio.TimeoutError:
+        logger.error(f"❌ RSS timeout: {url}")
+        return []
     except Exception as e:
-        logger.error(f"❌ RSS fetch error {url}: {e}")
+        logger.error(f"❌ RSS fetch error {url}: {str(e)[:100]}")
         return []
 
 async def fetch_all_news() -> list[dict]:
@@ -582,9 +620,9 @@ async def api_bullrun_phase():
     # Ajout de la note explicative des 4 phases
     phase_note = (
         "Phases du cycle: "
-        "0) Accumulation/Bear — BTC.D élevé (≥50) & F&G <45; "
-        "1) Bitcoin Season — BTC.D >48; "
-        "2) ETH & Large-Cap — 45< BTC.D ≤48; "
+        "0) Accumulation/Bear — BTC.D élevé (≥55) & F&G <40; "
+        "1) Bitcoin Season — BTC.D >50; "
+        "2) ETH & Large-Cap — 45< BTC.D ≤50; "
         "3) Altcoin Season — BTC.D ≤45. "
         "La confiance augmente avec F&G (>55, >75)."
     )
@@ -602,6 +640,37 @@ async def api_bullrun_phase():
                 "small_alts": {"avg_performance_30d": 0, "trades": len([t for t in trading_state.trades if t.get('row_state') == 'normal'])}
             },
             "note": phase_note
+        }
+    }
+
+@app.get("/api/telegram-test")
+async def telegram_test():
+    """Test de connexion Telegram"""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return {
+            "ok": False, 
+            "error": "Configuration manquante",
+            "details": {
+                "bot_token_present": bool(settings.TELEGRAM_BOT_TOKEN),
+                "chat_id_present": bool(settings.TELEGRAM_CHAT_ID)
+            }
+        }
+    
+    test_message = f"""🧪 <b>TEST TELEGRAM</b>
+
+✅ Connexion réussie !
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Ce message confirme que votre bot Telegram fonctionne correctement."""
+    
+    success = await send_telegram_message(test_message)
+    
+    return {
+        "ok": success,
+        "message": "Message envoyé avec succès" if success else "Échec de l'envoi",
+        "config": {
+            "bot_token": settings.TELEGRAM_BOT_TOKEN[:10] + "..." if settings.TELEGRAM_BOT_TOKEN else None,
+            "chat_id": settings.TELEGRAM_CHAT_ID
         }
     }
 
@@ -704,8 +773,13 @@ async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1
             "limit": min(limit, 1000)
         }
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/json'
+        }
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=60)) as response:
                 if response.status == 200:
                     data = await response.json()
                     klines = []
@@ -721,8 +795,12 @@ async def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1
                     logger.info(f"✅ Binance: {len(klines)} klines pour {symbol}")
                     return klines
                 else:
-                    logger.error(f"❌ Binance API: {response.status}")
+                    text = await response.text()
+                    logger.error(f"❌ Binance API: {response.status} - {text[:200]}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error(f"❌ Binance: Timeout après 60s")
+        return None
     except Exception as e:
         logger.error(f"❌ Binance: {str(e)}")
         return None
@@ -1042,7 +1120,6 @@ async def trades():
     
     patterns_html = "".join(f'<li style="padding:8px">{p}</li>' for p in patterns)
     
-    # f-string -> doubler les accolades dans JS
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><title>Dashboard</title><meta charset="UTF-8">{CSS}</head>
 <body><div class="container">
@@ -1056,9 +1133,9 @@ async def trades():
         <div class="card" style="margin-top:12px">
             <h2>ℹ️ Phases & critères</h2>
             <ul class="small" style="margin-top:8px;line-height:1.6">
-                <li><b>Phase 0</b> — Accumulation/Bear: BTC.D ≥ 50% & F&G &lt; 45</li>
-                <li><b>Phase 1</b> — Bitcoin Season: BTC.D &gt; 48%</li>
-                <li><b>Phase 2</b> — ETH & Large-Cap: 45% &lt; BTC.D ≤ 48%</li>
+                <li><b>Phase 0</b> — Accumulation/Bear: BTC.D ≥ 55% & F&G &lt; 40</li>
+                <li><b>Phase 1</b> — Bitcoin Season: BTC.D &gt; 50%</li>
+                <li><b>Phase 2</b> — ETH & Large-Cap: 45% &lt; BTC.D ≤ 50%</li>
                 <li><b>Phase 3</b> — Altcoin Season: BTC.D ≤ 45%</li>
                 <li>Confiance augmentée si F&G &gt; 55 (forte au-delà de 75)</li>
             </ul>
@@ -1193,6 +1270,8 @@ fetch('/api/heatmap').then(r=>r.json()).then(d=>{
 @app.get("/strategie", response_class=HTMLResponse)
 async def strategie():
     telegram_ok = bool(settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID)
+    telegram_status = '✅ Configuré' if telegram_ok else '⚠️ Non configuré (ajoutez TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID dans les variables d\'environnement Render)'
+    
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Stratégie</title>""" + CSS + """</head>
 <body><div class="container">
@@ -1211,14 +1290,50 @@ async def strategie():
 
 <div class="card"><h2>🔔 Telegram</h2>
 <p style="color:{'#10b981' if telegram_ok else '#ef4444'}">
-{ '✅ Configuré' if telegram_ok else '⚠️ Non configuré (ajoutez TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)' }
-</p></div>
+{telegram_status}
+</p>
+<button onclick="testTelegram()" id="telegramBtn" style="margin-top:12px">🧪 Tester Telegram</button>
+<div id="telegramResult" style="margin-top:12px;padding:12px;border-radius:8px;display:none"></div>
+</div>
+
+<script>
+async function testTelegram() {{
+    const btn = document.getElementById('telegramBtn');
+    const result = document.getElementById('telegramResult');
+    btn.disabled = true;
+    btn.textContent = '⏳ Test en cours...';
+    result.style.display = 'none';
+    
+    try {{
+        const response = await fetch('/api/telegram-test');
+        const data = await response.json();
+        
+        result.style.display = 'block';
+        if (data.ok) {{
+            result.style.background = 'rgba(16, 185, 129, 0.2)';
+            result.style.color = '#10b981';
+            result.innerHTML = '✅ ' + data.message + '<br><small>Vérifiez votre Telegram !</small>';
+        }} else {{
+            result.style.background = 'rgba(239, 68, 68, 0.2)';
+            result.style.color = '#ef4444';
+            result.innerHTML = '❌ ' + (data.error || data.message) + '<br><small>' + JSON.stringify(data.details || {{}}, null, 2) + '</small>';
+        }}
+    }} catch (error) {{
+        result.style.display = 'block';
+        result.style.background = 'rgba(239, 68, 68, 0.2)';
+        result.style.color = '#ef4444';
+        result.innerHTML = '❌ Erreur: ' + error.message;
+    }} finally {{
+        btn.disabled = false;
+        btn.textContent = '🧪 Tester Telegram';
+    }}
+}}
+</script>
 
 </div></body></html>""")
 
 @app.get("/backtest", response_class=HTMLResponse)
 async def backtest():
-    # page front : on utilise JS pour appeler /api/backtest
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Backtest</title>""" + CSS + """</head>
 <body><div class="container">
