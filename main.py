@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces Améliorées
+Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces Améliorées + PATCHES
 Toutes les corrections et améliorations incluses
 """
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.2.0")
+app = FastAPI(title="Trading Dashboard", version="2.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -471,7 +471,7 @@ def calc_metrics(rows):
     }
 
 # ============================================================================
-# NEWS (RSS) - VERSION AMÉLIORÉE
+# NEWS (RSS) - VERSION AMÉLIORÉE + PATCH TIMEZONE
 # ============================================================================
 
 KEYWORDS_BY_CATEGORY = {
@@ -596,6 +596,7 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                 logger.error(f"❌ RSS parse error: {url} - {str(e)[:100]}")
                 return []
             
+            # PATCH: Utiliser datetime timezone-naive pour la comparaison
             cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
             
             channel = root.find("./channel")
@@ -611,10 +612,13 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                     
                     item_time = None
                     try:
-                        item_time = parsedate_to_datetime(pub_date)
+                        # PATCH: Parser et convertir en naive datetime
+                        parsed = parsedate_to_datetime(pub_date)
+                        item_time = parsed.replace(tzinfo=None)
                     except:
                         pass
                     
+                    # Comparer seulement si on a une date valide
                     if item_time and item_time < cutoff_time:
                         continue
                     
@@ -630,6 +634,7 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                         "summary": clean_desc,
                     })
             else:
+                # Atom feed
                 for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
                     title_el = entry.find("{http://www.w3.org/2005/Atom}title")
                     link_el = entry.find("{http://www.w3.org/2005/Atom}link")
@@ -646,7 +651,9 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                     
                     item_time = None
                     try:
-                        item_time = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                        # PATCH: Parser ISO et convertir en naive
+                        parsed = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                        item_time = parsed.replace(tzinfo=None)
                     except:
                         pass
                     
@@ -713,7 +720,7 @@ async def fetch_all_news_improved() -> list[dict]:
         
         if it.get("published_dt"):
             try:
-                delta = datetime.now() - it["published_dt"].replace(tzinfo=None)
+                delta = datetime.now() - it["published_dt"]
                 if delta.days > 0:
                     it["time_ago"] = f"il y a {delta.days}j"
                 elif delta.seconds >= 3600:
@@ -1035,55 +1042,191 @@ async def api_backtest(
     }
 
 # ============================================================================
-# WEBHOOK
+# WEBHOOK - VERSION PATCHÉE
 # ============================================================================
 
 @app.post("/tv-webhook")
 async def webhook(request: Request):
     try:
-        payload = await request.json()
+        # Lecture du body brut pour debug
+        body = await request.body()
+        
+        # Vérifier si le body est vide
+        if not body:
+            logger.error("❌ Webhook: Body vide")
+            return JSONResponse(
+                {"status": "error", "message": "Body vide"}, 
+                status_code=400
+            )
+        
+        # Tenter de parser le JSON
+        try:
+            payload = await request.json()
+        except Exception as json_err:
+            logger.error(f"❌ Webhook JSON parse: {json_err}")
+            logger.error(f"Body reçu: {body.decode('utf-8', errors='ignore')[:500]}")
+            return JSONResponse(
+                {"status": "error", "message": "JSON invalide"}, 
+                status_code=400
+            )
+        
         logger.info(f"📥 Webhook: {payload}")
         
-        action = payload.get("action")
+        # PATCH: Supporter 'type' ET 'action'
+        action = payload.get("type") or payload.get("action")
+        if not action:
+            return JSONResponse(
+                {"status": "error", "message": "Champ 'type' ou 'action' manquant"}, 
+                status_code=400
+            )
+        
+        # Normaliser l'action (ENTRY -> entry, TP2_HIT -> tp_hit)
+        action = action.lower()
+        
         symbol = payload.get("symbol")
         side = payload.get("side", "LONG")
         
+        if not symbol:
+            return JSONResponse(
+                {"status": "error", "message": "Symbol manquant"}, 
+                status_code=400
+            )
+        
+        # Gestion ENTRY
         if action == "entry":
             new_trade = {
                 'symbol': symbol,
-                'tf_label': payload.get("timeframe", "15m"),
+                'tf_label': payload.get("tf_label") or (payload.get("tf", "15") + "m"),
                 'side': side,
                 'entry': payload.get("entry"),
-                'tp': payload.get("tp"),
+                'tp': payload.get("tp") or payload.get("tp1"),  # Support tp ou tp1
                 'sl': payload.get("sl"),
                 'row_state': 'normal'
             }
+            
+            # Validation
+            if not all([new_trade['entry'], new_trade['tp'], new_trade['sl']]):
+                return JSONResponse(
+                    {"status": "error", "message": "entry/tp/sl manquants"}, 
+                    status_code=400
+                )
+            
             trading_state.add_trade(new_trade)
             await notify_new_trade(new_trade)
-            return JSONResponse({"status": "ok", "trade_id": new_trade.get('id')})
-            
-        elif action in ["tp_hit", "sl_hit"]:
+            return JSONResponse({
+                "status": "ok", 
+                "trade_id": new_trade.get('id'),
+                "message": f"Trade {symbol} créé"
+            })
+        
+        # Gestion TP (TP_HIT, TP1_HIT, TP2_HIT, TP3_HIT)
+        elif action.startswith("tp") and "hit" in action:
             for trade in trading_state.trades:
                 if (trade.get('symbol') == symbol and 
                     trade.get('row_state') == 'normal' and
                     trade.get('side') == side):
                     
-                    exit_price = payload.get('tp' if action == 'tp_hit' else 'sl')
-                    result = 'tp' if action == 'tp_hit' else 'sl'
+                    # Prix de sortie
+                    exit_price = (
+                        payload.get('price') or 
+                        payload.get('tp') or 
+                        trade.get('tp')
+                    )
                     
-                    if trading_state.close_trade(trade['id'], result, exit_price or trade.get(result)):
-                        if action == 'tp_hit':
-                            await notify_tp_hit(trade)
-                        else:
-                            await notify_sl_hit(trade)
-                        return JSONResponse({"status": "ok", "trade_id": trade['id']})
+                    if trading_state.close_trade(trade['id'], 'tp', exit_price):
+                        await notify_tp_hit(trade)
+                        return JSONResponse({
+                            "status": "ok", 
+                            "trade_id": trade['id'],
+                            "message": f"TP hit sur {symbol}"
+                        })
             
-            return JSONResponse({"status": "warning", "message": f"Trade non trouvé: {symbol}"})
+            return JSONResponse({
+                "status": "warning", 
+                "message": f"Trade non trouvé: {symbol} {side}"
+            })
         
-        return JSONResponse({"status": "error", "message": f"Action inconnue: {action}"}, status_code=400)
+        # Gestion SL (SL_HIT)
+        elif action.startswith("sl") and "hit" in action:
+            for trade in trading_state.trades:
+                if (trade.get('symbol') == symbol and 
+                    trade.get('row_state') == 'normal' and
+                    trade.get('side') == side):
+                    
+                    exit_price = (
+                        payload.get('price') or 
+                        payload.get('sl') or 
+                        trade.get('sl')
+                    )
+                    
+                    if trading_state.close_trade(trade['id'], 'sl', exit_price):
+                        await notify_sl_hit(trade)
+                        return JSONResponse({
+                            "status": "ok", 
+                            "trade_id": trade['id'],
+                            "message": f"SL hit sur {symbol}"
+                        })
+            
+            return JSONResponse({
+                "status": "warning", 
+                "message": f"Trade non trouvé: {symbol} {side}"
+            })
+        
+        # Action non reconnue
+        return JSONResponse(
+            {"status": "error", "message": f"Action non supportée: {action}"}, 
+            status_code=400
+        )
+        
     except Exception as e:
-        logger.error(f"❌ Webhook: {str(e)}")
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        logger.error(f"❌ Webhook exception: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return JSONResponse(
+            {"status": "error", "message": str(e)}, 
+            status_code=500
+        )
+
+# ============================================================================
+# ROUTE DEBUG WEBHOOK
+# ============================================================================
+
+@app.post("/webhook-debug")
+async def webhook_debug(request: Request):
+    """Endpoint pour déboguer les webhooks"""
+    headers = dict(request.headers)
+    body = await request.body()
+    
+    return {
+        "headers": headers,
+        "body": body.decode('utf-8', errors='ignore'),
+        "content_type": headers.get('content-type'),
+        "body_length": len(body)
+    }
+
+@app.post("/test-webhook")
+async def test_webhook():
+    """Envoyer un webhook de test"""
+    test_payload = {
+        "type": "ENTRY",
+        "symbol": "BTCUSDT",
+        "tf": "15",
+        "side": "LONG",
+        "entry": 65000,
+        "tp": 66950,
+        "sl": 63700
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://localhost:8000/tv-webhook",
+                json=test_payload
+            ) as resp:
+                result = await resp.json()
+                return {"test_payload": test_payload, "result": result}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ============================================================================
 # ROUTES HTML
@@ -1435,11 +1578,13 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD - VERSION COMPLÈTE")
+    print("🚀 TRADING DASHBOARD - VERSION COMPLÈTE + PATCHES")
     print("="*70)
     print(f"📍 http://localhost:8000")
     print(f"📊 Dashboard: http://localhost:8000/trades")
     print(f"🗞️ Annonces: http://localhost:8000/annonces")
+    print(f"🔧 Webhook: http://localhost:8000/tv-webhook")
+    print(f"🧪 Test: http://localhost:8000/test-webhook")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
