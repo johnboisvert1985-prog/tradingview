@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION FINALE COMPLÈTE + Annonces Améliorées + PATCHES
-Toutes les corrections et améliorations incluses
-""
+Trading Dashboard - VERSION FINALE COMPLÈTE + TOUS LES PATCHES
+Webhook corrigé + RSS timezone fixé + Status 202 supporté
+"""
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-app = FastAPI(title="Trading Dashboard", version="2.2.1")
+app = FastAPI(title="Trading Dashboard", version="2.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -471,7 +471,7 @@ def calc_metrics(rows):
     }
 
 # ============================================================================
-# NEWS (RSS) - VERSION AMÉLIORÉE + PATCH TIMEZONE
+# NEWS (RSS) - VERSION FINALE PATCHÉE
 # ============================================================================
 
 KEYWORDS_BY_CATEGORY = {
@@ -578,12 +578,19 @@ def score_importance_advanced(title: str, summary: str, source: str) -> dict:
 
 async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_hours: int = 48) -> list[dict]:
     try:
+        # PATCH: User-Agent amélioré + headers complets
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/rss+xml, application/xml, text/xml'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
+            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+            'Accept-Language': 'en-US,en;q=0.9,fr;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache'
         }
+        
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers=headers) as resp:
-            if resp.status != 200:
+            # PATCH: Accepter 200 ET 202 (Binance utilise 202)
+            if resp.status not in [200, 202]:
                 logger.warning(f"⚠️ RSS {url} status {resp.status}")
                 return []
             
@@ -596,7 +603,7 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                 logger.error(f"❌ RSS parse error: {url} - {str(e)[:100]}")
                 return []
             
-            # PATCH: Utiliser datetime timezone-naive pour la comparaison
+            # PATCH: Datetime timezone-naive
             cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
             
             channel = root.find("./channel")
@@ -612,13 +619,12 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                     
                     item_time = None
                     try:
-                        # PATCH: Parser et convertir en naive datetime
+                        # PATCH: Convertir en naive datetime
                         parsed = parsedate_to_datetime(pub_date)
                         item_time = parsed.replace(tzinfo=None)
                     except:
                         pass
                     
-                    # Comparer seulement si on a une date valide
                     if item_time and item_time < cutoff_time:
                         continue
                     
@@ -1042,7 +1048,7 @@ async def api_backtest(
     }
 
 # ============================================================================
-# WEBHOOK - VERSION PATCHÉE
+# WEBHOOK - VERSION FINALE PATCHÉE
 # ============================================================================
 
 @app.post("/tv-webhook")
@@ -1188,7 +1194,7 @@ async def webhook(request: Request):
         )
 
 # ============================================================================
-# ROUTE DEBUG WEBHOOK
+# ROUTES DEBUG
 # ============================================================================
 
 @app.post("/webhook-debug")
@@ -1578,13 +1584,19 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD - VERSION COMPLÈTE + PATCHES")
+    print("🚀 TRADING DASHBOARD - VERSION FINALE COMPLÈTE")
     print("="*70)
     print(f"📍 http://localhost:8000")
     print(f"📊 Dashboard: http://localhost:8000/trades")
     print(f"🗞️ Annonces: http://localhost:8000/annonces")
     print(f"🔧 Webhook: http://localhost:8000/tv-webhook")
     print(f"🧪 Test: http://localhost:8000/test-webhook")
+    print(f"🐛 Debug: http://localhost:8000/webhook-debug")
+    print("="*70)
+    print("📦 Version: 2.2.2")
+    print("✅ Webhook patché (type/action)")
+    print("✅ RSS timezone fixé")
+    print("✅ Status 202 supporté")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
