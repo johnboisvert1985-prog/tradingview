@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION CORRIGÉE v2.5.1
-✅ Toutes les routes HTML ajoutées
-✅ Gestion des erreurs webhook améliorée
-✅ Code 100% fonctionnel
+Trading Dashboard - VERSION CORRIGÉE v2.5.2
+✅ Dashboard JavaScript corrigé
+✅ API /api/trades ajoutée
+✅ Affichage des trades fonctionnel
 """
 
 from fastapi import FastAPI, Request
@@ -18,13 +18,14 @@ import os
 import asyncio
 import random
 import re
+import json
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Trading Dashboard", version="2.5.1")
+app = FastAPI(title="Trading Dashboard", version="2.5.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -263,6 +264,25 @@ class TradingState:
             'initial_capital': settings.INITIAL_CAPITAL,
             'total_return': total_return
         }
+    
+    def get_trades_json(self) -> List[Dict[str, Any]]:
+        """Retourne les trades dans un format JSON-safe"""
+        trades_json = []
+        for trade in self.trades:
+            trade_dict = {
+                'id': trade.get('id'),
+                'symbol': trade.get('symbol'),
+                'side': trade.get('side'),
+                'entry': trade.get('entry'),
+                'tp': trade.get('tp'),
+                'sl': trade.get('sl'),
+                'row_state': trade.get('row_state'),
+                'tf_label': trade.get('tf_label'),
+                'pnl_percent': round(trade.get('pnl_percent', 0), 2),
+                'timestamp': trade.get('timestamp').isoformat() if trade.get('timestamp') else None
+            }
+            trades_json.append(trade_dict)
+        return trades_json
 
 trading_state = TradingState()
 
@@ -665,6 +685,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .card h2 { font-size: 20px; margin-bottom: 16px; color: #6366f1; font-weight: 700; }
 .grid { display: grid; gap: 20px; margin-bottom: 20px; }
 .grid-3 { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.grid-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .metric { background: #1e293b; border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 12px; padding: 24px; text-align: center; }
 .metric-label { font-size: 12px; color: #64748b; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
 .metric-value { font-size: 36px; font-weight: bold; color: #6366f1; }
@@ -713,6 +734,11 @@ NAV = """<div class="nav">
 </div>"""
 
 # ==================== API ENDPOINTS ====================
+
+@app.get("/api/trades")
+async def api_trades():
+    """API pour récupérer les trades au format JSON"""
+    return {"ok": True, "trades": trading_state.get_trades_json()}
 
 @app.get("/api/fear-greed")
 async def api_fear_greed():
@@ -865,7 +891,6 @@ async def webhook(request: Request):
             logger.warning("⚠️ Webhook: JSON invalide")
             return JSONResponse({"status": "error", "message": "JSON invalide"}, status_code=400)
         
-        # Log du payload reçu
         logger.info(f"📥 Webhook reçu: {payload}")
         
         action = (payload.get("type") or payload.get("action") or "").lower()
@@ -933,7 +958,7 @@ async def home():
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Dashboard</title>""" + CSS + """</head>
 <body><div class="container">
-<div class="header"><h1>🚀 Trading Dashboard v2.5.1</h1><p>Système complet <span class="live-badge">LIVE</span></p></div>""" + NAV + """
+<div class="header"><h1>🚀 Trading Dashboard v2.5.2</h1><p>Système complet <span class="live-badge">LIVE</span></p></div>""" + NAV + """
 <div class="card" style="text-align:center;">
 <h2>Dashboard Professionnel de Trading</h2>
 <p style="color:#94a3b8;margin:20px 0;">✅ Données réelles • ✅ News 100% FR • ✅ Auto-refresh • ✅ Bull Run Phase</p>
@@ -951,9 +976,6 @@ async def trades_page():
 <html><head><meta charset="UTF-8"><title>Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 {CSS}
-<style>
-.grid-4 {{ grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }}
-</style>
 </head>
 <body>
 <div class="container">
@@ -1016,14 +1038,20 @@ async def trades_page():
 <script>
 async function loadDashboard() {{
     try {{
-        const statsRes = await fetch('/api/stats');
-        const stats = await statsRes.json();
+        // Charger les trades via API
+        const tradesRes = await fetch('/api/trades');
+        const tradesData = await tradesRes.json();
+        
+        if (!tradesData.ok) {{
+            console.error('Erreur trades:', tradesData);
+            return;
+        }}
         
         const tbody = document.querySelector('#tradesTable tbody');
         tbody.innerHTML = '';
         
-        const trades = {trading_state.trades};
-        trades.slice().reverse().forEach(trade => {{
+        const trades = tradesData.trades.slice().reverse();
+        trades.forEach(trade => {{
             const row = document.createElement('tr');
             const pnl = trade.pnl_percent || 0;
             const statusBadge = trade.row_state === 'normal' ? '<span class="badge badge-yellow">ACTIF</span>' :
@@ -1046,34 +1074,42 @@ async function loadDashboard() {{
         // Fear & Greed
         const fgRes = await fetch('/api/fear-greed');
         const fgData = await fgRes.json();
-        const fg = fgData.fear_greed;
-        document.getElementById('fearGreedContainer').innerHTML = `
-            <div class="gauge"><div class="gauge-inner">
-                <div class="gauge-value">${{fg.value}}</div>
-                <div class="gauge-label">${{fg.sentiment}}</div>
-            </div></div>
-            <p style="font-size:18px;">${{fg.emoji}} ${{fg.recommendation}}</p>
-        `;
+        
+        if (fgData.ok) {{
+            const fg = fgData.fear_greed;
+            document.getElementById('fearGreedContainer').innerHTML = `
+                <div class="gauge"><div class="gauge-inner">
+                    <div class="gauge-value">${{fg.value}}</div>
+                    <div class="gauge-label">${{fg.sentiment}}</div>
+                </div></div>
+                <p style="font-size:18px;">${{fg.emoji}} ${{fg.recommendation}}</p>
+            `;
+        }}
         
         // Bull Run Phase
         const brRes = await fetch('/api/bullrun-phase');
         const brData = await brRes.json();
-        const phase = brData.bullrun_phase;
-        document.getElementById('bullrunContainer').innerHTML = `
-            <div style="text-align:center;padding:20px;">
-                <div style="font-size:48px;margin-bottom:10px;">${{phase.emoji}}</div>
-                <h3 style="color:${{phase.color}};margin-bottom:10px;">${{phase.phase_name}}</h3>
-                <p style="color:#94a3b8;margin-bottom:20px;">${{phase.description}}</p>
-                <div style="display:flex;gap:20px;justify-content:center;">
-                    <div><strong>BTC.D:</strong> ${{phase.btc_dominance}}%</div>
-                    <div><strong>F&G:</strong> ${{phase.fg}}</div>
-                    <div><strong>Confiance:</strong> ${{phase.confidence}}%</div>
+        
+        if (brData.ok) {{
+            const phase = brData.bullrun_phase;
+            document.getElementById('bullrunContainer').innerHTML = `
+                <div style="text-align:center;padding:20px;">
+                    <div style="font-size:48px;margin-bottom:10px;">${{phase.emoji}}</div>
+                    <h3 style="color:${{phase.color}};margin-bottom:10px;">${{phase.phase_name}}</h3>
+                    <p style="color:#94a3b8;margin-bottom:20px;">${{phase.description}}</p>
+                    <div style="display:flex;gap:20px;justify-content:center;">
+                        <div><strong>BTC.D:</strong> ${{phase.btc_dominance}}%</div>
+                        <div><strong>F&G:</strong> ${{phase.fg}}</div>
+                        <div><strong>Confiance:</strong> ${{phase.confidence}}%</div>
+                    </div>
                 </div>
-            </div>
-        `;
+            `;
+        }}
         
     }} catch(e) {{
-        console.error('Erreur:', e);
+        console.error('Erreur loadDashboard:', e);
+        document.getElementById('fearGreedContainer').innerHTML = '❌ Erreur de chargement';
+        document.getElementById('bullrunContainer').innerHTML = '❌ Erreur de chargement';
     }}
 }}
 
@@ -1425,7 +1461,7 @@ async def annonces_page():
 </div>
 </div>
 <script>
-setTimeout(() => window.location.reload(), 180000); // Auto-refresh toutes les 3min
+setTimeout(() => window.location.reload(), 180000);
 </script>
 </body></html>""")
 
@@ -1435,15 +1471,16 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD v2.5.1 - CODE COMPLET")
+    print("🚀 TRADING DASHBOARD v2.5.2 - CORRIGÉ")
     print("="*70)
     print(f"📍 http://localhost:8000")
     print(f"📊 Dashboard: http://localhost:8000/trades")
     print(f"🗞️ Annonces FR: http://localhost:8000/annonces")
     print("="*70)
-    print("✅ Toutes les routes HTML activées")
-    print("✅ Logs webhook améliorés")
-    print("✅ Gestion d'erreurs renforcée")
+    print("✅ API /api/trades ajoutée")
+    print("✅ JavaScript corrigé (fetch API)")
+    print("✅ Affichage des trades fonctionnel")
+    print("✅ Fear & Greed + Bull Run Phase OK")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
