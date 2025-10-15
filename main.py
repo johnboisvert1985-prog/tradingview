@@ -1199,7 +1199,7 @@ async def webhook(request: Request):
         logger.error(f"❌ Webhook erreur: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
-# ==================== HTML ROUTES (CONTINUES EN COMMENTAIRE 2/2) ====================
+# ==================== HTML ROUTES ====================
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -1318,7 +1318,6 @@ async function loadDashboard() {{
             const tp2Class = trade.tp2_hit ? 'tp-hit' : 'tp-pending';
             const tp3Class = trade.tp3_hit ? 'tp-hit' : 'tp-pending';
             
-            // Afficher avec jusqu'à 4 décimales
             const formatPrice = (p) => {{
                 if (p >= 1) return p.toFixed(2);
                 if (p >= 0.01) return p.toFixed(4);
@@ -1390,8 +1389,275 @@ setInterval(loadDashboard, 30000);
     
     return HTMLResponse(html)
 
-# Routes complètes - SUITE EN COMMENTAIRE... (equity-curve, journal, heatmap, etc.)
-# Pour raison de limite de tokens, ajoutez les routes manquantes depuis la version précédente
+# -------- NEW: Equity Curve page --------
+@app.get("/equity-curve", response_class=HTMLResponse)
+async def equity_curve_page():
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Equity Curve</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+{CSS}
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>📈 Equity Curve</h1></div>
+{NAV}
+<div class="card">
+<canvas id="equityChart" height="120"></canvas>
+</div>
+</div>
+<script>
+async function loadEq(){{
+  const res = await fetch('/api/equity-curve');
+  const data = await res.json();
+  if(!data.ok) return;
+  const labels = data.equity_curve.map(p=>new Date(p.timestamp).toLocaleString());
+  const series = data.equity_curve.map(p=>p.equity);
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  new Chart(ctx, {{
+    type: 'line',
+    data: {{ labels, datasets: [{{ label: 'Equity', data: series, tension: 0.25, borderWidth: 2, pointRadius: 0 }}] }},
+    options: {{ scales: {{ x: {{ ticks: {{ maxTicksLimit: 8 }} }}, y: {{ beginAtZero: false }} }} }}
+  }});
+}}
+loadEq();
+</script>
+</body></html>""")
+
+# -------- NEW: Journal page --------
+@app.get("/journal", response_class=HTMLResponse)
+async def journal_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Journal</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📝 Journal</h1></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Ajouter une entrée</h2>
+<div style="margin-top:10px;">
+<input id="tradeId" type="number" placeholder="Trade ID (optionnel)" style="width:160px;padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;margin-right:8px;">
+</div>
+<textarea id="entryTxt" placeholder="Votre note..."></textarea>
+<button onclick="addEntry()">Ajouter</button>
+<p id="saveMsg" style="margin-top:10px;color:#94a3b8;"></p>
+</div>
+<div class="card">
+<h2>Entrées récentes</h2>
+<div id="journalList">Chargement...</div>
+</div>
+</div>
+</div>
+<script>
+async function loadJournal(){
+  const res = await fetch('/api/journal');
+  const data = await res.json();
+  if(!data.ok){ document.getElementById('journalList').textContent='Erreur'; return; }
+  const items = data.entries.slice().reverse().map(e => `
+    <div style="border-bottom:1px solid rgba(99,102,241,.1);padding:10px 0;">
+      <div style="color:#64748b;font-size:12px;">#${e.id} • ${(new Date(e.timestamp)).toLocaleString()} ${e.trade_id?('• Trade '+e.trade_id):''}</div>
+      <div style="margin-top:6px;">${e.entry}</div>
+    </div>
+  `).join('') || '<i>Aucune entrée</i>';
+  document.getElementById('journalList').innerHTML = items;
+}
+async function addEntry(){
+  const txt = document.getElementById('entryTxt').value.trim();
+  const tid = document.getElementById('tradeId').value;
+  if(!txt){ document.getElementById('saveMsg').textContent='Veuillez écrire quelque chose.'; return; }
+  const res = await fetch('/api/journal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry:txt,trade_id:tid?Number(tid):null})});
+  const data = await res.json();
+  if(data.ok){ document.getElementById('entryTxt').value=''; document.getElementById('tradeId').value=''; document.getElementById('saveMsg').textContent='✅ Sauvegardé'; loadJournal(); }
+  else { document.getElementById('saveMsg').textContent='❌ Erreur: '+(data.error||''); }
+}
+loadJournal();
+</script>
+</body></html>""")
+
+# -------- NEW: Heatmap page --------
+@app.get("/heatmap", response_class=HTMLResponse)
+async def heatmap_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Heatmap</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔥 Heatmap Trading</h1></div>""" + NAV + """
+<div class="card">
+<div id="heatmapGrid">Chargement...</div>
+</div>
+</div>
+<script>
+async function loadHM(){
+  const res = await fetch('/api/heatmap');
+  const data = await res.json();
+  if(!data.ok){ document.getElementById('heatmapGrid').textContent='Erreur'; return; }
+  const map = data.heatmap;
+  const days = ['Monday','Tuesday','Wednesday','Thursday','Friday'];
+  const hours = Array.from({length:12}, (_,i)=> (i+8).toString().padStart(2,'0')+':00');
+  let html = '<table><thead><tr><th>Heure</th>'+days.map(d=>'<th>'+d+'</th>').join('')+'</tr></thead><tbody>';
+  for(const h of hours){
+    html += '<tr><td style="color:#94a3b8">'+h+'</td>';
+    for(const d of days){
+      const k = d+'_'+h;
+      const cell = map[k] || {winrate:0,trades:0};
+      const cls = cell.winrate>=66?'high':(cell.winrate>=55?'medium':'low');
+      html += `<td><div class="heatmap-cell ${cls}"><div><b>${cell.winrate}%</b></div><div style="font-size:12px;color:#94a3b8">${cell.trades} trades</div></div></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  document.getElementById('heatmapGrid').innerHTML = html;
+}
+loadHM();
+</script>
+</body></html>""")
+
+# -------- NEW: Strategie (UI only) --------
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>⚙️ Stratégie — Paramètres (UI)</h1></div>""" + NAV + """
+<div class="grid grid-3">
+  <div class="card">
+    <h2>Signal</h2>
+    <label>Momentum min (%)</label>
+    <input id="mom" type="range" min="0" max="10" step="0.5" value="2" oninput="upd()">
+    <div id="momv" style="margin-top:6px;color:#94a3b8;">2%</div>
+    <div style="height:12px"></div>
+    <label>Volume boost</label>
+    <input id="vol" type="range" min="0" max="3" step="0.1" value="1" oninput="upd()">
+    <div id="volv" style="margin-top:6px;color:#94a3b8;">x1.0</div>
+  </div>
+  <div class="card">
+    <h2>Gestion du risque</h2>
+    <label>Risque par trade (%)</label>
+    <input id="risk" type="range" min="0.25" max="5" step="0.25" value="2" oninput="upd()">
+    <div id="riskv" style="margin-top:6px;color:#94a3b8;">2%</div>
+    <div style="height:12px"></div>
+    <label>Max positions actives</label>
+    <input id="maxp" type="number" min="1" max="10" value="3" oninput="upd()" style="width:110px;padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;">
+  </div>
+  <div class="card">
+    <h2>Aperçu</h2>
+    <div id="preview" style="color:#94a3b8">…</div>
+  </div>
+</div>
+<script>
+function upd(){
+  const mom = Number(document.getElementById('mom').value);
+  const vol = Number(document.getElementById('vol').value);
+  const risk = Number(document.getElementById('risk').value);
+  const maxp = Number(document.getElementById('maxp').value);
+  document.getElementById('momv').textContent = mom.toFixed(1)+'%';
+  document.getElementById('volv').textContent = 'x'+vol.toFixed(1);
+  document.getElementById('riskv').textContent = risk.toFixed(2)+'%';
+  document.getElementById('preview').innerHTML = `
+    <ul style="line-height:1.8">
+      <li>Momentum ≥ <b>${mom.toFixed(1)}%</b></li>
+      <li>Boost volume: <b>x${vol.toFixed(1)}</b></li>
+      <li>Risque/trade: <b>${risk.toFixed(2)}%</b></li>
+      <li>Max positions: <b>${maxp}</b></li>
+    </ul>`;
+}
+upd();
+</script>
+</body></html>""")
+
+# -------- NEW: Backtest page --------
+@app.get("/backtest", response_class=HTMLResponse)
+async def backtest_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Backtest</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>⏮️ Backtest</h1></div>""" + NAV + """
+<div class="card">
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+    <div><label>Symbol</label><br><input id="symbol" value="BTCUSDT" style="padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;"></div>
+    <div><label>Interval</label><br>
+      <select id="interval" style="padding:8px;border-radius:8px;background:rgba(99,102,241,.05);color:#e2e8f0;border:1px solid rgba(99,102,241,.3);">
+        <option>1h</option><option>2h</option><option>4h</option><option>1d</option>
+      </select>
+    </div>
+    <div><label>Limit</label><br><input id="limit" type="number" value="500" min="100" max="1000" style="width:110px;padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;"></div>
+    <div><label>TP %</label><br><input id="tp" type="number" value="3" step="0.1" style="width:110px;padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;"></div>
+    <div><label>SL %</label><br><input id="sl" type="number" value="2" step="0.1" style="width:110px;padding:8px;border-radius:8px;border:1px solid rgba(99,102,241,.3);background:rgba(99,102,241,.05);color:#e2e8f0;"></div>
+    <div><button onclick="run()">Lancer</button></div>
+  </div>
+</div>
+
+<div class="grid grid-3">
+  <div class="metric"><div class="metric-label">Trades</div><div class="metric-value" id="mTrades">-</div></div>
+  <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value" id="mWR">-</div></div>
+  <div class="metric"><div class="metric-label">Return</div><div class="metric-value" id="mRet">-</div></div>
+</div>
+
+<div class="card">
+  <h2>Courbe d'Equity</h2>
+  <canvas id="btChart" height="120"></canvas>
+</div>
+
+<div class="card">
+  <h2>Trades</h2>
+  <div style="overflow-x:auto;">
+  <table id="btTable">
+    <thead><tr>
+      <th>Entry time</th><th>Exit time</th><th>Entry</th><th>Exit</th><th>Résultat</th><th>PnL %</th><th>Equity</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</div>
+
+</div>
+<script>
+let chart;
+async function run(){
+  const q = new URLSearchParams({
+    symbol: document.getElementById('symbol').value.trim(),
+    interval: document.getElementById('interval').value,
+    limit: document.getElementById('limit').value,
+    tp_percent: document.getElementById('tp').value,
+    sl_percent: document.getElementById('sl').value
+  });
+  const res = await fetch('/api/backtest?'+q.toString());
+  const data = await res.json();
+  if(!data.ok){ alert(data.error||'Erreur'); return; }
+  const st = data.backtest.stats;
+
+  document.getElementById('mTrades').textContent = st.total_trades;
+  document.getElementById('mWR').textContent = st.win_rate.toFixed(1)+'%';
+  document.getElementById('mRet').textContent = st.total_return.toFixed(2)+'%';
+
+  // Table
+  const tbody = document.querySelector('#btTable tbody');
+  tbody.innerHTML = st.trades.map(t => `
+    <tr>
+      <td>${new Date(t.entry_time).toLocaleString()}</td>
+      <td>${new Date(t.exit_time).toLocaleString()}</td>
+      <td>$${t.entry_price}</td>
+      <td>$${t.exit_price}</td>
+      <td>${t.result}</td>
+      <td>${t.pnl_percent.toFixed(2)}%</td>
+      <td>$${t.equity.toFixed(2)}</td>
+    </tr>`).join('');
+
+  // Chart
+  const labels = st.trades.map((_,i)=> i+1);
+  const eq = st.equity_curve;
+  const ctx = document.getElementById('btChart').getContext('2d');
+  if(chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type:'line',
+    data:{ labels, datasets:[{ label:'Equity', data:eq, tension:.25, borderWidth:2, pointRadius:0 }] },
+    options:{ scales:{ x:{ ticks:{ maxTicksLimit:8 }}, y:{ beginAtZero:false } } }
+  });
+}
+</script>
+</body></html>""")
 
 @app.get("/annonces", response_class=HTMLResponse)
 async def annonces_page():
