@@ -401,6 +401,16 @@ class TradingState:
             trades_json.append(trade_dict)
         return trades_json
 
+    # ✅ RESET DU DASHBOARD
+    def reset(self, keep_journal: bool = False):
+        """Remet l'état du dashboard à zéro."""
+        self.trades = []
+        self.current_equity = settings.INITIAL_CAPITAL
+        self.equity_curve = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
+        if not keep_journal:
+            self.journal_entries = []
+        logger.info("♻️ TradingState reset (keep_journal=%s)", keep_journal)
+
 trading_state = TradingState()
 
 async def init_demo():
@@ -552,16 +562,12 @@ async def send_telegram_message(message: str) -> bool:
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
     """Notification avec TP1, TP2, TP3 et niveau de confiance"""
-    
     confidence = await calculate_trade_confidence(
         trade.get('symbol'), 
         trade.get('side'), 
         trade.get('entry')
     )
-    
     reasons_text = "\n".join([f"  • {r}" for r in confidence['reasons'][:4]])
-    
-    # Calcul des pourcentages pour chaque TP
     entry = trade.get('entry')
     side = trade.get('side')
     
@@ -1063,16 +1069,12 @@ async def api_news(
     offset: int = 0
 ):
     items = await fetch_all_news_improved()
-    
     if q:
         ql = q.lower().strip()
         items = [i for i in items if ql in (i["title"] + " " + i["summary"]).lower()]
-    
     items = [i for i in items if i.get("importance", 1) >= min_importance]
-    
     total = len(items)
     page = items[offset: offset + limit]
-    
     return {"ok": True, "total": total, "count": len(page), "items": page}
 
 @app.get("/api/backtest")
@@ -1086,11 +1088,9 @@ async def api_backtest(
     klines = await fetch_binance_klines(symbol, interval, limit)
     if not klines:
         return {"ok": False, "error": "Impossible de récupérer les données"}
-    
     results = run_backtest_strategy(klines, tp_percent, sl_percent, settings.INITIAL_CAPITAL)
     if not results:
         return {"ok": False, "error": "Aucun trade généré"}
-    
     return {"ok": True, "backtest": {"symbol": symbol, "stats": results}}
 
 # --------- ✅ Helper: parse robuste pour /tv-webhook ----------
@@ -1102,18 +1102,15 @@ async def _parse_any_payload(request: Request) -> Optional[Dict[str, Any]]:
     - text/plain (on tente JSON puis key=value&key2=... )
     Retourne un dict ou None si impossible.
     """
-    # 1) Essai JSON direct
     try:
         return await request.json()
     except Exception:
         pass
 
-    # 2) Essai form-urlencoded
     try:
         form = await request.form()
         if form:
             d = {k: v for k, v in form.items()}
-            # si 'payload' ou 'message' contient du JSON, on l'ouvre
             for key in ('payload', 'message'):
                 val = d.get(key)
                 if isinstance(val, str):
@@ -1127,7 +1124,6 @@ async def _parse_any_payload(request: Request) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 3) Essai texte brut
     try:
         raw = (await request.body()).decode('utf-8', errors='ignore').strip()
         if not raw:
@@ -1154,11 +1150,9 @@ async def webhook(request: Request):
             logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
             return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
 
-        # Log content-type pour debug
         ct = request.headers.get('content-type', '')
         logger.info(f"📥 Webhook content-type: {ct}")
 
-        # ✅ Parse robuste (JSON / form / texte)
         payload = await _parse_any_payload(request)
         if not payload:
             logger.warning("⚠️ Webhook: Payload non parseable")
@@ -1166,12 +1160,10 @@ async def webhook(request: Request):
 
         logger.info(f"📥 Webhook payload keys: {list(payload.keys())[:10]}")
 
-        # Normalise alias courants
         action = (payload.get("type") or payload.get("action") or payload.get("event") or "").lower()
         symbol = payload.get("symbol") or payload.get("ticker") or payload.get("s")
         side = (payload.get("side") or payload.get("direction") or "LONG").upper()
 
-        # Si action absent mais 'alert_name' décrit l'intention
         if not action and isinstance(payload.get("alert_name"), str):
             an = payload["alert_name"].lower()
             if "entry" in an: action = "entry"
@@ -1183,19 +1175,15 @@ async def webhook(request: Request):
             logger.warning("⚠️ Webhook: Symbol manquant")
             return JSONResponse({"status": "error", "message": "Symbol manquant"}, status_code=400)
         
-        # ACTION: ENTRY
         if action == "entry":
             entry = payload.get("entry")
             tp1 = payload.get("tp1") or payload.get("tp")
             tp2 = payload.get("tp2")
             tp3 = payload.get("tp3")
             sl = payload.get("sl")
-            
             if not all([entry, tp1, sl]):
                 logger.warning(f"⚠️ Entry incomplet: entry={entry}, tp1={tp1}, sl={sl}")
                 return JSONResponse({"status": "error", "message": "entry, tp1, sl requis"}, status_code=400)
-            
-            # Auto-calcul TP2/TP3 si manquants
             if not tp2:
                 tp2 = float(tp1) * 1.01 if side == 'LONG' else float(tp1) * 0.99
             if not tp3:
@@ -1212,19 +1200,16 @@ async def webhook(request: Request):
                 'sl': float(sl),
                 'row_state': 'normal'
             }
-            
             trading_state.add_trade(new_trade)
             await notify_new_trade(new_trade)
             return JSONResponse({"status": "ok", "trade_id": new_trade.get('id')})
         
-        # ACTION: TP HIT
         elif ("tp" in action or "take_profit" in action) and ("hit" in action or "_hit" in action.replace("take_profit", "")):
             tp_level = 'tp1'
             if 'tp3' in action or '3' in action:
                 tp_level = 'tp3'
             elif 'tp2' in action or '2' in action:
                 tp_level = 'tp2'
-            
             for trade in trading_state.trades:
                 if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
                     exit_price = float(payload.get('price') or payload.get(tp_level) or trade.get(tp_level))
@@ -1234,7 +1219,6 @@ async def webhook(request: Request):
             logger.warning(f"⚠️ TP hit: Trade {symbol} non trouvé")
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
         
-        # ACTION: SL HIT
         elif ("sl" in action or "stop_loss" in action) and ("hit" in action or "_hit" in action.replace("stop_loss", "")):
             for trade in trading_state.trades:
                 if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
@@ -1245,11 +1229,9 @@ async def webhook(request: Request):
             logger.warning(f"⚠️ SL hit: Trade {symbol} non trouvé")
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
         
-        # ACTION: CLOSE (manuel)
         elif action == "close":
             reason = payload.get('reason', 'Manuel')
             price = payload.get('price')
-            
             for trade in trading_state.trades:
                 if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
                     exit_price = float(price) if price else trade.get('entry')
@@ -1265,6 +1247,19 @@ async def webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Webhook erreur: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+# ✅ API RESET
+@app.post("/api/reset")
+async def api_reset(keep_journal: bool = False, demo: bool = False):
+    """
+    Réinitialise les données du dashboard.
+    - keep_journal: True pour conserver le journal
+    - demo: True pour réinjecter les 6 trades de démo après reset
+    """
+    trading_state.reset(keep_journal=keep_journal)
+    if demo:
+        await init_demo()
+    return {"ok": True, "message": "Reset effectué", "keep_journal": keep_journal, "demo": demo}
 
 # ==================== HTML ROUTES ====================
 
@@ -1321,6 +1316,14 @@ async def trades_page():
 
 <div class="card">
 <h2>📈 Trades avec TP1, TP2, TP3</h2>
+
+<!-- ✅ Boutons Reset -->
+<div style="display:flex;gap:8px;align-items:center;margin:10px 0 16px;">
+  <button onclick="resetData(false,false)" style="background:#ef4444">♻️ Reset (tout)</button>
+  <button onclick="resetData(true,false)"  style="background:#f59e0b">♻️ Reset (garder journal)</button>
+  <button onclick="resetData(false,true)"  style="background:#10b981">♻️ Reset + Démo</button>
+</div>
+
 <div style="overflow-x:auto;">
 <table id="tradesTable">
 <thead>
@@ -1329,7 +1332,7 @@ async def trades_page():
 <th>Symbol</th>
 <th>Side</th>
 <th>Entry</th>
-<th>Entry Time</th> <!-- ✅ AJOUT -->
+<th>Entry Time</th> <!-- ✅ -->
 <th>TP1 / TP2 / TP3</th>
 <th>SL</th>
 <th>Status</th>
@@ -1366,11 +1369,20 @@ const fmtTime = (iso) => {{
   }} catch {{ return new Date(iso).toLocaleString(); }}
 }};
 
+// ✅ Reset API
+async function resetData(keepJournal=false, demo=false){{
+  if(!confirm('Confirmer le reset du dashboard ?')) return;
+  const qs = new URLSearchParams({{ keep_journal: String(keepJournal), demo: String(demo) }});
+  const res = await fetch('/api/reset?'+qs.toString(), {{ method: 'POST' }});
+  const data = await res.json();
+  if(data.ok){{ await loadDashboard(); alert('✅ Reset OK' + (demo ? ' + Démo' : '')); }}
+  else {{ alert('❌ Erreur reset'); }}
+}}
+
 async function loadDashboard() {{
     try {{
         const tradesRes = await fetch('/api/trades');
         const tradesData = await tradesRes.json();
-        
         if (!tradesData.ok) return;
         
         const tbody = document.querySelector('#tradesTable tbody');
@@ -1410,7 +1422,7 @@ async function loadDashboard() {{
                 <td><strong>${{trade.symbol}}</strong></td>
                 <td>${{trade.side}}</td>
                 <td>$${{formatPrice(trade.entry)}}</td>
-                <td>${{fmtTime(trade.timestamp)}}</td> <!-- ✅ AJOUT -->
+                <td>${{fmtTime(trade.timestamp)}}</td>
                 <td>
                     <div class="tp-cell">
                         <div class="${{tp1Class}} tp-item">${{trade.tp1_hit ? '✅' : '⚪'}} TP1: $${{formatPrice(trade.tp1)}}</div>
@@ -1427,7 +1439,6 @@ async function loadDashboard() {{
         // Fear & Greed
         const fgRes = await fetch('/api/fear-greed');
         const fgData = await fgRes.json();
-        
         if (fgData.ok) {{
             const fg = fgData.fear_greed;
             document.getElementById('fearGreedContainer').innerHTML = `
@@ -1442,7 +1453,6 @@ async function loadDashboard() {{
         // Bull Run Phase
         const brRes = await fetch('/api/bullrun-phase');
         const brData = await brRes.json();
-        
         if (brData.ok) {{
             const phase = brData.bullrun_phase;
             document.getElementById('bullrunContainer').innerHTML = `
@@ -1714,7 +1724,6 @@ async function run(){
   document.getElementById('mWR').textContent = st.win_rate.toFixed(1)+'%';
   document.getElementById('mRet').textContent = st.total_return.toFixed(2)+'%';
 
-  // Table
   const tbody = document.querySelector('#btTable tbody');
   tbody.innerHTML = st.trades.map(t => `
     <tr>
@@ -1727,7 +1736,6 @@ async function run(){
       <td>$${t.equity.toFixed(2)}</td>
     </tr>`).join('');
 
-  // Chart
   const labels = st.trades.map((_,i)=> i+1);
   const eq = st.equity_curve;
   const ctx = document.getElementById('btChart').getContext('2d');
@@ -1840,6 +1848,7 @@ if __name__ == "__main__":
     print("✅ Support action CLOSE")
     print("✅ Toutes les routes HTML ajoutées")
     print("✅ Telegram avec confiance détaillée")
+    print("✅ Boutons Reset + API /api/reset")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
