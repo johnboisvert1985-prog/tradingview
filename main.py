@@ -21,6 +21,7 @@ import random
 import re
 import json
 import xml.etree.ElementTree as ET
+import urllib.parse  # ✅ pour parse_qs
 from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
@@ -1092,28 +1093,94 @@ async def api_backtest(
     
     return {"ok": True, "backtest": {"symbol": symbol, "stats": results}}
 
+# --------- ✅ Helper: parse robuste pour /tv-webhook ----------
+async def _parse_any_payload(request: Request) -> Optional[Dict[str, Any]]:
+    """
+    Essaie de lire un payload TradingView sous plusieurs formats :
+    - application/json
+    - application/x-www-form-urlencoded  (souvent 'payload' ou 'message' contiennent du JSON)
+    - text/plain (on tente JSON puis key=value&key2=... )
+    Retourne un dict ou None si impossible.
+    """
+    # 1) Essai JSON direct
+    try:
+        return await request.json()
+    except Exception:
+        pass
+
+    # 2) Essai form-urlencoded
+    try:
+        form = await request.form()
+        if form:
+            d = {k: v for k, v in form.items()}
+            # si 'payload' ou 'message' contient du JSON, on l'ouvre
+            for key in ('payload', 'message'):
+                val = d.get(key)
+                if isinstance(val, str):
+                    try:
+                        inner = json.loads(val)
+                        if isinstance(inner, dict):
+                            d.update(inner)
+                    except Exception:
+                        pass
+            return d
+    except Exception:
+        pass
+
+    # 3) Essai texte brut
+    try:
+        raw = (await request.body()).decode('utf-8', errors='ignore').strip()
+        if not raw:
+            return None
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        if parsed:
+            return {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
+    except Exception:
+        pass
+
+    return None
+
 @app.post("/tv-webhook")
 async def webhook(request: Request):
     try:
-        body = await request.body()
-        if not body:
+        body_bytes = await request.body()
+        if not body_bytes:
             logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
             return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
-        
-        try:
-            payload = await request.json()
-        except:
-            logger.warning("⚠️ Webhook: JSON invalide")
-            return JSONResponse({"status": "error", "message": "JSON invalide"}, status_code=400)
-        
-        logger.info(f"📥 Webhook: {payload.get('type', 'UNKNOWN')} - {payload.get('symbol', 'N/A')}")
-        
-        action = (payload.get("type") or payload.get("action") or "").lower()
-        symbol = payload.get("symbol")
-        side = payload.get("side", "LONG")
-        
+
+        # Log content-type pour debug
+        ct = request.headers.get('content-type', '')
+        logger.info(f"📥 Webhook content-type: {ct}")
+
+        # ✅ Parse robuste (JSON / form / texte)
+        payload = await _parse_any_payload(request)
+        if not payload:
+            logger.warning("⚠️ Webhook: Payload non parseable")
+            return JSONResponse({"status": "error", "message": "Payload non parseable"}, status_code=400)
+
+        logger.info(f"📥 Webhook payload keys: {list(payload.keys())[:10]}")
+
+        # Normalise alias courants
+        action = (payload.get("type") or payload.get("action") or payload.get("event") or "").lower()
+        symbol = payload.get("symbol") or payload.get("ticker") or payload.get("s")
+        side = (payload.get("side") or payload.get("direction") or "LONG").upper()
+
+        # Si action absent mais 'alert_name' décrit l'intention
+        if not action and isinstance(payload.get("alert_name"), str):
+            an = payload["alert_name"].lower()
+            if "entry" in an: action = "entry"
+            elif "close" in an: action = "close"
+            elif "tp" in an and "hit" in an: action = "tp_hit"
+            elif ("sl" in an or "stop" in an) and "hit" in an: action = "sl_hit"
+
         if not symbol:
-            logger.warning(f"⚠️ Webhook: Symbol manquant")
+            logger.warning("⚠️ Webhook: Symbol manquant")
             return JSONResponse({"status": "error", "message": "Symbol manquant"}, status_code=400)
         
         # ACTION: ENTRY
@@ -1262,6 +1329,7 @@ async def trades_page():
 <th>Symbol</th>
 <th>Side</th>
 <th>Entry</th>
+<th>Entry Time</th> <!-- ✅ AJOUT -->
 <th>TP1 / TP2 / TP3</th>
 <th>SL</th>
 <th>Status</th>
@@ -1285,6 +1353,19 @@ async def trades_page():
 </div>
 
 <script>
+// ✅ format 24h en fuseau America/Toronto
+const fmtTime = (iso) => {{
+  if (!iso) return '-';
+  try {{
+    return new Date(iso).toLocaleString('fr-CA', {{
+      timeZone: 'America/Toronto',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    }});
+  }} catch {{ return new Date(iso).toLocaleString(); }}
+}};
+
 async function loadDashboard() {{
     try {{
         const tradesRes = await fetch('/api/trades');
@@ -1328,15 +1409,16 @@ async function loadDashboard() {{
                 <td>#${{trade.id}}</td>
                 <td><strong>${{trade.symbol}}</strong></td>
                 <td>${{trade.side}}</td>
-                <td>${{formatPrice(trade.entry)}}</td>
+                <td>$${{formatPrice(trade.entry)}}</td>
+                <td>${{fmtTime(trade.timestamp)}}</td> <!-- ✅ AJOUT -->
                 <td>
                     <div class="tp-cell">
-                        <div class="${{tp1Class}} tp-item">${{trade.tp1_hit ? '✅' : '⚪'}} TP1: ${{formatPrice(trade.tp1)}}</div>
-                        <div class="${{tp2Class}} tp-item">${{trade.tp2_hit ? '✅' : '⚪'}} TP2: ${{formatPrice(trade.tp2)}}</div>
-                        <div class="${{tp3Class}} tp-item">${{trade.tp3_hit ? '✅' : '⚪'}} TP3: ${{formatPrice(trade.tp3)}}</div>
+                        <div class="${{tp1Class}} tp-item">${{trade.tp1_hit ? '✅' : '⚪'}} TP1: $${{formatPrice(trade.tp1)}}</div>
+                        <div class="${{tp2Class}} tp-item">${{trade.tp2_hit ? '✅' : '⚪'}} TP2: $${{formatPrice(trade.tp2)}}</div>
+                        <div class="${{tp3Class}} tp-item">${{trade.tp3_hit ? '✅' : '⚪'}} TP3: $${{formatPrice(trade.tp3)}}</div>
                     </div>
                 </td>
-                <td>${{formatPrice(trade.sl)}}</td>
+                <td>$${{formatPrice(trade.sl)}}</td>
                 <td>${{statusBadge}}</td>
             `;
             tbody.appendChild(row);
