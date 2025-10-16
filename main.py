@@ -1,234 +1,407 @@
 # main.py
 import os
 import re
-import math
 import json
+import time
+import math
 import asyncio
-import logging
-from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Any
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# ------------------------------------------------------------------------------
-# Config & logger
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-logger = logging.getLogger("main")
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# Pour Render / CORS
-app = FastAPI(title="TradingView Webhook Server")
+# -----------------------------------------------------------------------------
+# App & state
+# -----------------------------------------------------------------------------
+app = FastAPI(title="TradingView Bridge")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------------
-# État en mémoire (démos + historique minimal)
-# ------------------------------------------------------------------------------
-class TradingState:
-    def __init__(self) -> None:
-        self.trades: List[Dict[str, Any]] = []
-        self.journal: List[Dict[str, Any]] = []
-        self.created_at = datetime.utcnow().isoformat()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    def reset(self):
-        self.trades.clear()
-        self.journal.clear()
-        logger.info("♻️ TradingState reset")
+# In-memory state
+TRADES: List[Dict[str, Any]] = []
 
-STATE = TradingState()
-
-# Démo de trades au démarrage (si tu veux, sinon commente)
-DEMO = [
-    {"symbol": "BTCUSDT", "side": "BUY",  "direction": "LONG",  "entry": 65000, "tf": "15m"},
-    {"symbol": "ETHUSDT", "side": "SELL", "direction": "SHORT", "entry": 3500,  "tf": "15m"},
-    {"symbol": "SOLUSDT", "side": "BUY",  "direction": "LONG",  "entry": 140,   "tf": "15m"},
-]
-for i, t in enumerate(DEMO, start=1):
-    t["tp1"] = round(t["entry"] * (1.015 if t["side"] == "BUY" else 0.985), 6)
-    t["tp2"] = round(t["entry"] * (1.025 if t["side"] == "BUY" else 0.975), 6)
-    t["tp3"] = round(t["entry"] * (1.040 if t["side"] == "BUY" else 0.960), 6)
-    t["sl"]  = round(t["entry"] * (0.98 if t["side"] == "BUY" else 1.02), 6)
-    t["created_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    t["entry_time"] = t["created_at"]
-    t["confidence"] = {"score": 60, "label": "MOYEN", "reasons": "Démo"}
-    STATE.trades.append(t)
-logger.info("✅ Démo initialisée avec %d trades", len(STATE.trades))
-
-# ------------------------------------------------------------------------------
-# Utilitaires
-# ------------------------------------------------------------------------------
-ALIASES = {
-    # symbol
-    "symbol": "symbol", "ticker": "symbol", "pair": "symbol",
-    # timeframe
-    "tf": "tf", "interval": "tf", "timeframe": "tf",
-    # side/direction
-    "side": "side", "direction": "direction",
-    # entry
-    "entry": "entry", "price": "entry", "close": "entry",
-    # entry time
-    "entry_time": "entry_time", "heure": "entry_time", "created_at": "entry_time", "time": "entry_time",
-    # extras
-    "alert_name": "alert_name", "name": "alert_name",
-    # targets
-    "tp1": "tp1", "tp2": "tp2", "tp3": "tp3", "sl": "sl"
+MARKET = {
+    "fear_greed": 28,        # défaut pour démarrer
+    "btc_dominance": 57.1,   # défaut
+    "btc_price": 110_000.0,  # défaut approx
 }
 
-def as_float(x: Any) -> Optional[float]:
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+class Confidence(BaseModel):
+    score: int
+    label: str
+    reasons: List[str] = Field(default_factory=list)
+
+
+class Trade(BaseModel):
+    symbol: str
+    side: str                # BUY/SELL
+    direction: str           # LONG/SHORT
+    tf: Optional[str] = None
+    entry: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    sl: Optional[float] = None
+    confidence: Optional[Confidence] = None
+    created_at: str
+    entry_time: Optional[str] = None
+    alert_name: Optional[str] = None
+
+
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def safe_float(x: Any) -> Optional[float]:
     if x is None:
         return None
     try:
-        return float(str(x).replace(",", "").replace("$", "").strip())
+        # Certains arrivent comme str avec “$” etc.
+        s = str(x).strip().replace("$", "").replace(",", "")
+        if s == "" or s == "-":
+            return None
+        return float(s)
     except Exception:
         return None
 
-async def fetch_spot_price(symbol: str) -> Optional[float]:
-    """Fetch spot price from Binance public API."""
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                j = r.json()
-                return float(j.get("price"))
-    except Exception as e:
-        logger.warning(f"⚠️ Binance fetch price failed for {symbol}: {e}")
-    return None
-
-async def fetch_fear_greed() -> Optional[int]:
-    """Stub rapide. Remplace par ton fetch réel si besoin."""
-    return 28
-
-async def fetch_btc_dominance() -> Optional[float]:
-    """Stub rapide. Remplace par ton fetch réel si besoin."""
-    return 57.1
-
-def confidence_score(fng: Optional[int], btc_d: Optional[float], side: str) -> Tuple[int, str, str]:
-    """Retourne (score, label, raisons)"""
-    score = 50
-    reasons = []
-
-    if fng is not None:
-        if fng <= 25:
-            score += 10; reasons.append("✅ Fear bas : opportunité")
-        elif fng >= 75:
-            score -= 10; reasons.append("⚠️ Greed élevé : prudence")
-
-    if btc_d is not None:
-        if side == "BUY":
-            if btc_d > 55: score -= 5; reasons.append("⚠️ BTC.D élevé (altcoins défavorisés)")
-            else: score += 5; reasons.append("✅ BTC.D modéré (altcoins OK)")
-        else:  # SELL
-            if btc_d > 55: score += 5; reasons.append("✅ BTC.D élevé (altcoins fragiles)")
-            else: score -= 3; reasons.append("⚠️ BTC.D bas (shorts moins évidents)")
-
-    score = max(0, min(100, score))
-    if score >= 70: label = "ÉLEVÉ"
-    elif score >= 55: label = "MOYEN"
-    elif score >= 45: label = "FAIBLE"
-    else: label = "TRÈS FAIBLE"
-
-    return score, label, " • ".join(reasons) if reasons else "—"
-
-async def telegram_send(text: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram non configuré (TOKEN/CHAT_ID manquants).")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, json=data)
-        if r.status_code == 429:
-            j = {}
-            try:
-                j = r.json()
-            except Exception:
-                pass
-            wait = int((j.get("parameters") or {}).get("retry_after", 1))
-            logger.error(f"❌ Telegram: 429 - retry_after={wait}s")
-            await asyncio.sleep(wait)
-            await client.post(url, json=data)
-        else:
-            try:
-                r.raise_for_status()
-                logger.info("✅ Telegram envoyé")
-            except Exception as e:
-                logger.error(f"❌ Telegram: {r.status_code} - {r.text} - {e}")
 
 def fmt_money(x: Optional[float]) -> str:
     if x is None:
         return "$-"
-    # format adaptatif
+    # formattage lisible
     if abs(x) >= 1:
-        return f"${x:,.3f}".replace(",", " ")
-    if abs(x) >= 0.01:
-        return f"${x:.4f}"
-    return f"${x:.6f}"
+        return "$" + f"{x:,.3f}".replace(",", " ").replace(" ", ",").replace(",", " ")
+    # petites valeurs (altcoins)
+    return "$" + f"{x:.6f}"
 
-# ------------------------------------------------------------------------------
-# Parser TradingView tolérant (JSON ou texte)
-# ------------------------------------------------------------------------------
-async def parse_tv_payload(request: Request) -> Dict[str, Any]:
-    ct = (request.headers.get("content-type") or "").lower()
 
-    # 1) JSON propre
-    if "application/json" in ct:
+def side_to_direction(side: str) -> str:
+    return "LONG" if (side or "").upper() == "BUY" else "SHORT"
+
+
+def label_from_score(score: int) -> str:
+    if score >= 70:
+        return "ÉLEVÉ"
+    if score >= 55:
+        return "MOYEN"
+    return "FAIBLE"
+
+
+def build_confidence(side: str) -> Confidence:
+    """
+    Score 'vivant' en fonction de F&G, dominance BTC, et sens (long/short).
+    Simple, stable et explicable.
+    """
+    reasons: List[str] = []
+    base = 50
+
+    # Fear & Greed
+    fng = MARKET.get("fear_greed", 50)
+    if fng <= 25:
+        base += 10
+        reasons.append("✅ Sentiment de peur : opportunités d'achat accrues")
+    elif fng >= 75:
+        base -= 10
+        reasons.append("⚠️ Euphorie du marché : risques de retournement")
+
+    # BTC Dominance
+    btcd = MARKET.get("btc_dominance", 50.0)
+    if btcd >= 57.0:
+        reasons.append("⚠️ BTC très dominant : altcoins sous-performent")
+        # pénalise surtout les trades sur alt si LONG
+        if side.upper() == "BUY":
+            base -= 5
+    else:
+        reasons.append("✅ Dominance BTC modérée : terrain favorable aux alts")
+
+    # Normalisation + pincement
+    score = max(30, min(85, base))
+    label = label_from_score(score)
+    return Confidence(score=score, label=label, reasons=reasons)
+
+
+async def send_telegram(msg: str) -> None:
+    """Envoi Telegram avec gestion du 429 Too Many Requests."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        attempts = 0
+        while attempts < 3:
+            attempts += 1
+            r = await client.post(url, json=payload)
+            if r.status_code == 200:
+                return
+            if r.status_code == 429:
+                data = r.json()
+                retry_after = data.get("parameters", {}).get("retry_after", 1)
+                await asyncio.sleep(retry_after)
+                continue
+            # Autres erreurs : on sort
+            return
+
+
+def render_confidence_md(c: Confidence) -> str:
+    lines = [f"📊 *CONFIANCE*: {c.score}% ({c.label})", "", "Pourquoi ce score ?"]
+    for r in c.reasons:
+        lines.append(f"  • {r}")
+    return "\n".join(lines)
+
+
+def render_trade_md(tr: Trade) -> str:
+    # Titre avec symbole
+    head = f"🎯 *NOUVEAU TRADE — {tr.symbol}*"
+    # Direction et TF
+    tf_part = tr.tf if tr.tf else "-"
+    dir_line = f"📈 *Direction*: {tr.direction} | {tf_part}"
+
+    # Prix d'entrée + TPs + SL
+    entry_line = f"💰 *Entry*: {fmt_money(tr.entry)}"
+    tp_block = "\n".join([
+        "🎯 *Take Profits*:",
+        f"  TP1: {fmt_money(tr.tp1)}",
+        f"  TP2: {fmt_money(tr.tp2)}",
+        f"  TP3: {fmt_money(tr.tp3)}",
+    ])
+    sl_line = f"🛑 *Stop Loss*: {fmt_money(tr.sl)}"
+
+    # Confiance
+    conf = tr.confidence or build_confidence(tr.side)
+    conf_block = render_confidence_md(conf)
+
+    # Marché
+    mkt = f"💡 *Marché*: F&G {MARKET.get('fear_greed','-')} | BTC.D {MARKET.get('btc_dominance','-')}%"
+
+    parts = [
+        head,
+        "",
+        f"📊 *{tr.side}*",
+        dir_line,
+        "",
+        entry_line,
+        "",
+        tp_block,
+        "",
+        sl_line,
+        "",
+        conf_block,
+        "",
+        mkt,
+    ]
+    return "\n".join(parts)
+
+
+# -----------------------------------------------------------------------------
+# Webhook parsing
+# -----------------------------------------------------------------------------
+KV_RE = re.compile(r"^\s*([^:=\s]+)\s*[:=]\s*(.+?)\s*$")
+
+def parse_text_payload(txt: str) -> Dict[str, Any]:
+    """Parsage large du texte TradingView (clé=valeur, lignes, etc.)."""
+    out: Dict[str, Any] = {}
+    if not txt:
+        return out
+
+    # Si c'est du JSON dans du texte…
+    s = txt.strip()
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         try:
-            data = await request.json()
-            if isinstance(data, dict) and "chat_id" in data and "text" in data:
-                # On dirait un payload Telegram => refuser proprement
-                raise HTTPException(status_code=400, detail="Payload ressemble à un JSON Telegram. Envoie les champs de trade (side, symbol, entry...).")
-            return data if isinstance(data, dict) else {}
+            j = json.loads(s)
+            if isinstance(j, dict):
+                return j
         except Exception:
             pass
 
-    # 2) Texte brut: lignes "clé: valeur"
-    raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-    data: Dict[str, Any] = {}
-    if raw:
-        # Si contient chat_id, c'est un message Telegram
-        if "chat_id" in raw and "text" in raw:
-            raise HTTPException(status_code=400, detail="Payload semble être un message Telegram. Envoie les champs de trade (side, symbol, entry...).")
-        # JSON collé en texte ? on tente
-        if raw.startswith("{") and raw.endswith("}"):
-            try:
-                j = json.loads(raw)
-                if isinstance(j, dict):
-                    return j
-            except Exception:
-                pass
-        # Sinon parse "clé: valeur"
-        keys_seen = []
-        for line in raw.splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                k = k.strip()
-                v = v.strip()
-                if k:
-                    data[k] = v
-                    keys_seen.append(k)
-        logger.info(f"📥 Webhook payload (keys via text): {keys_seen if keys_seen else list(data.keys())}")
-    else:
-        logger.info("📥 Webhook: payload vide")
+    # Sinon, on parcourt ligne par ligne
+    lines = [x for x in re.split(r"[\r\n]+", s) if x.strip() != ""]
+    for line in lines:
+        m = KV_RE.match(line)
+        if m:
+            k, v = m.group(1).strip(), m.group(2).strip()
+            out[k] = v
 
-    return data
+    return out
 
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
+
+def normalize_webhook(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalise différentes clés possibles venant de TradingView.
+    Attend : side, symbol, tf, entry, tp1,tp2,tp3, sl, entry_time/created_at, alert_name.
+    """
+    # alias fréquents
+    aliases = {
+        "side": ["side", "action", "order", "type"],
+        "symbol": ["symbol", "ticker", "symbole"],
+        "tf": ["tf", "timeframe", "interval"],
+        "entry": ["entry", "entree", "price", "prix", "entry_price"],
+        "tp1": ["tp1", "take_profit_1", "tp_1"],
+        "tp2": ["tp2", "take_profit_2", "tp_2"],
+        "tp3": ["tp3", "take_profit_3", "tp_3"],
+        "sl": ["sl", "stop", "stop_loss", "stoploss"],
+        "entry_time": ["entry_time", "heure", "time", "timestamp"],
+        "created_at": ["created_at", "created", "alert_time"],
+        "alert_name": ["alert_name", "name", "titre", "title"],
+        "direction": ["direction"],  # parfois fourni
+    }
+
+    def pick(keys: List[str]) -> Optional[str]:
+        for k in keys:
+            if k in data and str(data[k]).strip() != "":
+                return str(data[k]).strip()
+        return None
+
+    side = (pick(aliases["side"]) or "").upper()
+    if side in ("BUY", "LONG"):
+        side = "BUY"
+    elif side in ("SELL", "SHORT"):
+        side = "SELL"
+
+    symbol = pick(aliases["symbol"]) or "-"
+    tf = pick(aliases["tf"])
+    direction = pick(aliases["direction"]) or side_to_direction(side)
+
+    entry = safe_float(pick(aliases["entry"]))
+    tp1 = safe_float(pick(aliases["tp1"]))
+    tp2 = safe_float(pick(aliases["tp2"]))
+    tp3 = safe_float(pick(aliases["tp3"]))
+    sl = safe_float(pick(aliases["sl"]))
+
+    entry_time = pick(aliases["entry_time"])
+    created_at = pick(aliases["created_at"]) or now_iso()
+    alert_name = pick(aliases["alert_name"])
+
+    return {
+        "side": side,
+        "symbol": symbol,
+        "tf": tf,
+        "direction": direction,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "sl": sl,
+        "entry_time": entry_time,
+        "created_at": created_at,
+        "alert_name": alert_name,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Webhook endpoint
+# -----------------------------------------------------------------------------
+@app.post("/tv-webhook")
+async def tv_webhook(request: Request):
+    ctype = request.headers.get("content-type", "").lower()
+
+    try:
+        if "application/json" in ctype:
+            body = await request.json()
+        else:
+            raw = await request.body()
+            txt = raw.decode("utf-8", errors="ignore")
+            body = parse_text_payload(txt)
+    except Exception:
+        body = {}
+
+    data = normalize_webhook(body)
+
+    if not data.get("side"):
+        return PlainTextResponse("Side manquant", status_code=400)
+
+    # Build trade + confiance
+    conf = build_confidence(data["side"])
+    trade = Trade(
+        symbol=data["symbol"],
+        side=data["side"],
+        direction=data["direction"],
+        tf=data.get("tf"),
+        entry=data.get("entry"),
+        tp1=data.get("tp1"),
+        tp2=data.get("tp2"),
+        tp3=data.get("tp3"),
+        sl=data.get("sl"),
+        confidence=conf,
+        created_at=data["created_at"],
+        entry_time=data.get("entry_time") or data["created_at"],
+        alert_name=data.get("alert_name"),
+    ).model_dump()
+
+    # Stocke + notifie Telegram immédiatement
+    TRADES.append(trade)
+    msg = render_trade_md(Trade(**trade))
+    asyncio.create_task(send_telegram(msg))
+
+    return JSONResponse({"ok": True})
+
+
+# -----------------------------------------------------------------------------
+# APIs
+# -----------------------------------------------------------------------------
+@app.get("/api/trades")
+async def api_trades():
+    return JSONResponse(TRADES)
+
+
+@app.post("/api/reset")
+async def api_reset():
+    TRADES.clear()
+    return JSONResponse({"ok": True, "msg": "TradingState reset"})
+
+
+@app.get("/api/fear-greed")
+async def api_fng():
+    return JSONResponse({"value": MARKET["fear_greed"]})
+
+
+@app.get("/api/bullrun-phase")
+async def api_bullrun():
+    return JSONResponse({
+        "global_mc": None,  # optionnel
+        "btc_dominance": MARKET["btc_dominance"],
+        "btc_price": MARKET["btc_price"],
+    })
+
+
+# (optionnel) setters manuels pour dev
+@app.post("/api/market/set")
+async def api_market_set(payload: Dict[str, Any]):
+    if "fear_greed" in payload:
+        MARKET["fear_greed"] = int(payload["fear_greed"])
+    if "btc_dominance" in payload:
+        MARKET["btc_dominance"] = float(payload["btc_dominance"])
+    if "btc_price" in payload:
+        MARKET["btc_price"] = float(payload["btc_price"])
+    return JSONResponse({"ok": True, "market": MARKET})
+
+
+# -----------------------------------------------------------------------------
+# UI (Dashboard + Trades)
+# -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
     html = """
@@ -239,58 +412,178 @@ async def home():
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>Dashboard Trading</title>
       <style>
-        body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif; margin:24px;}
-        a{color:#0b74de; text-decoration:none}
-        .grid{display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-        .card{border:1px solid #e5e7eb; border-radius:12px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,.04)}
-        .muted{color:#6b7280}
-        .btn{display:inline-block; padding:8px 12px; border-radius:8px; border:1px solid #ddd}
+        :root{
+          --bg:#0f172a;
+          --card:#111827;
+          --muted:#9ca3af;
+          --text:#e5e7eb;
+          --accent:#22d3ee;
+          --green:#22c55e;
+          --red:#ef4444;
+          --yellow:#f59e0b;
+          --border:#1f2937;
+        }
+        *{box-sizing:border-box}
+        body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif; background:linear-gradient(180deg,#0b1224 0%, #0f172a 100%); color:var(--text); margin:0; padding:24px;}
+        a{color:var(--accent); text-decoration:none}
+        .container{max-width:1200px; margin:0 auto}
+        .topbar{display:flex; align-items:center; justify-content:space-between; margin-bottom:24px}
+        .title{font-size:24px; font-weight:700; letter-spacing:.3px}
+        .grid{display:grid; gap:16px; grid-template-columns:repeat(12,1fr)}
+        .card{background:rgba(17,24,39,.8); border:1px solid var(--border); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.25); backdrop-filter: blur(6px);}
+        .card h3{margin:.25rem 0 1rem; font-size:14px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.08em}
+        .kpi{font-size:28px; font-weight:700}
+        .muted{color:var(--muted)}
+        .btn{display:inline-block; padding:10px 14px; border-radius:10px; border:1px solid var(--border); background:#0b1224; transition:.2s all; font-weight:600}
+        .btn:hover{transform:translateY(-1px); border-color:#273449}
+        .row{display:flex; gap:8px; align-items:center}
+        .pill{padding:4px 8px; border-radius:999px; font-size:12px; border:1px solid var(--border); background:#0c1428}
+        .col-3{grid-column:span 3}
+        .col-4{grid-column:span 4}
+        .col-8{grid-column:span 8}
+        .col-12{grid-column:span 12}
+        @media(max-width:1024px){.col-3,.col-4,.col-8{grid-column:span 6}}
+        @media(max-width:640px){.col-3,.col-4,.col-8{grid-column:span 12}}
+        .list{display:grid; gap:12px}
+        .trade{display:grid; grid-template-columns: 120px 1fr 80px 80px 120px; gap:8px; align-items:center; padding:10px; border-radius:12px; border:1px solid var(--border); background:rgba(2,6,23,.45)}
+        .badge{padding:4px 8px; border-radius:8px; font-weight:700; font-size:12px}
+        .badge.buy{color:#bbf7d0; background:rgba(34,197,94,.12); border:1px solid rgba(34,197,94,.3)}
+        .badge.sell{color:#fecaca; background:rgba(239,68,68,.12); border:1px solid rgba(239,68,68,.3)}
+        .mono{font-variant-numeric:tabular-nums}
+        canvas{width:100%; height:140px; display:block}
       </style>
     </head>
     <body>
-      <h1>📊 Dashboard Trading</h1>
-      <div class="grid">
-        <div class="card">
-          <h3>Trades</h3>
-          <p class="muted">Voir la liste des entrées</p>
-          <a class="btn" href="/trades">Ouvrir</a>
+      <div class="container">
+        <div class="topbar">
+          <div class="title">📊 Dashboard Trading</div>
+          <div class="row">
+            <a class="btn" href="/trades">Voir les trades</a>
+            <a class="btn" href="/journal">Journal</a>
+            <a class="btn" href="/equity-curve">Équity</a>
+          </div>
         </div>
-        <div class="card">
-          <h3>Équity curve</h3>
-          <p class="muted">Courbe simple (placeholder)</p>
-          <a class="btn" href="/equity-curve">Ouvrir</a>
-        </div>
-        <div class="card">
-          <h3>Journal</h3>
-          <p class="muted">Notes rapides</p>
-          <a class="btn" href="/journal">Ouvrir</a>
-        </div>
-        <div class="card">
-          <h3>Heatmap</h3>
-          <p class="muted">Aperçu (placeholder)</p>
-          <a class="btn" href="/heatmap">Ouvrir</a>
+
+        <div class="grid">
+          <div class="card col-3">
+            <h3>Fear & Greed</h3>
+            <div class="kpi"><span id="kpi-fng">—</span></div>
+            <div class="muted">Indice sentiment marché</div>
+          </div>
+          <div class="card col-3">
+            <h3>BTC Dominance</h3>
+            <div class="kpi"><span id="kpi-btcd">—</span></div>
+            <div class="muted">Poids BTC sur marché</div>
+          </div>
+          <div class="card col-3">
+            <h3>BTC Price</h3>
+            <div class="kpi mono"><span id="kpi-btc">—</span></div>
+            <div class="muted">Prix spot (approx.)</div>
+          </div>
+          <div class="card col-3">
+            <h3>Actions rapides</h3>
+            <div class="row" style="margin-bottom:8px">
+              <a class="btn" href="/api/reset">♻️ Reset</a>
+              <a class="btn" href="/annonces">🗞️ News</a>
+            </div>
+            <div class="muted">Maintenance & navigation</div>
+          </div>
+
+          <div class="card col-8">
+            <h3>Derniers trades</h3>
+            <div id="recent" class="list"></div>
+          </div>
+
+          <div class="card col-4">
+            <h3>Équity (mini)</h3>
+            <canvas id="eq"></canvas>
+            <div class="muted" style="margin-top:6px">Aperçu indicatif</div>
+          </div>
         </div>
       </div>
-      <p style="margin-top:24px"><a class="btn" href="/annonces">🗞️ Annonces</a>
-         <a class="btn" href="/strategie">🧠 Stratégie</a>
-         <a class="btn" href="/backtest">🧪 Backtest</a>
-         <a class="btn" href="/patterns">📐 Patterns</a></p>
+
+      <script>
+        async function getJSON(u){ const r = await fetch(u); return r.json(); }
+
+        function fmtNum(x){
+          if(x==null||x==='') return '—';
+          const n=Number(x);
+          if(Number.isNaN(n)) return '—';
+          if(Math.abs(n)>=1000) return n.toLocaleString(undefined,{maximumFractionDigits:0});
+          if(Math.abs(n)>=1) return n.toFixed(2);
+          if(Math.abs(n)>=0.01) return n.toFixed(4);
+          return n.toFixed(6);
+        }
+        function fmtMoney(x){ const v=fmtNum(x); return v==='—'?'—':('$'+v); }
+
+        async function loadMarket(){
+          try{
+            const f = await getJSON('/api/fear-greed'); 
+            document.getElementById('kpi-fng').textContent = f?.value ?? '—';
+          }catch(e){}
+          try{
+            const b = await getJSON('/api/bullrun-phase');
+            document.getElementById('kpi-btcd').textContent = (b?.btc_dominance!=null? b.btc_dominance.toFixed(1)+'%':'—');
+            document.getElementById('kpi-btc').textContent = (b?.btc_price!=null? Math.round(b.btc_price).toLocaleString():'—');
+          }catch(e){}
+        }
+
+        function pill(side){
+          return '<span class="badge '+(side==='BUY'?'buy':'sell')+'">'+side+'</span>';
+        }
+
+        function renderRecent(trades){
+          const root = document.getElementById('recent'); root.innerHTML='';
+          trades.slice(-5).reverse().forEach(t=>{
+            const el=document.createElement('div'); el.className='trade';
+            el.innerHTML = `
+              <div class="mono">${t.entry_time || t.created_at || '-'}</div>
+              <div><strong>${t.symbol||'-'}</strong> <span class="pill">${t.tf||'-'}</span></div>
+              <div>${pill(t.side||'-')}</div>
+              <div class="mono">${t.direction||'-'}</div>
+              <div class="mono">${fmtMoney(t.entry)}</div>
+            `;
+            root.appendChild(el);
+          });
+        }
+
+        function miniEq(trades){
+          const c = document.getElementById('eq'); const ctx = c.getContext('2d');
+          const w = c.width = c.clientWidth; const h = c.height = 140;
+          ctx.clearRect(0,0,w,h);
+          const pts=[]; let eq=0;
+          trades.forEach(t=>{ eq += (t.side==='BUY'?+1:-1); pts.push(eq); });
+          if(pts.length===0){ ctx.strokeStyle='#334155'; ctx.strokeRect(0,0,w,h); return; }
+          const min=Math.min(...pts), max=Math.max(...pts);
+          const rng = (max-min)||1;
+          ctx.beginPath(); ctx.strokeStyle = '#22d3ee'; ctx.lineWidth=2;
+          pts.forEach((v,i)=>{
+            const x = (i/(pts.length-1))*w;
+            const y = h - ((v-min)/rng)*h;
+            if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+          });
+          ctx.stroke();
+        }
+
+        async function loadTrades(){
+          const t = await getJSON('/api/trades');
+          renderRecent(t);
+          miniEq(t);
+        }
+
+        async function boot(){
+          await loadMarket();
+          await loadTrades();
+          setInterval(loadMarket, 30000);
+          setInterval(loadTrades, 10000);
+        }
+        boot();
+      </script>
     </body>
     </html>
     """
     return HTMLResponse(html)
 
-TRADES_PAGE_JS = r"""
-function formatNumber(x) {
-  if (x === null || x === undefined || x === '') return '-';
-  const n = Number(x);
-  if (Number.isNaN(n)) return '-';
-  if (n >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  if (n >= 1) return n.toFixed(3);
-  if (n >= 0.01) return n.toFixed(4);
-  return n.toFixed(6);
-}
-"""
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
@@ -301,47 +594,95 @@ async def trades_page():
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Trades</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif; margin:24px;}
-    table{border-collapse:collapse; width:100%}
-    th,td{border:1px solid #e5e7eb; padding:8px; text-align:left}
-    th{background:#f3f4f6}
-    .muted{color:#6b7280}
+    :root{
+      --bg:#0f172a; --card:#111827; --border:#1f2937; --text:#e5e7eb; --muted:#94a3b8;
+      --green:#22c55e; --red:#ef4444; --accent:#22d3ee;
+    }
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif; background:linear-gradient(180deg,#0b1224 0%, #0f172a 100%); color:var(--text); margin:0; padding:24px;}
+    .wrap{max-width:1200px; margin:0 auto}
+    h1{margin:0 0 16px 0}
+    .muted{color:var(--muted)}
+    .card{background:rgba(17,24,39,.8); border:1px solid var(--border); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.25); backdrop-filter: blur(6px);}
+    table{border-collapse:collapse; width:100%; overflow:hidden; border-radius:12px; border:1px solid var(--border)}
+    thead th{background:#0b1224; color:#a5b4fc; font-weight:700; font-size:12px; letter-spacing:.06em; text-transform:uppercase; padding:12px; text-align:left}
+    tbody td{border-top:1px solid var(--border); padding:10px; font-variant-numeric:tabular-nums}
+    .badge{padding:4px 8px; border-radius:8px; font-weight:700; font-size:12px; border:1px solid transparent}
+    .badge.buy{color:#bbf7d0; background:rgba(34,197,94,.12); border-color:rgba(34,197,94,.3)}
+    .badge.sell{color:#fecaca; background:rgba(239,68,68,.12); border-color:rgba(239,68,68,.3)}
+    .pill{padding:4px 8px; border-radius:999px; font-size:12px; border:1px solid var(--border); color:#cbd5e1}
+    .mono{font-variant-numeric:tabular-nums}
+    .toolbar{display:flex; gap:8px; align-items:center; margin:12px 0 16px}
+    .btn{display:inline-block; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0b1224; color:var(--text); text-decoration:none; font-weight:600}
+    .btn:hover{transform:translateY(-1px)}
   </style>
 </head>
 <body>
-  <h1>📈 Trades</h1>
-  <p class="muted">Actualisation auto toutes les 10s</p>
-  <table id="t">
-    <thead>
-      <tr>
-        <th>Heure</th><th>Symbole</th><th>Side</th><th>TF</th>
-        <th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th>
-        <th>Confiance</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-  <script>""" + TRADES_PAGE_JS + """</script>
+  <div class="wrap">
+    <h1>📈 Trades</h1>
+    <div class="muted">Actualisation auto toutes les 10s</div>
+    <div class="toolbar">
+      <a class="btn" href="/">← Retour</a>
+      <a class="btn" href="/api/reset">♻️ Reset</a>
+    </div>
+    <div class="card">
+      <table id="t">
+        <thead>
+          <tr>
+            <th>Heure</th>
+            <th>Symbole</th>
+            <th>Side</th>
+            <th>TF</th>
+            <th>Entry</th>
+            <th>TP1</th>
+            <th>TP2</th>
+            <th>TP3</th>
+            <th>SL</th>
+            <th>Confiance</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
   <script>
+    function formatNumber(x) {
+      if (x === null || x === undefined || x === '') return '-';
+      const n = Number(x);
+      if (Number.isNaN(n)) return '-';
+      if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+      if (Math.abs(n) >= 1) return n.toFixed(3);
+      if (Math.abs(n) >= 0.01) return n.toFixed(4);
+      return n.toFixed(6);
+    }
+    function money(x){ const v = formatNumber(x); return v==='-'?'-':('$'+v); }
+    function badge(side){
+      side = (side||'').toUpperCase();
+      if(side==='BUY') return '<span class="badge buy">BUY</span>';
+      if(side==='SELL') return '<span class="badge sell">SELL</span>';
+      return '<span class="pill">-</span>';
+    }
+
     async function load(){ 
       const r = await fetch('/api/trades'); 
       const js = await r.json();
       const tbody = document.querySelector('#t tbody');
       tbody.innerHTML = '';
-      js.forEach(tr => {
+      js.slice().reverse().forEach(tr => {
+        const c = tr.confidence ? (tr.confidence.score + '% (' + tr.confidence.label + ')') : '-';
         const trEl = document.createElement('tr');
-        const conf = tr.confidence ? (tr.confidence.score + '% ' + '(' + tr.confidence.label + ')') : '-';
         trEl.innerHTML = `
-          <td>${tr.entry_time || tr.created_at || '-'}</td>
-          <td>${tr.symbol || '-'}</td>
-          <td>${tr.side || '-'}</td>
-          <td>${tr.tf || '-'}</td>
-          <td>${formatNumber(tr.entry)}</td>
-          <td>${formatNumber(tr.tp1)}</td>
-          <td>${formatNumber(tr.tp2)}</td>
-          <td>${formatNumber(tr.tp3)}</td>
-          <td>${formatNumber(tr.sl)}</td>
-          <td>${conf}</td>
+          <td class="mono">${tr.entry_time || tr.created_at || '-'}</td>
+          <td><strong>${tr.symbol || '-'}</strong></td>
+          <td>${badge(tr.side)}</td>
+          <td><span class="pill">${tr.tf || '-'}</span></td>
+          <td class="mono">${money(tr.entry)}</td>
+          <td class="mono">${money(tr.tp1)}</td>
+          <td class="mono">${money(tr.tp2)}</td>
+          <td class="mono">${money(tr.tp3)}</td>
+          <td class="mono">${money(tr.sl)}</td>
+          <td>${c}</td>
         `;
         tbody.appendChild(trEl);
       });
@@ -352,204 +693,49 @@ async def trades_page():
 </html>"""
     return HTMLResponse(html)
 
-@app.get("/api/trades", response_class=JSONResponse)
-async def api_trades():
-    return JSONResponse(STATE.trades)
 
-@app.post("/api/reset", response_class=PlainTextResponse)
-async def api_reset():
-    STATE.reset()
-    return PlainTextResponse("OK")
-
-@app.get("/api/fear-greed", response_class=JSONResponse)
-async def api_fng():
-    fng = await fetch_fear_greed()
-    logger.info(f"✅ Fear & Greed: {fng}")
-    return {"value": fng}
-
-@app.get("/api/bullrun-phase", response_class=JSONResponse)
-async def api_bullrun():
-    btc_price = await fetch_spot_price("BTCUSDT")
-    btc_d = await fetch_btc_dominance()
-    mc = 3.87  # T (placeholder)
-    if btc_d is not None:
-        logger.info(f"✅ Global: MC ${mc:.2f}T, BTC.D {btc_d:.1f}%")
-    if btc_price is not None:
-        logger.info(f"✅ Prix: BTC ${btc_price:,.0f}".replace(",", " "))
-    return {
-        "market_cap_trillions": mc,
-        "btc_dominance": btc_d,
-        "btc_price": btc_price
-    }
-
-# Pages placeholders pour éviter “rien n’est beau”
+# -----------------------------------------------------------------------------
+# Petites pages (pour éviter 404 et garder l’UX)
+# -----------------------------------------------------------------------------
 @app.get("/equity-curve", response_class=HTMLResponse)
-async def page_equity():
-    return HTMLResponse("<h1>Équity curve</h1><p>Placeholder simple.</p>")
+async def equity_curve():
+    return HTMLResponse("""
+    <!doctype html><html><head><meta charset="utf-8"><title>Équity</title></head>
+    <body style="background:#0f172a;color:#e5e7eb;font-family:Inter;padding:24px">
+      <h1>📈 Équity (aperçu)</h1>
+      <p>Simple placeholder (à brancher sur vos données historiques si besoin).</p>
+      <p><a href="/" style="color:#22d3ee">← Retour</a></p>
+    </body></html>
+    """)
+
 
 @app.get("/journal", response_class=HTMLResponse)
-async def page_journal():
-    return HTMLResponse("<h1>Journal</h1><p>Placeholder simple.</p>")
+async def journal():
+    return HTMLResponse("""
+    <!doctype html><html><head><meta charset="utf-8"><title>Journal</title></head>
+    <body style="background:#0f172a;color:#e5e7eb;font-family:Inter;padding:24px">
+      <h1>📝 Journal</h1>
+      <p>Placeholder. Vous pouvez consigner vos notes ici ultérieurement.</p>
+      <p><a href="/" style="color:#22d3ee">← Retour</a></p>
+    </body></html>
+    """)
 
-@app.get("/heatmap", response_class=HTMLResponse)
-async def page_heatmap():
-    return HTMLResponse("<h1>Heatmap</h1><p>Placeholder simple.</p>")
-
-@app.get("/strategie", response_class=HTMLResponse)
-async def page_strat():
-    return HTMLResponse("<h1>Stratégie</h1><p>Placeholder simple.</p>")
-
-@app.get("/backtest", response_class=HTMLResponse)
-async def page_backtest():
-    return HTMLResponse("<h1>Backtest</h1><p>Placeholder simple.</p>")
-
-@app.get("/patterns", response_class=HTMLResponse)
-async def page_patterns():
-    return HTMLResponse("<h1>Patterns</h1><p>Placeholder simple.</p>")
 
 @app.get("/annonces", response_class=HTMLResponse)
-async def page_news():
-    return HTMLResponse("<h1>Annonces</h1><p>Placeholder simple.</p>")
+async def annonces():
+    return HTMLResponse("""
+    <!doctype html><html><head><meta charset="utf-8"><title>News</title></head>
+    <body style="background:#0f172a;color:#e5e7eb;font-family:Inter;padding:24px">
+      <h1>🗞️ News</h1>
+      <p>Flux d'annonces (placeholder). Intégrez vos RSS ici.</p>
+      <p><a href="/" style="color:#22d3ee">← Retour</a></p>
+    </body></html>
+    """)
 
-# ------------------------------------------------------------------------------
-# Webhook TradingView TOLÉRANT
-# ------------------------------------------------------------------------------
-@app.post("/tv-webhook")
-async def tv_webhook(request: Request):
-    # Parse "intelligent"
-    payload = await parse_tv_payload(request)
 
-    # Normalise clés via ALIASES
-    norm: Dict[str, Any] = {}
-    for k, v in payload.items():
-        k2 = ALIASES.get(str(k).strip().lower())
-        if k2:
-            norm[k2] = v
-
-    alert_name = str(norm.get("alert_name", "")).upper()
-    direction  = str(norm.get("direction", "")).upper()
-    side       = str(norm.get("side", "")).upper()
-
-    # Déduction du side si absent
-    if side not in {"BUY", "SELL"}:
-        if direction in {"LONG", "BUY"}:
-            side = "BUY"
-        elif direction in {"SHORT", "SELL"}:
-            side = "SELL"
-        elif "LONG" in alert_name or "BUY" in alert_name:
-            side = "BUY"
-        elif "SHORT" in alert_name or "SELL" in alert_name:
-            side = "SELL"
-
-    if not side:
-        logger.warning("⚠️ Side manquant")
-        raise HTTPException(status_code=400, detail="side manquant")
-
-    # Symbol
-    symbol = norm.get("symbol") or ""
-    symbol = str(symbol).upper().replace("PERP", "USDT").replace(".P", "USDT").replace("-PERP", "USDT")
-
-    if not symbol:
-        # Essaie depuis alert_name : ex "NOUVEAU TRADE — FLUXUSDT.P"
-        m = re.search(r"([A-Z]{2,}USDT(?:\.P)?)", alert_name)
-        if m:
-            symbol = m.group(1).replace(".P", "USDT")
-
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol manquant")
-
-    # Entry
-    entry = as_float(norm.get("entry"))
-    if entry is None:
-        entry = await fetch_spot_price(symbol)
-    if entry is None:
-        raise HTTPException(status_code=400, detail="entry manquant et fetch spot impossible")
-
-    # Timeframe & heure
-    tf = norm.get("tf") or "-"
-    entry_time = norm.get("entry_time") or datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-    # TP/SL
-    tp1 = as_float(norm.get("tp1"))
-    tp2 = as_float(norm.get("tp2"))
-    tp3 = as_float(norm.get("tp3"))
-    sl  = as_float(norm.get("sl"))
-
-    TP_LONG  = (0.015, 0.025, 0.040)
-    TP_SHORT = (0.015, 0.025, 0.040)
-    SL_LONG  = 0.02
-    SL_SHORT = 0.02
-
-    if tp1 is None or tp2 is None or tp3 is None or sl is None:
-        if side == "BUY":
-            if tp1 is None: tp1 = entry * (1 + TP_LONG[0])
-            if tp2 is None: tp2 = entry * (1 + TP_LONG[1])
-            if tp3 is None: tp3 = entry * (1 + TP_LONG[2])
-            if sl  is None: sl  = entry * (1 - SL_LONG)
-        else:
-            if tp1 is None: tp1 = entry * (1 - TP_SHORT[0])
-            if tp2 is None: tp2 = entry * (1 - TP_SHORT[1])
-            if tp3 is None: tp3 = entry * (1 - TP_SHORT[2])
-            if sl  is None: sl  = entry * (1 + SL_SHORT)
-
-    # Score confiance vivant
-    fng = await fetch_fear_greed()
-    btc_d = await fetch_btc_dominance()
-    score, label, reasons = confidence_score(fng, btc_d, side)
-
-    trade = {
-        "symbol": symbol,
-        "side": side,
-        "direction": "LONG" if side == "BUY" else "SHORT",
-        "tf": tf,
-        "entry": round(entry, 10),
-        "tp1": round(tp1, 10),
-        "tp2": round(tp2, 10),
-        "tp3": round(tp3, 10),
-        "sl":  round(sl,  10),
-        "entry_time": entry_time,
-        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-        "confidence": {"score": score, "label": label, "reasons": reasons},
-    }
-
-    STATE.trades.append(trade)
-
-    # Message Telegram
-    # Titre inclut le symbole pour régler "ne dit pas c'est quoi la crypto"
-    parts = []
-    parts.append(f"🎯 <b>NOUVEAU TRADE — {symbol}</b>")
-    parts.append("")
-    parts.append(f"📊 <b>{'BUY' if side=='BUY' else 'SELL'}</b>")
-    parts.append(f"📈 Direction: {trade['direction']} | {tf}")
-    parts.append("")
-    parts.append(f"💰 Entry: {fmt_money(entry)}")
-    parts.append("")
-    parts.append("🎯 <b>Take Profits:</b>")
-    parts.append(f"  TP1: {fmt_money(tp1)}")
-    parts.append(f"  TP2: {fmt_money(tp2)}")
-    parts.append(f"  TP3: {fmt_money(tp3)}")
-    parts.append("")
-    parts.append(f"🛑 Stop Loss: {fmt_money(sl)}")
-    parts.append("")
-    parts.append(f"📊 <b>CONFIANCE:</b> {score}% ({label})")
-    parts.append("")
-    why = reasons if reasons else "—"
-    parts.append("Pourquoi ce score ?")
-    for bullet in why.split(" • "):
-        if bullet.strip():
-            parts.append(f"  • {bullet.strip()}")
-
-    fg_str = f"{fng}" if fng is not None else "—"
-    btd_str = f"{btc_d:.1f}%" if btc_d is not None else "—"
-    parts.append("")
-    parts.append(f"💡 Marché: F&G {fg_str} | BTC.D {btd_str}")
-
-    text = "\n".join(parts)
-    await telegram_send(text)
-
-    return JSONResponse({"ok": True})
-
-# ------------------------------------------------------------------------------
-# Uvicorn entrypoint
-# ------------------------------------------------------------------------------
-# Laisse 'app' au niveau global pour uvicorn: `uvicorn main:app --host 0.0.0.0 --port 8000`
+# -----------------------------------------------------------------------------
+# Run hint (Render/uvicorn utilise: "uvicorn main:app")
+# -----------------------------------------------------------------------------
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
