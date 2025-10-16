@@ -1,487 +1,429 @@
 # main.py
-import os, re, json, asyncio, logging, random
-from typing import Optional, Dict, Any, List
+import os
+import re
+import json
+import time
+import math
+import asyncio
+import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
 
-app = FastAPI(title="TradingView Webhook Dashboard")
+app = FastAPI(title="TradingView Webhook Bridge")
 
-# ========= Config =========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# =========================
+# ------- Storage ---------
+# =========================
+class Trade(BaseModel):
+    id: int
+    side: str = Field(default="-")            # BUY / SELL
+    symbol: str = Field(default="-")          # e.g. BTCUSDT.P
+    direction: str = Field(default="-")       # LONG / SHORT
+    timeframe: str = Field(default="-")       # e.g. 15
+    entry: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    sl: Optional[float] = None
+    entry_time: str = Field(default="-")      # human text
+    alert_name: str = Field(default="-")
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
 
-# ========= In-memory state =========
-STATE: Dict[str, Any] = {
-    "next_id": 1,
-    "trades": [],              # list[dict]
-    "equity_curve": [],        # list[{t, equity}]
-    "journal": [],             # list entries
-    "heatmap": {},             # symbol -> score
-    "market": {                # Market snapshot pour confiance
-        "fear_greed": 28,
-        "btc_dominance": 57.2,
-        "btc_price": 110_500,
-        "marketcap": "3.87T",
-    },
-    "annonces": [],            # RSS/news items (optionnel)
-}
+TRADES: List[Trade] = []
+NEXT_ID = 1
 
-def _now_iso():
-    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+# Simple lock (single worker)
+def next_id() -> int:
+    global NEXT_ID
+    nid = NEXT_ID
+    NEXT_ID += 1
+    return nid
 
-# ========= Confidence scoring (vivant) =========
-def compute_confidence(market: Dict[str, Any], side: str) -> Dict[str, Any]:
-    fg = float(market.get("fear_greed", 50) or 50)
-    btc_d = float(market.get("btc_dominance", 50) or 50)
-
-    score = 50
-    why: List[str] = []
-
-    # Sentiment global
-    if fg <= 20:
-        score += 8;  why.append("✅ Peur extrême : opportunités")
-    elif fg <= 30:
-        score += 4;  why.append("✅ Sentiment frileux : léger avantage")
-    elif fg >= 70:
-        score -= 6;  why.append("⚠️ Euphorie : prudence")
-
-    # Dominance BTC
-    if btc_d >= 57:
-        score -= 5;  why.append("⚠️ BTC dominant : altcoins sous pression")
-    elif btc_d <= 48:
-        score += 4;  why.append("✅ Dominance BTC faible : altcoins favorisés")
-
-    # Alignement côté/condition
-    s = (side or "").upper()
-    if s == "BUY" and fg <= 30: score += 3
-    if s == "SELL" and fg >= 70: score += 3
-
-    score = max(0, min(100, score))
-    label = "ÉLEVÉ" if score >= 70 else ("MOYEN" if score >= 55 else "FAIBLE")
-    # On garde 3 raisons max, sinon ça spam
-    return {"score": score, "label": label, "reasons": why[:3] or ["ℹ️ Modèle neutre"]}
-
-# ========= Telegram =========
-async def send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("⚠️ Telegram non configuré (TELEGRAM_BOT_TOKEN/CHAT_ID manquants)")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    async with httpx.AsyncClient(timeout=15) as client:
-        for attempt in range(5):
-            r = await client.post(url, json=payload)
-            if r.status_code == 429:
-                retry = 1
-                try: retry = r.json().get("parameters", {}).get("retry_after", 1)
-                except Exception: pass
-                log.error(f"❌ Telegram: 429 - retry {retry}s (attempt {attempt+1})")
-                await asyncio.sleep(retry)
-                continue
-            if r.status_code >= 400:
-                log.error(f"❌ Telegram: {r.status_code} - {r.text}")
-            else:
-                log.info("✅ Telegram envoyé")
-            break
-
-def fmt_money(x: Optional[Any]) -> str:
+def to_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace(",", "")
     try:
-        if x is None or x == "" or str(x).strip() == "-" or str(x).strip().lower() == "nan":
-            return "-"
-        n = float(str(x).replace(",", ""))
-        s = f"{n:.6f}".rstrip("0").rstrip(".")
-        return s if s else "0"
-    except Exception:
-        return "-"
-
-def build_telegram_message(t: Dict[str, Any], market: Dict[str, Any]) -> str:
-    side = (t.get("side") or "").upper()
-    direction = "LONG" if side == "BUY" else ("SHORT" if side == "SELL" else "-")
-    tf = str(t.get("timeframe") or "-")
-    fg = market.get("fear_greed", "-")
-    btc_d = market.get("btc_dominance", "-")
-
-    conf = compute_confidence(market, side)
-    reasons = conf["reasons"]
-
-    lines = [
-        f"<b>🎯 NOUVEAU TRADE — {t.get('symbol','-')}</b>",
-        "",
-        f"📊 <b>{side or '-'}</b>",
-        f"📈 Direction: {direction} | {tf}",
-        f"🕒 Heure: {t.get('entry_time','-')}",
-        "",
-        f"💰 Entry: ${fmt_money(t.get('entry'))}",
-        "",
-        "🎯 Take Profits:",
-        f"  TP1: ${fmt_money(t.get('tp1'))}",
-        f"  TP2: ${fmt_money(t.get('tp2'))}",
-        f"  TP3: ${fmt_money(t.get('tp3'))}",
-        "",
-        f"🛑 Stop Loss: ${fmt_money(t.get('sl'))}",
-        "",
-        f"📊 CONFIANCE: {conf['score']}% ({conf['label']})",
-        "",
-        "Pourquoi ce score ?",
-        *[f"  • {r}" for r in reasons],
-        "",
-        f"💡 Marché: F&G {fg} | BTC.D {btc_d}%",
-    ]
-    return "\n".join(lines)
-
-# ========= Parsing Webhook =========
-ALIASES = {
-    "symbol": {"ticker", "asset", "pair", "sym"},
-    "side": {"action", "direction", "type"},
-    "timeframe": {"tf", "interval"},
-    "entry_time": {"entrytime","time","heure"},
-    "alert_name": {"alert","name","message_name","messagename","messanem"},
-}
-NUMBER_KEYS = {"entry","tp1","tp2","tp3","sl"}
-
-SYMBOL_RE = re.compile(r"\b([A-Z0-9]{2,}[A-Z]{3,})(?:\.P|USDT\.P|USD\.P|USDC\.P|\.P)?\b")
-PRICE_RE  = re.compile(r"(@|entry|entrée|price|prix)\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP_RE     = re.compile(r"TP\s*1?\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP2_RE    = re.compile(r"TP\s*2\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-TP3_RE    = re.compile(r"TP\s*3\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-SL_RE     = re.compile(r"\bSL|stop\s*loss\b\s*[:=]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
-
-def norm_key(k:str)->str:
-    k = (k or "").strip().lower()
-    for canonical, alts in ALIASES.items():
-        if k == canonical or k in alts:
-            return canonical
-    return k
-
-def parse_number(v: Any) -> Optional[float]:
-    if v is None: return None
-    s = str(v).strip().replace(",", "")
-    try:
+        # ignore date-like strings
+        if re.search(r"\d{2}:\d{2}", s) or re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", s):
+            return None
         return float(s)
-    except Exception:
+    except:
         return None
 
-def parse_text_body(body: str) -> Dict[str, Any]:
-    """Parse format texte libre type:
-       side=BUY; symbol=FLUXUSDT.P; tf=15; entry=0.0123; tp1=...; sl=...
-       ou lignes 'key: value'"""
-    data: Dict[str, Any] = {}
-    parts = re.split(r"[;\n]+", body)
-    for p in parts:
-        m = re.match(r"\s*([A-Za-z0-9_]+)\s*[:=]\s*(.+?)\s*$", p)
-        if not m:
-            continue
-        k, v = m.group(1), m.group(2)
-        k = norm_key(k)
-        v = v.strip()
-        data[k] = v
-    # si un seul champ message contient du json/kv, reparse
-    msg = data.get("message")
-    if isinstance(msg, str) and ("=" in msg or ":" in msg):
-        data.update(parse_text_body(msg))
-    return data
+def safe_text(x: Any, dash: str = "-") -> str:
+    if x is None:
+        return dash
+    s = str(x).strip()
+    return s if s else dash
 
-def coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(d)
-    for k in NUMBER_KEYS:
-        if k in out:
-            out[k] = parse_number(out[k])
-    if "timeframe" in out and isinstance(out["timeframe"], str):
-        out["timeframe"] = out["timeframe"].strip().upper()
-    if "side" in out and isinstance(out["side"], str):
-        s = out["side"].strip().upper()
-        if s in ("BUY","LONG"): out["side"] = "BUY"
-        elif s in ("SELL","SHORT"): out["side"] = "SELL"
-    if not out.get("entry_time"):
-        out["entry_time"] = _now_iso()
-    return out
+# =========================
+# ---- Market Context -----
+# =========================
+MARKET = {
+    "fear_greed": 50,      # 0..100
+    "btc_d": 50.0,         # %
+    "mc_trillion": 3.5,    # T
+    "btc_price": 70000.0,
+    "last_update": None,
+}
 
-def try_fill_from_text(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Complète symbol/entry/tp/sl depuis alert_name/message si manquants."""
-    txt_parts = []
-    for k in ("alert_name","message","name","text","raw"):
-        v = d.get(k)
-        if isinstance(v, str) and v:
-            txt_parts.append(v)
-    blob = " | ".join(txt_parts)
-
-    if not d.get("symbol"):
-        m = SYMBOL_RE.search(blob)
-        if m:
-            d["symbol"] = m.group(1) + (".P" if ".P" in blob else "")
-    if d.get("entry") is None:
-        for rx in (PRICE_RE,):
-            m = rx.search(blob)
-            if m:
-                d["entry"] = parse_number(m.group(2)); break
-    if d.get("tp1") is None:
-        m = TP_RE.search(blob)
-        if m: d["tp1"] = parse_number(m.group(1))
-    if d.get("tp2") is None:
-        m = TP2_RE.search(blob)
-        if m: d["tp2"] = parse_number(m.group(1))
-    if d.get("tp3") is None:
-        m = TP3_RE.search(blob)
-        if m: d["tp3"] = parse_number(m.group(1))
-    if d.get("sl") is None:
-        m = SL_RE.search(blob)
-        if m: d["sl"] = parse_number(m.group(1))
-    return d
-
-async def parse_webhook(request: Request) -> Dict[str, Any]:
-    ctype = request.headers.get("content-type","").lower()
-    body_bytes = await request.body()
-    log.info(f"📥 Webhook content-type: {ctype}")
-    try:
-        raw_text = body_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        raw_text = ""
-
-    # JSON direct
-    if "application/json" in ctype:
-        try:
-            j = await request.json()
-            log.info(f"📥 Webhook payload (keys): {list(j.keys())}")
-            data = {norm_key(k): v for k, v in j.items()}
-            # Si j["message"] contient un JSON stringifié
-            msg = data.get("message")
-            if isinstance(msg, str) and msg.strip().startswith("{") and msg.strip().endswith("}"):
-                try:
-                    inner = json.loads(msg)
-                    data.update({norm_key(k): v for k, v in inner.items()})
-                except Exception:
-                    pass
-            data = coerce_types(try_fill_from_text(data))
-            return data
-        except Exception:
-            log.warning("⚠️ JSON invalide -> tentative texte")
-
-    # Form
-    if "application/x-www-form-urlencoded" in ctype:
-        form = await request.form()
-        data = {norm_key(k): (form.get(k) if form.get(k) is not None else "") for k in form.keys()}
-        log.info(f"📥 Webhook form (keys): {list(data.keys())}")
-        # JSON dans "message"
-        msg = data.get("message")
-        if isinstance(msg, str) and msg.strip().startswith("{") and msg.strip().endswith("}"):
-            try:
-                inner = json.loads(msg)
-                data.update({norm_key(k): v for k, v in inner.items()})
-            except Exception:
-                pass
-        else:
-            # kv dans "message"
-            if isinstance(msg, str) and ("=" in msg or ":" in msg):
-                data.update(parse_text_body(msg))
-        data = coerce_types(try_fill_from_text(data))
-        return data
-
-    # Texte: JSON pur
-    if raw_text.strip().startswith("{") and raw_text.strip().endswith("}"):
-        try:
-            j = json.loads(raw_text)
-            log.info(f"📥 Webhook payload (keys via text->json): {list(j.keys())}")
-            data = {norm_key(k): v for k, v in j.items()}
-            data = coerce_types(try_fill_from_text(data))
-            return data
-        except Exception:
-            pass
-
-    # Texte kv
-    if raw_text:
-        data = parse_text_body(raw_text)
-        log.info(f"📥 Webhook payload (keys via text): {list(data.keys())}")
-        data = coerce_types(try_fill_from_text(data))
-        return data
-
-    return {}
-
-# ========= Background market refresher (léger, mockable) =========
-async def market_refresher():
+async def refresh_market_loop():
     while True:
         try:
-            # Ici tu peux brancher de vraies API si tu veux.
-            # On fait varier un peu pour rendre le score "vivant".
-            fg = STATE["market"].get("fear_greed", 28)
-            fg = max(0, min(100, fg + random.choice([-1,0,0,1])))
-            btc_d = STATE["market"].get("btc_dominance", 57.1)
-            btc_d = max(30, min(70, btc_d + random.choice([-0.1,0,0,0.1])))
-            price = STATE["market"].get("btc_price", 110_500)
-            price = max(9000, price + random.choice([-50,0,25,40,-30,10]))
-            STATE["market"].update({"fear_greed": fg, "btc_dominance": round(btc_d,1), "btc_price": price})
+            # Fear & Greed (alternative.me)
+            async with httpx.AsyncClient(timeout=8) as client:
+                try:
+                    r = await client.get("https://api.alternative.me/fng/?limit=1&format=json")
+                    if r.status_code == 200:
+                        j = r.json()
+                        v = int(j["data"][0]["value"])
+                        MARKET["fear_greed"] = v
+                        log.info(f"✅ Fear & Greed: {v}")
+                except Exception:
+                    pass
+
+                # BTC Dom + MC + price: coinstats.app (lightweight public)
+                try:
+                    r = await client.get("https://api.coinstats.app/public/v1/global")
+                    if r.status_code == 200:
+                        j = r.json()
+                        MARKET["mc_trillion"] = round(j.get("marketCap", 0) / 1e12, 2)
+                        MARKET["btc_d"] = float(j.get("btcDominance", 0.0))
+                        log.info(f"✅ Global: MC ${MARKET['mc_trillion']}T, BTC.D {MARKET['btc_d']}%")
+                except Exception:
+                    pass
+
+                try:
+                    r = await client.get("https://api.coinstats.app/public/v1/coins/bitcoin?currency=USD")
+                    if r.status_code == 200:
+                        j = r.json()
+                        MARKET["btc_price"] = float(j["coin"]["price"])
+                        log.info(f"✅ Prix: BTC ${int(MARKET['btc_price']):,}".replace(",", " "))
+                except Exception:
+                    pass
+
+            MARKET["last_update"] = datetime.utcnow().isoformat()
         except Exception as e:
-            log.warning(f"Market refresher error: {e}")
-        await asyncio.sleep(30)
+            log.warning(f"⚠️ market loop: {e}")
+        await asyncio.sleep(60)
 
-@app.on_event("startup")
-async def on_start():
-    asyncio.create_task(market_refresher())
+def score_confiance() -> Dict[str, Any]:
+    fg = MARKET["fear_greed"]
+    b = MARKET["btc_d"]
 
-# ========= API =========
-@app.get("/api/trades")
-async def api_trades():
-    return {"trades": STATE["trades"]}
+    # base from sentiment
+    base = 50.0
+    # greed (<-> fear)
+    if fg <= 25:
+        base += 5     # opportunité d'achat
+    elif fg <= 45:
+        base += 2
+    elif fg >= 80:
+        base -= 5
+    elif fg >= 60:
+        base -= 2
 
-@app.post("/api/reset")
-async def api_reset():
-    STATE["trades"].clear()
-    STATE["next_id"] = 1
-    log.info("♻️ TradingState reset")
-    return {"ok": True}
+    # BTC dominance hurt alts longs
+    note = []
+    if b >= 57:
+        base -= 3
+        note.append("⚠️ BTC trop dominant pour altcoins")
+    elif b <= 45:
+        base += 2
+        note.append("✅ BTC.D basse: alts favorisées")
 
-@app.get("/api/fear-greed")
-async def api_fg():
-    fg = STATE["market"].get("fear_greed", 28)
-    log.info(f"✅ Fear & Greed: {fg}")
-    return {"fear_greed": fg}
+    # clamp
+    sc = max(0, min(100, round(base)))
+    if sc >= 70:
+        label = "ÉLEVÉ"
+    elif sc >= 55:
+        label = "MOYEN"
+    else:
+        label = "FAIBLE"
 
-@app.get("/api/bullrun-phase")
-async def api_phase():
-    mc = STATE["market"].get("marketcap", "3.87T")
-    btc_d = STATE["market"].get("btc_dominance", 57.1)
-    price = STATE["market"].get("btc_price", 110_500)
-    log.info(f"✅ Global: MC ${mc}, BTC.D {btc_d}%")
-    log.info(f"✅ Prix: BTC ${price:,}".replace(",", " "))
-    return {"marketcap":"$"+mc, "btc_dominance": btc_d, "btc_price": price}
+    # default explanation if empty
+    if not note:
+        if sc >= 55:
+            note.append("✅ Sentiment frileux : léger avantage aux longs")
+        else:
+            note.append("⚠️ Sentiment frileux : avantage modéré")
 
-@app.get("/api/equity-curve")
-async def api_equity_curve():
-    # Placeholder simple: equity = base + nb_trades * delta
-    if not STATE["equity_curve"]:
-        base = 10_000
-        eq = base
-        for i, t in enumerate(STATE["trades"] or []):
-            eq += (1 if t["side"]=="BUY" else -1) * 5
-            STATE["equity_curve"].append({"t": i+1, "equity": eq})
-    return {"equity": STATE["equity_curve"]}
-
-@app.get("/api/journal")
-async def api_journal():
-    return {"journal": STATE["journal"]}
-
-@app.get("/api/heatmap")
-async def api_heatmap():
-    # Placeholder: score aléatoire
-    if not STATE["heatmap"]:
-        for t in STATE["trades"]:
-            STATE["heatmap"][t["symbol"]] = random.randint(-5, 5)
-    return {"heatmap": STATE["heatmap"]}
-
-# ========= Webhook =========
-@app.post("/tv-webhook")
-async def tv_webhook(request: Request):
-    data = await parse_webhook(request)
-
-    side = (data.get("side") or "").upper()
-    symbol = (data.get("symbol") or "").upper()
-    if not symbol:
-        log.warning("⚠️ Webhook: Symbol manquant")
-        return PlainTextResponse("symbol missing", status_code=400)
-    if side not in ("BUY","SELL"):
-        log.warning("⚠️ Action inconnue: ''")
-        return PlainTextResponse("unknown action", status_code=400)
-
-    trade = {
-        "id": STATE["next_id"],
-        "symbol": symbol,
-        "side": side,
-        "direction": "LONG" if side=="BUY" else "SHORT",
-        "timeframe": data.get("timeframe") or data.get("tf") or "-",
-        "entry_time": data.get("entry_time") or _now_iso(),
-        "entry": parse_number(data.get("entry")),
-        "tp1": parse_number(data.get("tp1")),
-        "tp2": parse_number(data.get("tp2")),
-        "tp3": parse_number(data.get("tp3")),
-        "sl":  parse_number(data.get("sl")),
-        "alert_name": data.get("alert_name") or data.get("name") or "",
+    return {
+        "score": sc,
+        "label": label,
+        "reasons": note,
+        "fg": fg,
+        "btc_d": b
     }
 
-    STATE["trades"].append(trade)
-    STATE["next_id"] += 1
-    log.info(f"✅ Trade #{trade['id']}: {trade['symbol']} {trade['side']} @ {trade['entry']}")
+# =========================
+# ----- Telegram Send -----
+# =========================
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage" if TG_TOKEN else None
 
-    # Journal minimal auto
-    STATE["journal"].append({
-        "time": _now_iso(),
-        "text": f"{trade['symbol']} {trade['side']} {fmt_money(trade['entry'])} {trade['timeframe']}"
-    })
+async def tg_send(text: str, parse_mode: str = "HTML"):
+    if not TG_API or not TG_CHAT_ID:
+        log.info("ℹ️ Telegram non configuré (TOKEN/CHAT_ID manquants)")
+        return
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.post(TG_API, json=payload)
+            if r.status_code == 200:
+                log.info("✅ Telegram envoyé")
+            else:
+                # 429 handling
+                try:
+                    j = r.json()
+                except Exception:
+                    j = {}
+                ra = 5
+                if isinstance(j, dict):
+                    ra = int(j.get("parameters", {}).get("retry_after", 5) or 5)
+                log.error(f"❌ Telegram: {r.status_code} - {j if j else r.text}")
+                if r.status_code == 429:
+                    await asyncio.sleep(ra)
+                    r2 = await client.post(TG_API, json=payload)
+                    if r2.status_code == 200:
+                        log.info("✅ Telegram envoyé (retry)")
+                    else:
+                        log.error(f"❌ Telegram (retry): {r2.status_code} - {r2.text}")
+        except Exception as e:
+            log.error(f"❌ Telegram exception: {e}")
 
-    # Equity simple: +5/-5
-    eq_last = STATE["equity_curve"][-1]["equity"] if STATE["equity_curve"] else 10_000
-    eq_new = eq_last + (5 if side=="BUY" else -5)
-    STATE["equity_curve"].append({"t": len(STATE["equity_curve"])+1, "equity": eq_new})
+def fmt_money(x: Optional[float]) -> str:
+    if x is None:
+        return "-"
+    s = f"{x:.6f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
-    try:
-        msg = build_telegram_message(trade, STATE["market"])
-        asyncio.create_task(send_telegram(msg))
-    except Exception as e:
-        log.error(f"Telegram build/send error: {e}")
+def build_telegram(tr: Trade) -> str:
+    ctx = score_confiance()
+    s_score = ctx["score"]; s_label = ctx["label"]
+    reasons = "\n  • " + "\n  • ".join(ctx["reasons"])
+    fg = ctx["fg"]; b = ctx["btc_d"]
+    # direction: si absent, déduire depuis side
+    direction = tr.direction
+    if direction == "-" or not direction:
+        if str(tr.side).upper() == "BUY":
+            direction = "LONG"
+        elif str(tr.side).upper() == "SELL":
+            direction = "SHORT"
+        else:
+            direction = "-"
 
-    return JSONResponse({"ok": True, "id": trade["id"]})
+    lines = [
+        f"🎯 <b>NOUVEAU TRADE — {safe_text(tr.symbol)}</b>",
+        "",
+        f"📊 <b>{safe_text(tr.side).upper()}</b>",
+        f"📈 Direction: {direction} | {safe_text(tr.timeframe)}m" if tr.timeframe not in ("-", "") else f"📈 Direction: {direction} | -",
+        "",
+    ]
+    # Heure + Entry (prix)
+    if tr.entry_time and tr.entry_time != "-":
+        lines.append(f"🕒 Heure: {tr.entry_time}")
+    if tr.entry is not None:
+        lines.append(f"💰 Entry: ${fmt_money(tr.entry)}")
 
-# ========= HTML (sans f-strings !) =========
-HTML_HEAD = """
-<!doctype html><html lang="fr"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Dashboard Trading</title>
-<style>
-  :root{--bg:#0b0f14;--card:#121822;--muted:#98a2b3;--txt:#e6edf3;--border:#1f2937;--green:#22c55e;--red:#ef4444}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Roboto}
-  nav{display:flex;gap:8px;flex-wrap:wrap;padding:12px 16px;background:#0e141b;border-bottom:1px solid var(--border)}
-  nav a{padding:8px 10px;border:1px solid var(--border);border-radius:10px;background:#0f1720;color:#cbd5e1;text-decoration:none}
-  main{max-width:1100px;margin:20px auto;padding:0 16px}
-  h1{margin:0 0 14px 0}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px}
-  .table{overflow:auto;border-radius:10px;border:1px solid var(--border)}
-  table{width:100%;border-collapse:collapse;min-width:900px}
-  th,td{padding:10px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
-  th{background:#101723;color:#cbd5e1;text-align:left;position:sticky;top:0}
-  tr:hover td{background:#0e1620}
-  .mono{font-family:ui-monospace,Consolas,Menlo,Monaco,monospace}
-  .right{text-align:right}
-  .pill{padding:2px 8px;border-radius:999px;border:1px solid var(--border)}
-  .buy{color:var(--green)} .sell{color:var(--red)}
-  .toolbar{display:flex;justify-content:space-between;align-items:center;margin:0 0 10px 0;gap:8px;flex-wrap:wrap}
-  .btn{padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:#0f1720;color:#cbd5e1;cursor:pointer}
-  .muted{color:var(--muted)}
-  input,select{background:#0f1720;border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:8px 10px}
-</style>
-</head><body>
-"""
+    # TP/SL
+    show_tps = any(v is not None for v in [tr.tp1, tr.tp2, tr.tp3])
+    if show_tps:
+        lines.append("")
+        lines.append("🎯 Take Profits:")
+        lines.append(f"  TP1: ${fmt_money(tr.tp1)}")
+        lines.append(f"  TP2: ${fmt_money(tr.tp2)}")
+        lines.append(f"  TP3: ${fmt_money(tr.tp3)}")
+    if tr.sl is not None:
+        if not show_tps:
+            lines.append("")
+        lines.append(f"🛑 Stop Loss: ${fmt_money(tr.sl)}")
 
-HTML_FOOT = "</body></html>"
+    lines.extend([
+        "",
+        f"📊 <b>CONFIANCE:</b> {s_score}% ({s_label})",
+        "",
+        "Pourquoi ce score ?" + reasons,
+        "",
+        f"💡 Marché: F&G {fg} | BTC.D {fmt_money(b)}%",
+    ])
+    return "\n".join(lines)
 
-NAV = """
-<nav>
-  <a href="/">Accueil</a>
-  <a href="/trades">Trades</a>
-  <a href="/equity-curve">Equity</a>
-  <a href="/journal">Journal</a>
-  <a href="/heatmap">Heatmap</a>
-  <a href="/strategie">Stratégie</a>
-  <a href="/backtest">Backtest</a>
-  <a href="/annonces">Annonces</a>
-  <a href="/advanced-metrics">Advanced</a>
-  <a href="/patterns">Patterns</a>
-</nav>
-"""
+# =========================
+# ---- Webhook Parsing ----
+# =========================
+SIDE_RE = re.compile(r"\b(BUY|SELL|LONG|SHORT)\b", re.I)
+SYM_RE  = re.compile(r"\b([A-Z0-9]{3,}USDT(?:\.P)?)\b", re.I)
+
+def parse_text_payload(txt: str) -> Dict[str, Any]:
+    # Format style "key=value; key2=value2" ou texte brut avec indices
+    d: Dict[str, Any] = {}
+    # key=value pairs
+    for part in re.split(r"[;\n]+", txt):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    # fallback: essayer de repêcher infos via regex dans tout le blob
+    blob = txt
+
+    # side
+    if not d.get("side"):
+        m = SIDE_RE.search(blob)
+        if m:
+            val = m.group(1).upper()
+            if val == "LONG":  val = "BUY"
+            if val == "SHORT": val = "SELL"
+            d["side"] = val
+
+    # symbol
+    if not d.get("symbol"):
+        m = SYM_RE.search(blob)
+        if m:
+            d["symbol"] = m.group(1).upper()
+
+    # timeframe (tf)
+    if not d.get("tf"):
+        m = re.search(r"\b(1|3|5|15|30|45|60|120|240|D|W|M)\b", blob)
+        if m:
+            d["tf"] = m.group(1)
+
+    # entry/entry_time heuristics
+    if not d.get("entry") and not d.get("entry_time"):
+        # prix (décimal)
+        m = re.search(r"(\d+\.\d{2,})", blob)
+        if m:
+            d["entry"] = m.group(1)
+        # time
+        m2 = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2} \d{2}:\d{2}(:\d{2})?)", blob)
+        if m2:
+            d["entry_time"] = m2.group(1)
+
+    # alert_name
+    if not d.get("alert_name") and "alert_name:" in blob.lower():
+        m = re.search(r"alert_name\s*:\s*(.+)", blob, re.I)
+        if m:
+            d["alert_name"] = m.group(1).strip()
+
+    return d
+
+def normalize_direction(side_val: str) -> str:
+    s = (side_val or "").upper()
+    if s == "BUY":
+        return "LONG"
+    if s == "SELL":
+        return "SHORT"
+    return "-"
+
+def build_trade_from_dict(d: Dict[str, Any]) -> Trade:
+    # entry vs entry_time disambiguation
+    raw_entry = d.get("entry", None)
+    entry_time = safe_text(d.get("entry_time"), "-")
+    entry_val = to_float(raw_entry)
+
+    # si entry ressemble à une heure => bascule vers entry_time
+    if entry_val is None and raw_entry:
+        if re.search(r"\d{2}:\d{2}", str(raw_entry)):
+            if entry_time == "-":
+                entry_time = str(raw_entry)
+
+    side = safe_text(d.get("side")).upper()
+    if side == "LONG":
+        side = "BUY"
+    if side == "SHORT":
+        side = "SELL"
+
+    symbol = safe_text(d.get("symbol")).upper()
+    if symbol == "-" and d.get("alert_name"):
+        m = SYM_RE.search(d["alert_name"])
+        if m:
+            symbol = m.group(1).upper()
+
+    timeframe = safe_text(d.get("tf"), "-")
+
+    direction = safe_text(d.get("direction"), "-")
+    if direction == "-" and side in ("BUY", "SELL"):
+        direction = "LONG" if side == "BUY" else "SHORT"
+
+    tr = Trade(
+        id=next_id(),
+        side=side if side else "-",
+        symbol=symbol,
+        direction=direction,
+        timeframe=timeframe,
+        entry=entry_val,
+        tp1=to_float(d.get("tp1")),
+        tp2=to_float(d.get("tp2")),
+        tp3=to_float(d.get("tp3")),
+        sl=to_float(d.get("sl")),
+        entry_time=entry_time,
+        alert_name=safe_text(d.get("alert_name"), "-"),
+    )
+    return tr
+
+# =========================
+# --------- API ----------
+# =========================
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(refresh_market_loop())
+    # Seed demo (visuel)
+    global TRADES, NEXT_ID
+    TRADES.clear(); NEXT_ID = 1
+    demo = [
+        {"side":"BUY","symbol":"BTCUSDT","entry":65000,"tf":"15","entry_time":"-"},
+        {"side":"SELL","symbol":"ETHUSDT","entry":3500,"tf":"15"},
+        {"side":"BUY","symbol":"SOLUSDT","entry":140,"tf":"15"},
+    ]
+    for d in demo:
+        TRADES.append(build_trade_from_dict(d))
+    log.info(f"✅ Démo initialisée avec {len(TRADES)} trades")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse(HTML_HEAD + NAV + """
     <main>
-      <div class="card"><h1>🚀 Dashboard Trading</h1>
-        <p class="muted">Webhook TradingView ➜ stockage ➜ Telegram ➜ visualisation.</p>
-        <p>Utilise le menu ci-dessus. La page <b>Trades</b> liste toutes les entrées avec TP/SL et heure d’entrée.</p>
+      <div class="hero">
+        <h1>🚀 Dashboard Trading</h1>
+        <p class="muted">Bridge TradingView → Telegram + Web UI</p>
+        <div class="grid">
+          <a class="card link" href="/trades">📈 Trades</a>
+          <a class="card link" href="/equity-curve">📉 Equity</a>
+          <a class="card link" href="/journal">📝 Journal</a>
+          <a class="card link" href="/heatmap">🔥 Heatmap</a>
+          <a class="card link" href="/strategie">⚙️ Stratégie</a>
+          <a class="card link" href="/backtest">⏮️ Backtest</a>
+        </div>
       </div>
     </main>
     """ + HTML_FOOT)
+
+@app.get("/api/trades")
+async def api_trades():
+    return {"trades": [t.dict() for t in TRADES]}
+
+@app.post("/api/reset")
+async def api_reset():
+    global TRADES, NEXT_ID
+    TRADES.clear(); NEXT_ID = 1
+    log.info("♻️ TradingState reset")
+    return {"ok": True}
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
@@ -538,86 +480,239 @@ async def trades_page():
     </script>
     """ + HTML_FOOT)
 
+# --- Equity ---
+@app.get("/api/equity-curve")
+async def api_equity():
+    # Equity synthétique depuis entries
+    eq = 10000.0
+    pts = []
+    for t in TRADES:
+        # petit PnL aléatoire déterministe sur id
+        pnl = (1 if (t.side.upper()=="BUY") else -1) * (0.0015 * (t.id % 7))
+        eq *= (1 + pnl)
+        pts.append({"id": t.id, "symbol": t.symbol, "equity": round(eq,2)})
+    return {"equity": pts}
+
 @app.get("/equity-curve", response_class=HTMLResponse)
-async def equity_curve():
+async def equity_page():
     return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>📈 Equity</h1>
-      <p class="muted">Courbe d’equity (placeholder). API: <code>/api/equity-curve</code></p>
-    </div></main>""" + HTML_FOOT)
+    <main>
+      <h1>📉 Equity Curve</h1>
+      <div class="card">
+        <canvas id="c" height="140"></canvas>
+      </div>
+    </main>
+    <script>
+      async function load(){
+        const r = await fetch('/api/equity-curve',{cache:'no-store'}); const j = await r.json();
+        const labels = j.equity.map(x=>x.id);
+        const data = j.equity.map(x=>x.equity);
+        const ctx = document.getElementById('c').getContext('2d');
+        new Chart(ctx,{type:'line',data:{labels:labels,datasets:[{label:'Equity',data:data,fill:false}]},options:{responsive:true,plugins:{legend:{display:false}}}});
+      }
+      load();
+    </script>
+    """ + HTML_FOOT_CHART)
+
+# --- Journal ---
+@app.get("/api/journal")
+async def api_journal():
+    return {"notes":[{"when":t.created_at,"text":f"{t.side} {t.symbol} @ {fmt_money(t.entry)}"} for t in TRADES]}
 
 @app.get("/journal", response_class=HTMLResponse)
-async def journal():
+async def journal_page():
     return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>📝 Journal</h1>
-      <p class="muted">Journal (placeholder). API: <code>/api/journal</code></p>
-    </div></main>""" + HTML_FOOT)
+    <main>
+      <h1>📝 Journal</h1>
+      <div id="list" class="stack card"></div>
+    </main>
+    <script>
+      async function load(){
+        const r = await fetch('/api/journal',{cache:'no-store'}); const j = await r.json();
+        const html = (j.notes||[]).reverse().map(n=>`<div class="row"><div class="muted">${n.when}</div><div>${n.text}</div></div>`).join('');
+        document.getElementById('list').innerHTML = html || '<div class="muted">Vide</div>';
+      }
+      load();
+    </script>
+    """ + HTML_FOOT)
+
+# --- Heatmap ---
+@app.get("/api/heatmap")
+async def api_heatmap():
+    # synthétique
+    rows = []
+    syms = list({t.symbol for t in TRADES})
+    for s in syms:
+        v = (sum((1 if t.side=="BUY" else -1) for t in TRADES if t.symbol==s))/max(1,len([t for t in TRADES if t.symbol==s]))
+        rows.append({"symbol": s, "score": round(50+v*25,1)})
+    return {"rows": rows}
 
 @app.get("/heatmap", response_class=HTMLResponse)
-async def heatmap():
+async def heatmap_page():
     return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>🔥 Heatmap</h1>
-      <p class="muted">Heatmap (placeholder). API: <code>/api/heatmap</code></p>
-    </div></main>""" + HTML_FOOT)
+    <main>
+      <h1>🔥 Heatmap</h1>
+      <div id="grid" class="grid"></div>
+    </main>
+    <script>
+      async function load(){
+        const r = await fetch('/api/heatmap',{cache:'no-store'}); const j = await r.json();
+        const html = (j.rows||[]).map(x=>`<div class="card box"><div class="muted">${x.symbol}</div><div class="big">${x.score}</div></div>`).join('');
+        document.getElementById('grid').innerHTML = html || '<div class="muted">Vide</div>';
+      }
+      load();
+    </script>
+    """ + HTML_FOOT)
 
+# --- Stratégie / Backtest (placeholders esthétiques) ---
 @app.get("/strategie", response_class=HTMLResponse)
-async def strategie():
+async def strat_page():
     return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>⚙️ Stratégie</h1>
-      <p class="muted">Ta description de stratégie ici.</p>
-    </div></main>""" + HTML_FOOT)
+    <main>
+      <h1>⚙️ Stratégie</h1>
+      <div class="card">
+        <p class="muted">Décrivez ici les règles de votre stratégie. (Placeholder)</p>
+      </div>
+    </main>
+    """ + HTML_FOOT)
 
 @app.get("/backtest", response_class=HTMLResponse)
-async def backtest():
+async def backtest_page():
     return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>⏮️ Backtest</h1>
-      <p class="muted">Section backtest (placeholder).</p>
-    </div></main>""" + HTML_FOOT)
+    <main>
+      <h1>⏮️ Backtest</h1>
+      <div class="card">
+        <p class="muted">Courbes & stats de backtest (placeholder).</p>
+      </div>
+    </main>
+    """ + HTML_FOOT)
 
-@app.get("/annonces", response_class=HTMLResponse)
-async def annonces():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>🗞️ Annonces</h1>
-      <p class="muted">Flux d’annonces (placeholder). Tu peux brancher du RSS comme avant.</p>
-    </div></main>""" + HTML_FOOT)
+# =========================
+# ----- TV Webhook --------
+# =========================
+@app.post("/tv-webhook")
+async def tv_webhook(request: Request):
+    ctype = request.headers.get("content-type","").lower()
+    try:
+        if "application/json" in ctype:
+            payload = await request.json()
+            if isinstance(payload, dict):
+                d = {k.lower(): v for k,v in payload.items()}
+            else:
+                # TradingView peut envoyer une string JSON en 'text/plain'
+                d = {}
+        elif "text/plain" in ctype or "application/x-www-form-urlencoded" in ctype:
+            text = (await request.body()).decode("utf-8", errors="ignore")
+            log.info("📥 Webhook payload (keys via text): %s", list(parse_text_payload(text).keys()))
+            d = parse_text_payload(text)
+        else:
+            # tenter json puis texte
+            try:
+                j = await request.json()
+                d = {k.lower(): v for k,v in j.items()}
+            except:
+                text = (await request.body()).decode("utf-8","ignore")
+                d = parse_text_payload(text)
 
-@app.get("/advanced-metrics", response_class=HTMLResponse)
-async def advanced_metrics():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>📊 Advanced Metrics</h1>
-      <p class="muted">Espace pour ratios, winrate, etc.</p>
-    </div></main>""" + HTML_FOOT)
+        # déductions supplémentaires
+        # side
+        if not d.get("side"):
+            blob = json.dumps(d, ensure_ascii=False)
+            m = SIDE_RE.search(blob)
+            if m:
+                val = m.group(1).upper()
+                if val == "LONG":  val = "BUY"
+                if val == "SHORT": val = "SELL"
+                d["side"] = val
 
-@app.get("/patterns", response_class=HTMLResponse)
-async def patterns():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main><div class="card"><h1>🧩 Patterns</h1>
-      <p class="muted">Section patterns (placeholder).</p>
-    </div></main>""" + HTML_FOOT)
+        # symbol via alert_name si manquant
+        if not d.get("symbol") and d.get("alert_name"):
+            m = SYM_RE.search(str(d["alert_name"]))
+            if m:
+                d["symbol"] = m.group(1).upper()
 
-# ========= Demo seed =========
-def seed_demo():
-    if STATE["trades"]:
-        return
-    demo = [
-        {"symbol":"BTCUSDT","side":"BUY","timeframe":"15","entry":65000,"tp1":65650,"tp2":66300,"tp3":67600,"sl":63700},
-        {"symbol":"ETHUSDT","side":"SELL","timeframe":"15","entry":3500,"tp1":3465,"tp2":3430,"tp3":3360,"sl":3570},
-        {"symbol":"SOLUSDT","side":"BUY","timeframe":"15","entry":140,"tp1":141.4,"tp2":142.8,"tp3":145.6,"sl":136.7},
-    ]
-    for d in demo:
-        STATE["trades"].append({
-            "id": STATE["next_id"], "symbol": d["symbol"], "side": d["side"],
-            "direction": "LONG" if d["side"]=="BUY" else "SHORT",
-            "timeframe": d["timeframe"], "entry_time": _now_iso(),
-            "entry": d["entry"], "tp1": d["tp1"], "tp2": d["tp2"], "tp3": d["tp3"], "sl": d["sl"],
-            "alert_name": "DEMO"
-        })
-        log.info(f"✅ Trade #{STATE['next_id']}: {d['symbol']} {d['side']} @ {d['entry']}")
-        STATE["next_id"] += 1
-    log.info(f"✅ Démo initialisée avec {len(demo)} trades")
+        # require minimal keys
+        if not d.get("side"):
+            log.warning("⚠️ Side manquant")
+            return PlainTextResponse("Bad Request", status_code=400)
 
-seed_demo()
+        tr = build_trade_from_dict(d)
+        TRADES.append(tr)
 
-# ========= Run (local) =========
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+        # Telegram
+        txt = build_telegram(tr)
+        asyncio.create_task(tg_send(txt))
+
+        return JSONResponse({"ok": True, "id": tr.id})
+    except Exception as e:
+        log.exception("Webhook error: %s", e)
+        return PlainTextResponse("Error", status_code=500)
+
+# =========================
+# --------- UI ------------
+# =========================
+HTML_HEAD = """
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Trading Dashboard</title>
+<style>
+:root{
+  --bg:#0e1014; --card:#161a22; --text:#e7ecf3; --muted:#8a93a5; --buy:#16c784; --sell:#ea3943; --line:#222838;
+}
+*{box-sizing:border-box} body{margin:0;font:14px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial;color:var(--text);background:linear-gradient(180deg,#0e1014 0%,#0e1014 60%,#0b0d11 100%) fixed;}
+main{max-width:1100px;margin:24px auto;padding:0 16px}
+.nav{display:flex;gap:10px;flex-wrap:wrap;padding:10px 16px;background:#0b0d11;border-bottom:1px solid var(--line)}
+.nav a{color:var(--text);text-decoration:none;padding:8px 10px;border-radius:10px}
+.nav a:hover{background:#121620}
+.hero{display:flex;flex-direction:column;gap:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.card.link{display:flex;align-items:center;justify-content:center;min-height:90px;font-weight:600}
+.table table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:10px;border-bottom:1px solid var(--line)}
+.table th{font-weight:600;text-align:left;color:#cdd6e5}
+.table td.right{text-align:right}
+.muted{color:var(--muted)}
+.mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+.big{font-size:24px;font-weight:700}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);background:#10141b}
+.pill.buy{border-color:rgba(22,199,132,.35);color:#b7f0d5}
+.pill.sell{border-color:rgba(234,57,67,.35);color:#f7c0c5}
+.toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.btn{background:#0f1320;color:#e7ecf3;border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer}
+.stack .row{display:flex;gap:12px;padding:8px;border-bottom:1px solid var(--line)}
+.box{display:flex;align-items:center;justify-content:space-between}
+</style>
+</head>
+<body>
+<nav class="nav">
+  <a href="/">🏠 Accueil</a>
+  <a href="/trades">📈 Trades</a>
+  <a href="/equity-curve">📉 Equity</a>
+  <a href="/journal">📝 Journal</a>
+  <a href="/heatmap">🔥 Heatmap</a>
+  <a href="/strategie">⚙️ Stratégie</a>
+  <a href="/backtest">⏮️ Backtest</a>
+</nav>
+"""
+
+NAV = ""  # (déjà inclus dans HTML_HEAD)
+
+HTML_FOOT = """
+</body></html>
+"""
+
+HTML_FOOT_CHART = """
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</body></html>
+"""
+
+# =========================
+# ------- Run (local) -----
+# =========================
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
