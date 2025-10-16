@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION 2.5.4 FINALE
+Trading Dashboard - VERSION 2.5.4 FINALE (patché)
 ✅ Toutes les routes HTML
 ✅ TP1/TP2/TP3 affichage corrigé
 ✅ Support action CLOSE
 ✅ Logs détaillés
+✅ Colonne heure d'entrée
+✅ Bouton Reset
+✅ Webhook parser Telegram/text/plain/json/form
 """
 
 from fastapi import FastAPI, Request
@@ -22,6 +25,7 @@ import re
 import json
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+import urllib.parse  # <-- pour parse_qs dans le parseur webhook
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -297,6 +301,13 @@ class TradingState:
         self.equity_curve: List[Dict[str, Any]] = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
         self.journal_entries: List[Dict[str, Any]] = []
     
+    def reset(self):
+        self.trades = []
+        self.current_equity = settings.INITIAL_CAPITAL
+        self.equity_curve = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
+        self.journal_entries = []
+        logger.info("♻️ TradingState reset")
+
     def clean_old_trades(self):
         now = datetime.now()
         for trade in self.trades:
@@ -1092,6 +1103,189 @@ async def api_backtest(
     
     return {"ok": True, "backtest": {"symbol": symbol, "stats": results}}
 
+# ---------- RESET ENDPOINT ----------
+@app.post("/api/reset")
+async def api_reset():
+    trading_state.reset()
+    return {"ok": True, "message": "Trading data reset"}
+
+# ---------- WEBHOOK PARSEURS (robustes) ----------
+def _extract_from_telegram_text(text: str) -> Dict[str, Any]:
+    """
+    Extrait side, symbol, price, timeframe à partir d'un texte HTML Telegram, ex :
+    ⚡ <b>SELL</b> — <b>ARPAUSDT.P</b> (15) Prix: <code>0.01953</code>
+    """
+    res: Dict[str, Any] = {}
+    try:
+        m = re.search(r"<b>\s*(BUY|SELL)\s*</b>", text, flags=re.IGNORECASE)
+        if m:
+            res["side"] = m.group(1).upper()
+        m = re.search(r"—\s*<b>\s*([A-Z0-9\-\_\.]+)\s*</b>", text, flags=re.IGNORECASE)
+        if m:
+            res["symbol"] = m.group(1).upper()
+        m = re.search(r"\(\s*(\d+)\s*\)", text)
+        if m:
+            res["tf"] = m.group(1) + "m"
+        m = re.search(r"<code>\s*([0-9]*\.?[0-9]+)\s*</code>", text)
+        if m:
+            try:
+                res["price"] = float(m.group(1))
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"_extract_from_telegram_text: {e}")
+    return res
+
+def _parse_any_payload_from_body(body_bytes: bytes, content_type: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse le payload sans relire le request stream.
+    Supporte:
+      - JSON (objet)  ex: {"type":"entry", "symbol":"BTCUSDT", ...}
+      - JSON Telegram  ex: {"text":"⚡ <b>SELL</b> — <b>ARPAUSDT.P</b> ..."}
+      - text/plain     ex: la même chaîne JSON (Telegram) mais en texte brut
+      - form-urlencoded ex: payload=<json>
+    """
+    if not body_bytes:
+        return None
+
+    raw = body_bytes.decode("utf-8", errors="ignore").strip()
+    ct = (content_type or "").lower()
+
+    # JSON (ou text/plain contenant JSON)
+    if "json" in ct or raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                if "text" in obj and isinstance(obj["text"], str):
+                    extracted = _extract_from_telegram_text(obj["text"])
+                    if extracted.get("symbol"):
+                        side = extracted.get("side", "BUY")
+                        price = extracted.get("price")
+                        base = {
+                            "type": "entry",
+                            "side": side,
+                            "symbol": extracted["symbol"],
+                            "tf": extracted.get("tf", "15"),
+                        }
+                        if price is not None:
+                            base["entry"] = price
+                            if side == "BUY":
+                                base["tp1"] = price * 1.01
+                                base["sl"] = price * 0.99
+                            else:
+                                base["tp1"] = price * 0.99
+                                base["sl"] = price * 1.01
+                        return base
+                return obj
+        except Exception:
+            pass
+
+    # form-urlencoded
+    if "application/x-www-form-urlencoded" in ct or "=" in raw:
+        try:
+            parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+            d = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
+
+            for key in ("payload", "message", "text"):
+                if key in d and isinstance(d[key], str):
+                    try:
+                        inner = json.loads(d[key])
+                        if isinstance(inner, dict):
+                            if "text" in inner and isinstance(inner["text"], str):
+                                extracted = _extract_from_telegram_text(inner["text"])
+                                if extracted.get("symbol"):
+                                    side = extracted.get("side", "BUY")
+                                    price = extracted.get("price")
+                                    base = {
+                                        "type": "entry",
+                                        "side": side,
+                                        "symbol": extracted["symbol"],
+                                        "tf": extracted.get("tf", "15"),
+                                    }
+                                    if price is not None:
+                                        base["entry"] = price
+                                        if side == "BUY":
+                                            base["tp1"] = price * 1.01
+                                            base["sl"] = price * 0.99
+                                        else:
+                                            base["tp1"] = price * 0.99
+                                            base["sl"] = price * 1.01
+                                    return base
+                            return inner
+                    except Exception:
+                        extracted = _extract_from_telegram_text(d[key])
+                        if extracted.get("symbol"):
+                            side = extracted.get("side", "BUY")
+                            price = extracted.get("price")
+                            base = {
+                                "type": "entry",
+                                "side": side,
+                                "symbol": extracted["symbol"],
+                                "tf": extracted.get("tf", "15"),
+                            }
+                            if price is not None:
+                                base["entry"] = price
+                                if side == "BUY":
+                                    base["tp1"] = price * 1.01
+                                    base["sl"] = price * 0.99
+                                else:
+                                    base["tp1"] = price * 0.99
+                                    base["sl"] = price * 1.01
+                            return base
+            return d if d else None
+        except Exception:
+            pass
+
+    # text/plain brut
+    if raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict) and "text" in obj:
+                extracted = _extract_from_telegram_text(obj["text"])
+                if extracted.get("symbol"):
+                    side = extracted.get("side", "BUY")
+                    price = extracted.get("price")
+                    base = {
+                        "type": "entry",
+                        "side": side,
+                        "symbol": extracted["symbol"],
+                        "tf": extracted.get("tf", "15"),
+                    }
+                    if price is not None:
+                        base["entry"] = price
+                        if side == "BUY":
+                            base["tp1"] = price * 1.01
+                            base["sl"] = price * 0.99
+                        else:
+                            base["tp1"] = price * 0.99
+                            base["sl"] = price * 1.01
+                    return base
+                return obj
+        except Exception:
+            pass
+
+        extracted = _extract_from_telegram_text(raw)
+        if extracted.get("symbol"):
+            side = extracted.get("side", "BUY")
+            price = extracted.get("price")
+            base = {
+                "type": "entry",
+                "side": side,
+                "symbol": extracted["symbol"],
+                "tf": extracted.get("tf", "15"),
+            }
+            if price is not None:
+                base["entry"] = price
+                if side == "BUY":
+                    base["tp1"] = price * 1.01
+                    base["sl"] = price * 0.99
+                else:
+                    base["tp1"] = price * 0.99
+                    base["sl"] = price * 1.01
+            return base
+
+    return None
+
 @app.post("/tv-webhook")
 async def webhook(request: Request):
     try:
@@ -1099,107 +1293,126 @@ async def webhook(request: Request):
         if not body:
             logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
             return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
-        
-        try:
-            payload = await request.json()
-        except:
-            logger.warning("⚠️ Webhook: JSON invalide")
-            return JSONResponse({"status": "error", "message": "JSON invalide"}, status_code=400)
-        
-        logger.info(f"📥 Webhook: {payload.get('type', 'UNKNOWN')} - {payload.get('symbol', 'N/A')}")
-        
-        action = (payload.get("type") or payload.get("action") or "").lower()
-        symbol = payload.get("symbol")
-        side = payload.get("side", "LONG")
-        
+
+        ct = request.headers.get("content-type", "")
+        logger.info(f"📥 Webhook content-type: {ct}")
+
+        payload = _parse_any_payload_from_body(body, ct)
+        if not payload:
+            logger.warning("⚠️ Webhook: Payload non parseable")
+            return JSONResponse({"status": "error", "message": "Payload non parseable"}, status_code=400)
+
+        logger.info(f"📥 Webhook payload (keys): {list(payload.keys())[:10]}")
+
+        action = (payload.get("type") or payload.get("action") or payload.get("event") or "").lower()
+        symbol = payload.get("symbol") or payload.get("ticker") or payload.get("s")
+        side = (payload.get("side") or payload.get("direction") or "LONG").upper()
+
         if not symbol:
-            logger.warning(f"⚠️ Webhook: Symbol manquant")
+            logger.warning("⚠️ Webhook: Symbol manquant")
             return JSONResponse({"status": "error", "message": "Symbol manquant"}, status_code=400)
-        
-        # ACTION: ENTRY
+
+        tf = payload.get("tf") or payload.get("timeframe") or payload.get("interval") or "15m"
+
+        # ENTRY
         if action == "entry":
             entry = payload.get("entry")
             tp1 = payload.get("tp1") or payload.get("tp")
             tp2 = payload.get("tp2")
             tp3 = payload.get("tp3")
             sl = payload.get("sl")
-            
+
+            if entry is None:
+                price = payload.get("price")
+                if price is not None:
+                    entry = float(price)
+                    if side == "BUY":
+                        tp1 = tp1 or entry * 1.01
+                        sl = sl or entry * 0.99
+                    else:
+                        tp1 = tp1 or entry * 0.99
+                        sl = sl or entry * 1.01
+
             if not all([entry, tp1, sl]):
                 logger.warning(f"⚠️ Entry incomplet: entry={entry}, tp1={tp1}, sl={sl}")
                 return JSONResponse({"status": "error", "message": "entry, tp1, sl requis"}, status_code=400)
-            
-            # Auto-calcul TP2/TP3 si manquants
+
             if not tp2:
-                tp2 = float(tp1) * 1.01 if side == 'LONG' else float(tp1) * 0.99
+                tp2 = float(tp1) * (1.01 if side == "BUY" else 0.99)
             if not tp3:
-                tp3 = float(tp1) * 1.02 if side == 'LONG' else float(tp1) * 0.98
-            
+                tp3 = float(tp1) * (1.02 if side == "BUY" else 0.98)
+
             new_trade = {
-                'symbol': symbol,
-                'tf_label': payload.get("tf_label") or (payload.get("tf", "15") + "m"),
-                'side': side,
-                'entry': float(entry),
-                'tp1': float(tp1),
-                'tp2': float(tp2),
-                'tp3': float(tp3),
-                'sl': float(sl),
-                'row_state': 'normal'
+                "symbol": symbol.upper(),
+                "tf_label": tf if isinstance(tf, str) and tf.endswith("m") else f"{tf}m",
+                "side": side,
+                "entry": float(entry),
+                "tp1": float(tp1),
+                "tp2": float(tp2),
+                "tp3": float(tp3),
+                "sl": float(sl),
+                "row_state": "normal",
             }
-            
+
             trading_state.add_trade(new_trade)
             await notify_new_trade(new_trade)
-            return JSONResponse({"status": "ok", "trade_id": new_trade.get('id')})
-        
-        # ACTION: TP HIT
+            return JSONResponse({"status": "ok", "trade_id": new_trade.get("id")})
+
+        # TP HIT
         elif ("tp" in action or "take_profit" in action) and ("hit" in action or "_hit" in action.replace("take_profit", "")):
-            tp_level = 'tp1'
-            if 'tp3' in action or '3' in action:
-                tp_level = 'tp3'
-            elif 'tp2' in action or '2' in action:
-                tp_level = 'tp2'
-            
+            tp_level = "tp1"
+            if "tp3" in action or "3" in action:
+                tp_level = "tp3"
+            elif "tp2" in action or "2" in action:
+                tp_level = "tp2"
+
             for trade in trading_state.trades:
-                if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
-                    exit_price = float(payload.get('price') or payload.get(tp_level) or trade.get(tp_level))
-                    if trading_state.close_trade(trade['id'], tp_level, exit_price):
+                if (trade.get("symbol") == symbol.upper()
+                    and trade.get("row_state") == "normal"
+                    and trade.get("side") == side):
+                    exit_price = float(payload.get("price") or payload.get(tp_level) or trade.get(tp_level))
+                    if trading_state.close_trade(trade["id"], tp_level, exit_price):
                         await notify_tp_hit(trade, tp_level)
-                        return JSONResponse({"status": "ok", "trade_id": trade['id'], "tp_level": tp_level})
+                        return JSONResponse({"status": "ok", "trade_id": trade["id"], "tp_level": tp_level})
             logger.warning(f"⚠️ TP hit: Trade {symbol} non trouvé")
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
-        
-        # ACTION: SL HIT
+
+        # SL HIT
         elif ("sl" in action or "stop_loss" in action) and ("hit" in action or "_hit" in action.replace("stop_loss", "")):
             for trade in trading_state.trades:
-                if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
-                    exit_price = float(payload.get('price') or payload.get('sl') or trade.get('sl'))
-                    if trading_state.close_trade(trade['id'], 'sl', exit_price):
+                if (trade.get("symbol") == symbol.upper()
+                    and trade.get("row_state") == "normal"
+                    and trade.get("side") == side):
+                    exit_price = float(payload.get("price") or payload.get("sl") or trade.get("sl"))
+                    if trading_state.close_trade(trade["id"], "sl", exit_price):
                         await notify_sl_hit(trade)
-                        return JSONResponse({"status": "ok", "trade_id": trade['id']})
+                        return JSONResponse({"status": "ok", "trade_id": trade["id"]})
             logger.warning(f"⚠️ SL hit: Trade {symbol} non trouvé")
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
-        
-        # ACTION: CLOSE (manuel)
+
+        # CLOSE
         elif action == "close":
-            reason = payload.get('reason', 'Manuel')
-            price = payload.get('price')
-            
+            reason = payload.get("reason", "Manuel")
+            price = payload.get("price")
             for trade in trading_state.trades:
-                if (trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side):
-                    exit_price = float(price) if price else trade.get('entry')
-                    if trading_state.close_trade(trade['id'], 'close', exit_price):
+                if (trade.get("symbol") == symbol.upper()
+                    and trade.get("row_state") == "normal"
+                    and trade.get("side") == side):
+                    exit_price = float(price) if price else trade.get("entry")
+                    if trading_state.close_trade(trade["id"], "close", exit_price):
                         await notify_close(trade, reason)
-                        return JSONResponse({"status": "ok", "trade_id": trade['id'], "reason": reason})
+                        return JSONResponse({"status": "ok", "trade_id": trade["id"], "reason": reason})
             logger.warning(f"⚠️ Close: Trade {symbol} non trouvé")
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
-        
+
         logger.warning(f"⚠️ Action inconnue: '{action}'")
         return JSONResponse({"status": "error", "message": f"Action non supportée: {action}"}, status_code=400)
-        
+
     except Exception as e:
         logger.error(f"❌ Webhook erreur: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
-# ==================== HTML ROUTES (CONTINUES EN COMMENTAIRE 2/2) ====================
+# ==================== HTML ROUTES ====================
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -1252,8 +1465,14 @@ async def trades_page():
 </div>
 </div>
 
+<div class="card" style="display:flex;gap:12px;align-items:center;justify-content:space-between;">
+  <div><h2>📈 Trades avec TP1, TP2, TP3</h2></div>
+  <div>
+    <button id="resetBtn" title="Réinitialiser les données">♻️ Reset</button>
+  </div>
+</div>
+
 <div class="card">
-<h2>📈 Trades avec TP1, TP2, TP3</h2>
 <div style="overflow-x:auto;">
 <table id="tradesTable">
 <thead>
@@ -1261,6 +1480,7 @@ async def trades_page():
 <th>ID</th>
 <th>Symbol</th>
 <th>Side</th>
+<th>Entrée (heure)</th>
 <th>Entry</th>
 <th>TP1 / TP2 / TP3</th>
 <th>SL</th>
@@ -1318,17 +1538,24 @@ async function loadDashboard() {{
             const tp2Class = trade.tp2_hit ? 'tp-hit' : 'tp-pending';
             const tp3Class = trade.tp3_hit ? 'tp-hit' : 'tp-pending';
             
-            // Afficher avec jusqu'à 4 décimales
             const formatPrice = (p) => {{
                 if (p >= 1) return p.toFixed(2);
                 if (p >= 0.01) return p.toFixed(4);
                 return p.toFixed(6);
+            }};
+
+            const formatTime = (iso) => {{
+                if (!iso) return '-';
+                const d = new Date(iso);
+                // Heure locale courte HH:MM:SS
+                return d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
             }};
             
             row.innerHTML = `
                 <td>#${{trade.id}}</td>
                 <td><strong>${{trade.symbol}}</strong></td>
                 <td>${{trade.side}}</td>
+                <td>${{formatTime(trade.timestamp)}}</td>
                 <td>${{formatPrice(trade.entry)}}</td>
                 <td>
                     <div class="tp-cell">
@@ -1383,6 +1610,22 @@ async function loadDashboard() {{
     }}
 }}
 
+document.getElementById('resetBtn').addEventListener('click', async () => {{
+    if (!confirm('Confirmer le reset des données ?')) return;
+    try {{
+        const res = await fetch('/api/reset', {{ method: 'POST' }});
+        const data = await res.json();
+        if (data.ok) {{
+            await loadDashboard();
+            alert('Reset effectué ✅');
+        }} else {{
+            alert('Reset erreur ❌: ' + (data.error || 'inconnu'));
+        }}
+    }} catch (e) {{
+        alert('Reset erreur ❌');
+    }}
+}});
+
 loadDashboard();
 setInterval(loadDashboard, 30000);
 </script>
@@ -1390,9 +1633,7 @@ setInterval(loadDashboard, 30000);
     
     return HTMLResponse(html)
 
-# Routes complètes - SUITE EN COMMENTAIRE... (equity-curve, journal, heatmap, etc.)
-# Pour raison de limite de tokens, ajoutez les routes manquantes depuis la version précédente
-
+# Routes simplifiées restantes
 @app.get("/annonces", response_class=HTMLResponse)
 async def annonces_page():
     news = await fetch_all_news_improved()
@@ -1486,12 +1727,13 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD v2.5.4 FINALE")
+    print("🚀 TRADING DASHBOARD v2.5.4 FINALE (patché)")
     print("="*70)
     print("✅ TP1/TP2/TP3 différenciés et corrigés")
     print("✅ Support action CLOSE")
-    print("✅ Toutes les routes HTML ajoutées")
-    print("✅ Telegram avec confiance détaillée")
+    print("✅ Colonne heure d'entrée")
+    print("✅ Bouton Reset")
+    print("✅ Webhook parser Telegram/json/text/form")
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
