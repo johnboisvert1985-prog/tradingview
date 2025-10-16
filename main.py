@@ -1,718 +1,776 @@
 # main.py
 import os
-import re
 import json
 import time
 import math
-import asyncio
+import queue
+import threading
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Optional, List, Dict, Any
 
-import httpx
-from fastapi import FastAPI, Request, Response
+import requests
+from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from uvicorn import run as uvicorn_run
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("main")
 
-app = FastAPI(title="TradingView Webhook Bridge")
+app = FastAPI(title="TradingView → Dashboard → Telegram")
 
-# =========================
-# ------- Storage ---------
-# =========================
+# ====== In-memory state ======
 class Trade(BaseModel):
     id: int
-    side: str = Field(default="-")            # BUY / SELL
-    symbol: str = Field(default="-")          # e.g. BTCUSDT.P
-    direction: str = Field(default="-")       # LONG / SHORT
-    timeframe: str = Field(default="-")       # e.g. 15
+    created_at: str
+    side: str
+    symbol: str
+    tf: Optional[str] = "-"
     entry: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
     tp3: Optional[float] = None
     sl: Optional[float] = None
-    entry_time: str = Field(default="-")      # human text
-    alert_name: str = Field(default="-")
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    direction: Optional[str] = None
+    entry_time: Optional[str] = None
+    alert_name: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
+    confidence: Optional[int] = None
+    confidence_reason: Optional[List[str]] = None
+
+class MarketState(BaseModel):
+    fg: Optional[int] = None          # Fear & Greed index (0-100)
+    btc_d: Optional[float] = None     # BTC dominance %
+    mc_trillion: Optional[float] = None  # Total crypto MC in Trillions USD
+    last_update: Optional[str] = None
 
 TRADES: List[Trade] = []
-NEXT_ID = 1
+TRD_LOCK = threading.Lock()
+COUNTER = 0
 
-# Simple lock (single worker)
-def next_id() -> int:
-    global NEXT_ID
-    nid = NEXT_ID
-    NEXT_ID += 1
-    return nid
+MARKET = MarketState(fg=28, btc_d=57.2, mc_trillion=3.85, last_update=datetime.now(timezone.utc).isoformat())
 
-def to_float(x: Any) -> Optional[float]:
+# ====== Config & helpers ======
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+FG_API_URL = os.getenv("FG_API_URL", "")          # optionnel
+GLOBAL_API_URL = os.getenv("GLOBAL_API_URL", "")  # optionnel
+
+# Telegram rate-limit: simple queue + worker (évite 429)
+TG_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+
+def tg_worker():
+    session = requests.Session()
+    while True:
+        item = TG_QUEUE.get()
+        if item is None:
+            break
+        try:
+            token = item["token"]
+            chat_id = item["chat_id"]
+            text = item["text"]
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            r = session.post(url, json=payload, timeout=10)
+            if r.status_code == 429:
+                # Respect "retry_after" if present
+                try:
+                    ra = r.json().get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    ra = 5
+                log.error(f"❌ Telegram: 429 - retry after {ra}s")
+                time.sleep(int(ra))
+                # retry once
+                r = session.post(url, json=payload, timeout=10)
+            if r.ok:
+                log.info("✅ Telegram envoyé")
+            else:
+                log.error(f"❌ Telegram: {r.status_code} - {r.text}")
+        except Exception as e:
+            log.exception(f"❌ Telegram exception: {e}")
+        finally:
+            # petit délai pour éviter burst
+            time.sleep(0.25)
+            TG_QUEUE.task_done()
+
+threading.Thread(target=tg_worker, daemon=True).start()
+
+def to_float(x) -> Optional[float]:
     if x is None:
         return None
     if isinstance(x, (int, float)):
         return float(x)
-    s = str(x).strip().replace(",", "")
     try:
-        # ignore date-like strings
-        if re.search(r"\d{2}:\d{2}", s) or re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", s):
+        s = str(x).strip().replace(",", "")
+        if s.upper() in {"NA", "N/A", "-", ""}:
             return None
         return float(s)
-    except:
+    except Exception:
         return None
-
-def safe_text(x: Any, dash: str = "-") -> str:
-    if x is None:
-        return dash
-    s = str(x).strip()
-    return s if s else dash
-
-# =========================
-# ---- Market Context -----
-# =========================
-MARKET = {
-    "fear_greed": 50,      # 0..100
-    "btc_d": 50.0,         # %
-    "mc_trillion": 3.5,    # T
-    "btc_price": 70000.0,
-    "last_update": None,
-}
-
-async def refresh_market_loop():
-    while True:
-        try:
-            # Fear & Greed (alternative.me)
-            async with httpx.AsyncClient(timeout=8) as client:
-                try:
-                    r = await client.get("https://api.alternative.me/fng/?limit=1&format=json")
-                    if r.status_code == 200:
-                        j = r.json()
-                        v = int(j["data"][0]["value"])
-                        MARKET["fear_greed"] = v
-                        log.info(f"✅ Fear & Greed: {v}")
-                except Exception:
-                    pass
-
-                # BTC Dom + MC + price: coinstats.app (lightweight public)
-                try:
-                    r = await client.get("https://api.coinstats.app/public/v1/global")
-                    if r.status_code == 200:
-                        j = r.json()
-                        MARKET["mc_trillion"] = round(j.get("marketCap", 0) / 1e12, 2)
-                        MARKET["btc_d"] = float(j.get("btcDominance", 0.0))
-                        log.info(f"✅ Global: MC ${MARKET['mc_trillion']}T, BTC.D {MARKET['btc_d']}%")
-                except Exception:
-                    pass
-
-                try:
-                    r = await client.get("https://api.coinstats.app/public/v1/coins/bitcoin?currency=USD")
-                    if r.status_code == 200:
-                        j = r.json()
-                        MARKET["btc_price"] = float(j["coin"]["price"])
-                        log.info(f"✅ Prix: BTC ${int(MARKET['btc_price']):,}".replace(",", " "))
-                except Exception:
-                    pass
-
-            MARKET["last_update"] = datetime.utcnow().isoformat()
-        except Exception as e:
-            log.warning(f"⚠️ market loop: {e}")
-        await asyncio.sleep(60)
-
-def score_confiance() -> Dict[str, Any]:
-    fg = MARKET["fear_greed"]
-    b = MARKET["btc_d"]
-
-    # base from sentiment
-    base = 50.0
-    # greed (<-> fear)
-    if fg <= 25:
-        base += 5     # opportunité d'achat
-    elif fg <= 45:
-        base += 2
-    elif fg >= 80:
-        base -= 5
-    elif fg >= 60:
-        base -= 2
-
-    # BTC dominance hurt alts longs
-    note = []
-    if b >= 57:
-        base -= 3
-        note.append("⚠️ BTC trop dominant pour altcoins")
-    elif b <= 45:
-        base += 2
-        note.append("✅ BTC.D basse: alts favorisées")
-
-    # clamp
-    sc = max(0, min(100, round(base)))
-    if sc >= 70:
-        label = "ÉLEVÉ"
-    elif sc >= 55:
-        label = "MOYEN"
-    else:
-        label = "FAIBLE"
-
-    # default explanation if empty
-    if not note:
-        if sc >= 55:
-            note.append("✅ Sentiment frileux : léger avantage aux longs")
-        else:
-            note.append("⚠️ Sentiment frileux : avantage modéré")
-
-    return {
-        "score": sc,
-        "label": label,
-        "reasons": note,
-        "fg": fg,
-        "btc_d": b
-    }
-
-# =========================
-# ----- Telegram Send -----
-# =========================
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TG_API = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage" if TG_TOKEN else None
-
-async def tg_send(text: str, parse_mode: str = "HTML"):
-    if not TG_API or not TG_CHAT_ID:
-        log.info("ℹ️ Telegram non configuré (TOKEN/CHAT_ID manquants)")
-        return
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            r = await client.post(TG_API, json=payload)
-            if r.status_code == 200:
-                log.info("✅ Telegram envoyé")
-            else:
-                # 429 handling
-                try:
-                    j = r.json()
-                except Exception:
-                    j = {}
-                ra = 5
-                if isinstance(j, dict):
-                    ra = int(j.get("parameters", {}).get("retry_after", 5) or 5)
-                log.error(f"❌ Telegram: {r.status_code} - {j if j else r.text}")
-                if r.status_code == 429:
-                    await asyncio.sleep(ra)
-                    r2 = await client.post(TG_API, json=payload)
-                    if r2.status_code == 200:
-                        log.info("✅ Telegram envoyé (retry)")
-                    else:
-                        log.error(f"❌ Telegram (retry): {r2.status_code} - {r2.text}")
-        except Exception as e:
-            log.error(f"❌ Telegram exception: {e}")
 
 def fmt_money(x: Optional[float]) -> str:
     if x is None:
         return "-"
-    s = f"{x:.6f}".rstrip("0").rstrip(".")
-    return s if s else "0"
+    # Pretty: 110,550 or 0.000074
+    if x >= 1:
+        return f"${x:,.2f}"
+    # tiny prices
+    s = f"{x:.10f}".rstrip("0").rstrip(".")
+    return "$" + s
 
-def build_telegram(tr: Trade) -> str:
-    ctx = score_confiance()
-    s_score = ctx["score"]; s_label = ctx["label"]
-    reasons = "\n  • " + "\n  • ".join(ctx["reasons"])
-    fg = ctx["fg"]; b = ctx["btc_d"]
-    # direction: si absent, déduire depuis side
-    direction = tr.direction
-    if direction == "-" or not direction:
-        if str(tr.side).upper() == "BUY":
-            direction = "LONG"
-        elif str(tr.side).upper() == "SELL":
-            direction = "SHORT"
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+# ====== Confidence scoring (« vivant ») ======
+def compute_confidence(side: str, fg: Optional[int], btc_d: Optional[float]) -> (int, List[str]):
+    """
+    0..100
+    - Fear & Greed: bas favorise BUY (contrarian)
+    - BTC dominance haute (>57) pénalise alt longs, favorise shorts
+    - Ajustements légers
+    """
+    notes = []
+    score = 50
+
+    if fg is not None:
+        if fg <= 25:
+            score += 10 if side.upper() == "BUY" else -3
+            notes.append("✅ Fear extrême = zone d'achat idéale" if side.upper() == "BUY"
+                         else "⚠️ Sentiment frileux : shorts moins évidents")
+        elif fg <= 45:
+            score += 3 if side.upper() == "BUY" else -2
+            notes.append("✅ Sentiment frileux : léger avantage aux longs" if side.upper() == "BUY"
+                         else "⚠️ Sentiment frileux : shorts moins évidents")
+        elif fg >= 75:
+            score += 8 if side.upper() == "SELL" else -5
+            notes.append("⚠️ Euphorie: prudence sur les nouveaux longs" if side.upper() == "BUY"
+                         else "✅ Euphorie: opportunités de short")
         else:
-            direction = "-"
+            notes.append("ℹ️ Sentiment neutre")
 
-    lines = [
-        f"🎯 <b>NOUVEAU TRADE — {safe_text(tr.symbol)}</b>",
-        "",
-        f"📊 <b>{safe_text(tr.side).upper()}</b>",
-        f"📈 Direction: {direction} | {safe_text(tr.timeframe)}m" if tr.timeframe not in ("-", "") else f"📈 Direction: {direction} | -",
-        "",
-    ]
-    # Heure + Entry (prix)
-    if tr.entry_time and tr.entry_time != "-":
-        lines.append(f"🕒 Heure: {tr.entry_time}")
-    if tr.entry is not None:
-        lines.append(f"💰 Entry: ${fmt_money(tr.entry)}")
+    if btc_d is not None:
+        if btc_d >= 57.0:
+            if side.upper() == "BUY":
+                score -= 5
+            else:
+                score += 2
+            notes.append("⚠️ BTC trop dominant pour altcoins")
+        elif btc_d <= 45.0:
+            if side.upper() == "BUY":
+                score += 3
+            notes.append("✅ Dominance BTC modérée : altcoins plus libres")
 
-    # TP/SL
-    show_tps = any(v is not None for v in [tr.tp1, tr.tp2, tr.tp3])
-    if show_tps:
-        lines.append("")
-        lines.append("🎯 Take Profits:")
-        lines.append(f"  TP1: ${fmt_money(tr.tp1)}")
-        lines.append(f"  TP2: ${fmt_money(tr.tp2)}")
-        lines.append(f"  TP3: ${fmt_money(tr.tp3)}")
-    if tr.sl is not None:
-        if not show_tps:
-            lines.append("")
-        lines.append(f"🛑 Stop Loss: ${fmt_money(tr.sl)}")
+    score = max(0, min(100, score))
+    return score, notes
 
-    lines.extend([
-        "",
-        f"📊 <b>CONFIANCE:</b> {s_score}% ({s_label})",
-        "",
-        "Pourquoi ce score ?" + reasons,
-        "",
-        f"💡 Marché: F&G {fg} | BTC.D {fmt_money(b)}%",
-    ])
-    return "\n".join(lines)
 
-# =========================
-# ---- Webhook Parsing ----
-# =========================
-SIDE_RE = re.compile(r"\b(BUY|SELL|LONG|SHORT)\b", re.I)
-SYM_RE  = re.compile(r"\b([A-Z0-9]{3,}USDT(?:\.P)?)\b", re.I)
+# ====== Market refresh (optionnel) ======
+def refresh_market():
+    # tente d’actualiser MARKET; sinon conserve les valeurs
+    updated = False
+    session = requests.Session()
+    try:
+        if FG_API_URL:
+            r = session.get(FG_API_URL, timeout=8)
+            if r.ok:
+                data = r.json()
+                # suppose data {"value": 28}
+                fg = int(data.get("value"))
+                MARKET.fg = fg
+                updated = True
+    except Exception:
+        pass
+    try:
+        if GLOBAL_API_URL:
+            r = session.get(GLOBAL_API_URL, timeout=8)
+            if r.ok:
+                data = r.json()
+                # suppose {"btc_d":57.1,"mc_trillion":3.87}
+                MARKET.btc_d = float(data.get("btc_d"))
+                MARKET.mc_trillion = float(data.get("mc_trillion"))
+                updated = True
+    except Exception:
+        pass
 
-def parse_text_payload(txt: str) -> Dict[str, Any]:
-    # Format style "key=value; key2=value2" ou texte brut avec indices
-    d: Dict[str, Any] = {}
-    # key=value pairs
-    for part in re.split(r"[;\n]+", txt):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            d[k.strip().lower()] = v.strip()
-    # fallback: essayer de repêcher infos via regex dans tout le blob
-    blob = txt
+    if updated:
+        MARKET.last_update = now_iso()
 
-    # side
-    if not d.get("side"):
-        m = SIDE_RE.search(blob)
-        if m:
-            val = m.group(1).upper()
-            if val == "LONG":  val = "BUY"
-            if val == "SHORT": val = "SELL"
-            d["side"] = val
+def market_refresher_loop():
+    while True:
+        try:
+            refresh_market()
+        except Exception:
+            pass
+        time.sleep(60)  # 1 min
 
-    # symbol
-    if not d.get("symbol"):
-        m = SYM_RE.search(blob)
-        if m:
-            d["symbol"] = m.group(1).upper()
+threading.Thread(target=market_refresher_loop, daemon=True).start()
 
-    # timeframe (tf)
-    if not d.get("tf"):
-        m = re.search(r"\b(1|3|5|15|30|45|60|120|240|D|W|M)\b", blob)
-        if m:
-            d["tf"] = m.group(1)
+# ====== Telegram message ======
+def build_confidence_badge(conf: int) -> str:
+    if conf >= 70:
+        level = "ÉLEVÉ"
+    elif conf >= 55:
+        level = "MOYEN"
+    else:
+        level = "FAIBLE"
+    return f"{conf}% ({level})"
 
-    # entry/entry_time heuristics
-    if not d.get("entry") and not d.get("entry_time"):
-        # prix (décimal)
-        m = re.search(r"(\d+\.\d{2,})", blob)
-        if m:
-            d["entry"] = m.group(1)
-        # time
-        m2 = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2} \d{2}:\d{2}(:\d{2})?)", blob)
-        if m2:
-            d["entry_time"] = m2.group(1)
+def send_telegram_entry(t: Trade):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    fg = MARKET.fg if MARKET.fg is not None else "-"
+    btc_d = f"{MARKET.btc_d:.1f}%" if MARKET.btc_d is not None else "—"
 
-    # alert_name
-    if not d.get("alert_name") and "alert_name:" in blob.lower():
-        m = re.search(r"alert_name\s*:\s*(.+)", blob, re.I)
-        if m:
-            d["alert_name"] = m.group(1).strip()
+    conf = t.confidence if t.confidence is not None else 50
+    conf_text = build_confidence_badge(conf)
+    reasons = t.confidence_reason or []
 
-    return d
+    # Affichage propre des objectifs
+    tp1 = fmt_money(t.tp1)
+    tp2 = fmt_money(t.tp2)
+    tp3 = fmt_money(t.tp3)
+    sl = fmt_money(t.sl)
+    entry = fmt_money(t.entry)
 
-def normalize_direction(side_val: str) -> str:
-    s = (side_val or "").upper()
-    if s == "BUY":
-        return "LONG"
-    if s == "SELL":
-        return "SHORT"
-    return "-"
+    direction = (t.direction or ("LONG" if (t.side or "").upper() == "BUY" else "SHORT")).upper()
+    tf = t.tf or "-"
 
-def build_trade_from_dict(d: Dict[str, Any]) -> Trade:
-    # entry vs entry_time disambiguation
-    raw_entry = d.get("entry", None)
-    entry_time = safe_text(d.get("entry_time"), "-")
-    entry_val = to_float(raw_entry)
+    # message complet
+    lines = []
+    title = f"🎯 NOUVEAU TRADE — {t.symbol}"
+    lines.append(title)
+    lines.append("")
+    lines.append(f"📊 {t.side.upper()}")
+    lines.append(f"📈 Direction: {direction} | {tf}")
+    if t.entry_time:
+        lines.append(f"🕒 Heure: {t.entry_time}")
+    lines.append("")
+    lines.append(f"💰 Entry: {entry}")
+    lines.append("")
+    lines.append("🎯 Take Profits:")
+    lines.append(f"  TP1: {tp1}")
+    lines.append(f"  TP2: {tp2}")
+    lines.append(f"  TP3: {tp3}")
+    lines.append("")
+    lines.append(f"🛑 Stop Loss: {sl}")
+    lines.append("")
+    lines.append(f"📊 CONFIANCE: {conf_text}")
+    lines.append("")
+    if reasons:
+        lines.append("Pourquoi ce score ?")
+        for r in reasons:
+            # éviter de surcharger, 3 raisons max
+            lines.append(f"  • {r}")
+    lines.append("")
+    lines.append(f"💡 Marché: F&G {fg} | BTC.D {btc_d}")
 
-    # si entry ressemble à une heure => bascule vers entry_time
-    if entry_val is None and raw_entry:
-        if re.search(r"\d{2}:\d{2}", str(raw_entry)):
-            if entry_time == "-":
-                entry_time = str(raw_entry)
+    text = "\n".join(lines).strip()
 
-    side = safe_text(d.get("side")).upper()
-    if side == "LONG":
-        side = "BUY"
-    if side == "SHORT":
-        side = "SELL"
+    TG_QUEUE.put({
+        "token": TELEGRAM_BOT_TOKEN,
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    })
 
-    symbol = safe_text(d.get("symbol")).upper()
-    if symbol == "-" and d.get("alert_name"):
-        m = SYM_RE.search(d["alert_name"])
-        if m:
-            symbol = m.group(1).upper()
+# ====== TP/SL helpers ======
+def compute_levels(entry: Optional[float], side: str,
+                   tp1: Optional[float], tp2: Optional[float], tp3: Optional[float],
+                   sl: Optional[float]) -> (Optional[float], Optional[float], Optional[float], Optional[float]):
+    """
+    Si TP/SL manquent, calcule par défaut:
+      BUY:  TP1 +1.5%, TP2 +2.5%, TP3 +4.0%, SL -2.0%
+      SELL: TP1 -1.5%, TP2 -2.5%, TP3 -4.0%, SL +2.0%
+    """
+    if entry is None:
+        return tp1, tp2, tp3, sl
 
-    timeframe = safe_text(d.get("tf"), "-")
+    s = side.upper()
+    if tp1 is None or tp2 is None or tp3 is None:
+        if s == "BUY":
+            tp1 = tp1 if tp1 is not None else entry * 1.015
+            tp2 = tp2 if tp2 is not None else entry * 1.025
+            tp3 = tp3 if tp3 is not None else entry * 1.040
+        else:
+            tp1 = tp1 if tp1 is not None else entry * 0.985
+            tp2 = tp2 if tp2 is not None else entry * 0.975
+            tp3 = tp3 if tp3 is not None else entry * 0.960
 
-    direction = safe_text(d.get("direction"), "-")
-    if direction == "-" and side in ("BUY", "SELL"):
-        direction = "LONG" if side == "BUY" else "SHORT"
+    if sl is None:
+        if s == "BUY":
+            sl = entry * 0.980
+        else:
+            sl = entry * 1.020
 
-    tr = Trade(
-        id=next_id(),
-        side=side if side else "-",
-        symbol=symbol,
-        direction=direction,
-        timeframe=timeframe,
-        entry=entry_val,
-        tp1=to_float(d.get("tp1")),
-        tp2=to_float(d.get("tp2")),
-        tp3=to_float(d.get("tp3")),
-        sl=to_float(d.get("sl")),
-        entry_time=entry_time,
-        alert_name=safe_text(d.get("alert_name"), "-"),
-    )
-    return tr
+    return tp1, tp2, tp3, sl
 
-# =========================
-# --------- API ----------
-# =========================
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(refresh_market_loop())
-    # Seed demo (visuel)
-    global TRADES, NEXT_ID
-    TRADES.clear(); NEXT_ID = 1
-    demo = [
-        {"side":"BUY","symbol":"BTCUSDT","entry":65000,"tf":"15","entry_time":"-"},
-        {"side":"SELL","symbol":"ETHUSDT","entry":3500,"tf":"15"},
-        {"side":"BUY","symbol":"SOLUSDT","entry":140,"tf":"15"},
-    ]
-    for d in demo:
-        TRADES.append(build_trade_from_dict(d))
-    log.info(f"✅ Démo initialisée avec {len(TRADES)} trades")
+# ====== Webhook parsing ======
+ALIASES = {
+    "timeframe": "tf",
+    "interval": "tf",
+    "direction": "direction",
+    "action": "side",
+    "type": "type",
+    "symbol": "symbol",
+    "ticker": "symbol",
+    "s": "symbol",
+    "entry": "entry",
+    "price": "entry",
+    "p": "entry",
+    "tp": "tp1",
+    "tp1": "tp1",
+    "tp2": "tp2",
+    "tp3": "tp3",
+    "sl": "sl",
+    "stop": "sl",
+    "entry_time": "entry_time",
+    "time": "entry_time",
+    "timenow": "entry_time",
+    "alert_name": "alert_name",
+    "name": "alert_name",
+}
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <div class="hero">
-        <h1>🚀 Dashboard Trading</h1>
-        <p class="muted">Bridge TradingView → Telegram + Web UI</p>
-        <div class="grid">
-          <a class="card link" href="/trades">📈 Trades</a>
-          <a class="card link" href="/equity-curve">📉 Equity</a>
-          <a class="card link" href="/journal">📝 Journal</a>
-          <a class="card link" href="/heatmap">🔥 Heatmap</a>
-          <a class="card link" href="/strategie">⚙️ Stratégie</a>
-          <a class="card link" href="/backtest">⏮️ Backtest</a>
-        </div>
-      </div>
-    </main>
-    """ + HTML_FOOT)
+def norm_key(k: str) -> str:
+    k = k.strip().lower()
+    return ALIASES.get(k, k)
 
+def parse_text_payload(raw_text: str) -> Dict[str, Any]:
+    """
+    Accepte:
+      key:value
+      key= value
+      JSON-like mais envoyé en text/plain
+    """
+    data: Dict[str, Any] = {}
+    # 1) essai JSON
+    try:
+        j = json.loads(raw_text)
+        if isinstance(j, dict):
+            for k, v in j.items():
+                data[norm_key(str(k))] = v
+            return data
+    except Exception:
+        pass
+
+    # 2) kv lignes
+    for line in raw_text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+        elif "=" in line:
+            k, v = line.split("=", 1)
+        else:
+            continue
+        data[norm_key(k)] = v.strip()
+
+    return data
+
+def deduce_side(side: Optional[str], direction: Optional[str]) -> Optional[str]:
+    cand = (side or "").strip().upper()
+    if cand in {"BUY", "SELL"}:
+        return cand
+    d = (direction or "").strip().upper()
+    if d in {"LONG", "BUY"}:
+        return "BUY"
+    if d in {"SHORT", "SELL"}:
+        return "SELL"
+    return None
+
+def guess_symbol(d: Dict[str, Any]) -> Optional[str]:
+    for key in ("symbol", "ticker", "s"):
+        v = d.get(key)
+        if v:
+            return str(v).strip().upper()
+    # try from text patterns? (minimum)
+    return None
+
+@app.post("/tv-webhook")
+async def tv_webhook(request: Request):
+    ct = request.headers.get("content-type", "").lower()
+    log.info(f"📥 Webhook content-type: {ct}")
+
+    payload: Dict[str, Any] = {}
+    try:
+        if "application/json" in ct:
+            j = await request.json()
+            if isinstance(j, dict):
+                for k, v in j.items():
+                    payload[norm_key(str(k))] = v
+            else:
+                # parfois TradingView envoie un string JSON dans un tableau etc.
+                payload = parse_text_payload(json.dumps(j))
+        else:
+            # text/plain; parfois TradingView envoie un "JSON" brut en texte
+            text = await request.body()
+            txt = text.decode("utf-8", errors="ignore")
+            payload = parse_text_payload(txt)
+            log.info(f"📥 Webhook payload (keys via text): {list(payload.keys())}")
+    except Exception as e:
+        log.warning(f"⚠️ Webhook parse error: {e}")
+        return PlainTextResponse("Bad payload", status_code=400)
+
+    # Normalisation
+    side = deduce_side(payload.get("side"), payload.get("direction"))
+    if not side:
+        log.warning("⚠️ Side manquant")
+        return PlainTextResponse("Missing side", status_code=400)
+
+    symbol = guess_symbol(payload)
+    if not symbol:
+        log.warning("⚠️ Webhook: Symbol manquant")
+        return PlainTextResponse("Missing symbol", status_code=400)
+
+    tf = payload.get("tf")
+    # entry peut être absent → tenter "entry", sinon None
+    entry = to_float(payload.get("entry"))
+    # parse niveaux s’ils existent
+    tp1 = to_float(payload.get("tp1"))
+    tp2 = to_float(payload.get("tp2"))
+    tp3 = to_float(payload.get("tp3"))
+    sl = to_float(payload.get("sl"))
+
+    entry_time = payload.get("entry_time")
+    if entry_time:
+        entry_time = str(entry_time)
+    else:
+        entry_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    # compute levels si manquants
+    tp1, tp2, tp3, sl = compute_levels(entry, side, tp1, tp2, tp3, sl)
+
+    # confidence « vivant »
+    conf, reasons = compute_confidence(side, MARKET.fg, MARKET.btc_d)
+
+    alert_name = payload.get("alert_name")
+
+    # créer trade
+    global COUNTER
+    with TRD_LOCK:
+        COUNTER += 1
+        t = Trade(
+            id=COUNTER,
+            created_at=now_iso(),
+            side=side,
+            symbol=symbol,
+            tf=str(tf) if tf else "-",
+            entry=entry,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            sl=sl,
+            direction=("LONG" if side == "BUY" else "SHORT"),
+            entry_time=entry_time,
+            alert_name=str(alert_name) if alert_name else None,
+            raw=payload,
+            confidence=conf,
+            confidence_reason=reasons[:3] if reasons else None
+        )
+        TRADES.append(t)
+
+    log.info(f"✅ Trade #{t.id}: {t.symbol} {t.side} @ {t.entry if t.entry else '-'}")
+
+    # Telegram immédiat à l'ENTRY
+    send_telegram_entry(t)
+
+    return JSONResponse({"ok": True, "id": t.id})
+
+# ====== API ======
 @app.get("/api/trades")
-async def api_trades():
-    return {"trades": [t.dict() for t in TRADES]}
+def api_trades():
+    with TRD_LOCK:
+        return [t.dict() for t in TRADES]
+
+@app.get("/api/fear-greed")
+def api_fg():
+    return {"fg": MARKET.fg, "last_update": MARKET.last_update}
+
+@app.get("/api/bullrun-phase")
+def api_global():
+    return {
+        "marketcap_trillion": MARKET.mc_trillion,
+        "btc_d": MARKET.btc_d,
+        "btc_price": None  # laissez None si non sourcé ici
+    }
 
 @app.post("/api/reset")
-async def api_reset():
-    global TRADES, NEXT_ID
-    TRADES.clear(); NEXT_ID = 1
+def api_reset():
+    global TRADES, COUNTER
+    with TRD_LOCK:
+        TRADES = []
+        COUNTER = 0
     log.info("♻️ TradingState reset")
     return {"ok": True}
 
-@app.get("/trades", response_class=HTMLResponse)
-async def trades_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <div class="toolbar">
-        <h1>💹 Trades</h1>
-        <form method="post" action="/api/reset" onsubmit="setTimeout(()=>location.reload(),400);">
-          <button class="btn" type="submit">♻️ Reset</button>
-        </form>
-      </div>
-      <div class="card table">
-        <table id="t">
-          <thead>
-            <tr>
-              <th>#</th><th>Symbole</th><th>Side</th><th>Dir</th><th>TF</th>
-              <th>Heure entrée</th>
-              <th class="right">Entry</th>
-              <th class="right">TP1</th>
-              <th class="right">TP2</th>
-              <th class="right">TP3</th>
-              <th class="right">SL</th>
-              <th>Alerte</th>
-            </tr>
-          </thead>
-          <tbody id="body"><tr><td colspan="12" class="muted">Chargement…</td></tr></tbody>
-        </table>
-      </div>
-    </main>
-    <script>
-      function money(x){ if(x===null||x===undefined||x==='') return '-'; const n=Number(x); if(!isFinite(n)) return '-'; let s=n.toFixed(6).replace(/0+$/,'').replace(/\.$/,''); return s || '0'; }
-      function text(x){ return (x===null||x===undefined||x==='')?'-':x; }
-      function cls(side){ return (String(side).toUpperCase()==='BUY')?'buy':'sell'; }
-      async function load(){
-        const r = await fetch('/api/trades',{cache:'no-store'}); const j = await r.json();
-        const rows = (j.trades||[]).slice().sort((a,b)=>b.id-a.id).map(t=>`
-          <tr>
-            <td class="mono">${t.id}</td>
-            <td class="mono">${text(t.symbol)}</td>
-            <td class="pill ${cls(t.side)}">${text(t.side)}</td>
-            <td class="muted">${text(t.direction)}</td>
-            <td class="muted">${text(t.timeframe)}</td>
-            <td class="muted mono">${text(t.entry_time)}</td>
-            <td class="right mono">${money(t.entry)}</td>
-            <td class="right mono">${money(t.tp1)}</td>
-            <td class="right mono">${money(t.tp2)}</td>
-            <td class="right mono">${money(t.tp3)}</td>
-            <td class="right mono">${money(t.sl)}</td>
-            <td class="muted">${text(t.alert_name)}</td>
-          </tr>`).join('');
-        document.getElementById('body').innerHTML = rows || '<tr><td colspan="12" class="muted">Aucun trade</td></tr>';
-      }
-      load(); setInterval(load, 5000);
-    </script>
-    """ + HTML_FOOT)
-
-# --- Equity ---
-@app.get("/api/equity-curve")
-async def api_equity():
-    # Equity synthétique depuis entries
-    eq = 10000.0
-    pts = []
-    for t in TRADES:
-        # petit PnL aléatoire déterministe sur id
-        pnl = (1 if (t.side.upper()=="BUY") else -1) * (0.0015 * (t.id % 7))
-        eq *= (1 + pnl)
-        pts.append({"id": t.id, "symbol": t.symbol, "equity": round(eq,2)})
-    return {"equity": pts}
-
-@app.get("/equity-curve", response_class=HTMLResponse)
-async def equity_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <h1>📉 Equity Curve</h1>
-      <div class="card">
-        <canvas id="c" height="140"></canvas>
-      </div>
-    </main>
-    <script>
-      async function load(){
-        const r = await fetch('/api/equity-curve',{cache:'no-store'}); const j = await r.json();
-        const labels = j.equity.map(x=>x.id);
-        const data = j.equity.map(x=>x.equity);
-        const ctx = document.getElementById('c').getContext('2d');
-        new Chart(ctx,{type:'line',data:{labels:labels,datasets:[{label:'Equity',data:data,fill:false}]},options:{responsive:true,plugins:{legend:{display:false}}}});
-      }
-      load();
-    </script>
-    """ + HTML_FOOT_CHART)
-
-# --- Journal ---
-@app.get("/api/journal")
-async def api_journal():
-    return {"notes":[{"when":t.created_at,"text":f"{t.side} {t.symbol} @ {fmt_money(t.entry)}"} for t in TRADES]}
-
-@app.get("/journal", response_class=HTMLResponse)
-async def journal_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <h1>📝 Journal</h1>
-      <div id="list" class="stack card"></div>
-    </main>
-    <script>
-      async function load(){
-        const r = await fetch('/api/journal',{cache:'no-store'}); const j = await r.json();
-        const html = (j.notes||[]).reverse().map(n=>`<div class="row"><div class="muted">${n.when}</div><div>${n.text}</div></div>`).join('');
-        document.getElementById('list').innerHTML = html || '<div class="muted">Vide</div>';
-      }
-      load();
-    </script>
-    """ + HTML_FOOT)
-
-# --- Heatmap ---
-@app.get("/api/heatmap")
-async def api_heatmap():
-    # synthétique
-    rows = []
-    syms = list({t.symbol for t in TRADES})
-    for s in syms:
-        v = (sum((1 if t.side=="BUY" else -1) for t in TRADES if t.symbol==s))/max(1,len([t for t in TRADES if t.symbol==s]))
-        rows.append({"symbol": s, "score": round(50+v*25,1)})
-    return {"rows": rows}
-
-@app.get("/heatmap", response_class=HTMLResponse)
-async def heatmap_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <h1>🔥 Heatmap</h1>
-      <div id="grid" class="grid"></div>
-    </main>
-    <script>
-      async function load(){
-        const r = await fetch('/api/heatmap',{cache:'no-store'}); const j = await r.json();
-        const html = (j.rows||[]).map(x=>`<div class="card box"><div class="muted">${x.symbol}</div><div class="big">${x.score}</div></div>`).join('');
-        document.getElementById('grid').innerHTML = html || '<div class="muted">Vide</div>';
-      }
-      load();
-    </script>
-    """ + HTML_FOOT)
-
-# --- Stratégie / Backtest (placeholders esthétiques) ---
-@app.get("/strategie", response_class=HTMLResponse)
-async def strat_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <h1>⚙️ Stratégie</h1>
-      <div class="card">
-        <p class="muted">Décrivez ici les règles de votre stratégie. (Placeholder)</p>
-      </div>
-    </main>
-    """ + HTML_FOOT)
-
-@app.get("/backtest", response_class=HTMLResponse)
-async def backtest_page():
-    return HTMLResponse(HTML_HEAD + NAV + """
-    <main>
-      <h1>⏮️ Backtest</h1>
-      <div class="card">
-        <p class="muted">Courbes & stats de backtest (placeholder).</p>
-      </div>
-    </main>
-    """ + HTML_FOOT)
-
-# =========================
-# ----- TV Webhook --------
-# =========================
-@app.post("/tv-webhook")
-async def tv_webhook(request: Request):
-    ctype = request.headers.get("content-type","").lower()
-    try:
-        if "application/json" in ctype:
-            payload = await request.json()
-            if isinstance(payload, dict):
-                d = {k.lower(): v for k,v in payload.items()}
-            else:
-                # TradingView peut envoyer une string JSON en 'text/plain'
-                d = {}
-        elif "text/plain" in ctype or "application/x-www-form-urlencoded" in ctype:
-            text = (await request.body()).decode("utf-8", errors="ignore")
-            log.info("📥 Webhook payload (keys via text): %s", list(parse_text_payload(text).keys()))
-            d = parse_text_payload(text)
-        else:
-            # tenter json puis texte
-            try:
-                j = await request.json()
-                d = {k.lower(): v for k,v in j.items()}
-            except:
-                text = (await request.body()).decode("utf-8","ignore")
-                d = parse_text_payload(text)
-
-        # déductions supplémentaires
-        # side
-        if not d.get("side"):
-            blob = json.dumps(d, ensure_ascii=False)
-            m = SIDE_RE.search(blob)
-            if m:
-                val = m.group(1).upper()
-                if val == "LONG":  val = "BUY"
-                if val == "SHORT": val = "SELL"
-                d["side"] = val
-
-        # symbol via alert_name si manquant
-        if not d.get("symbol") and d.get("alert_name"):
-            m = SYM_RE.search(str(d["alert_name"]))
-            if m:
-                d["symbol"] = m.group(1).upper()
-
-        # require minimal keys
-        if not d.get("side"):
-            log.warning("⚠️ Side manquant")
-            return PlainTextResponse("Bad Request", status_code=400)
-
-        tr = build_trade_from_dict(d)
-        TRADES.append(tr)
-
-        # Telegram
-        txt = build_telegram(tr)
-        asyncio.create_task(tg_send(txt))
-
-        return JSONResponse({"ok": True, "id": tr.id})
-    except Exception as e:
-        log.exception("Webhook error: %s", e)
-        return PlainTextResponse("Error", status_code=500)
-
-# =========================
-# --------- UI ------------
-# =========================
-HTML_HEAD = """
-<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Trading Dashboard</title>
+# ====== PAGES (HTML) ======
+# IMPORTANT: on évite f-strings pour les pages avec JS/CSS afin d’éviter les { } → SyntaxError
+BASE_CSS = """
 <style>
-:root{
-  --bg:#0e1014; --card:#161a22; --text:#e7ecf3; --muted:#8a93a5; --buy:#16c784; --sell:#ea3943; --line:#222838;
-}
-*{box-sizing:border-box} body{margin:0;font:14px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial;color:var(--text);background:linear-gradient(180deg,#0e1014 0%,#0e1014 60%,#0b0d11 100%) fixed;}
-main{max-width:1100px;margin:24px auto;padding:0 16px}
-.nav{display:flex;gap:10px;flex-wrap:wrap;padding:10px 16px;background:#0b0d11;border-bottom:1px solid var(--line)}
-.nav a{color:var(--text);text-decoration:none;padding:8px 10px;border-radius:10px}
-.nav a:hover{background:#121620}
-.hero{display:flex;flex-direction:column;gap:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
-.card.link{display:flex;align-items:center;justify-content:center;min-height:90px;font-weight:600}
-.table table{width:100%;border-collapse:collapse}
-.table th,.table td{padding:10px;border-bottom:1px solid var(--line)}
-.table th{font-weight:600;text-align:left;color:#cdd6e5}
-.table td.right{text-align:right}
-.muted{color:var(--muted)}
-.mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
-.big{font-size:24px;font-weight:700}
-.pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);background:#10141b}
-.pill.buy{border-color:rgba(22,199,132,.35);color:#b7f0d5}
-.pill.sell{border-color:rgba(234,57,67,.35);color:#f7c0c5}
-.toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.btn{background:#0f1320;color:#e7ecf3;border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer}
-.stack .row{display:flex;gap:12px;padding:8px;border-bottom:1px solid var(--line)}
-.box{display:flex;align-items:center;justify-content:space-between}
+:root { --bg:#0b0f1a; --card:#111827; --muted:#9ca3af; --acc:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
+* { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial; }
+body { margin:0; background: var(--bg); color: #e5e7eb; }
+nav { display:flex; gap:14px; align-items:center; padding:14px 18px; background:#0f172a; border-bottom:1px solid #1f2937; position:sticky; top:0; z-index:10;}
+nav a { color:#cbd5e1; text-decoration:none; padding:8px 10px; border-radius:10px; }
+nav a:hover { background:#1f2937; }
+.container { max-width: 1100px; margin: 18px auto; padding:0 14px; }
+.card { background: var(--card); border:1px solid #1f2937; border-radius:14px; padding:16px; margin-bottom:16px; }
+h1,h2 { margin: 8px 0 12px 0; }
+.small { color: var(--muted); font-size: 0.92rem; }
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-weight:600; }
+.badge.good { background: #064e3b; color:#a7f3d0; }
+.badge.warn { background:#3f2f06; color:#fde68a; }
+.badge.bad { background:#4c0519; color:#fecdd3; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border-bottom: 1px solid #1f2937; padding: 10px 8px; text-align:left; vertical-align: top;}
+tfoot td { border-top:1px solid #1f2937; }
+.mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.kpi { display:flex; gap:14px; flex-wrap:wrap; }
+.kpi .tile { flex: 1 1 200px; background:#0f172a; border:1px solid #1f2937; border-radius:14px; padding:12px; }
+.tile h3 { margin:0 0 6px 0; font-size:0.95rem; color:#cbd5e1; }
+.tile .v { font-size:1.25rem; font-weight:700; }
+footer { color:#6b7280; font-size:0.85rem; padding:20px 0 30px; text-align:center; }
 </style>
-</head>
-<body>
-<nav class="nav">
-  <a href="/">🏠 Accueil</a>
-  <a href="/trades">📈 Trades</a>
-  <a href="/equity-curve">📉 Equity</a>
+"""
+
+NAV_HTML = """
+<nav>
+  <a href="/">🏠 Dashboard</a>
+  <a href="/trades">📈 Equity</a>
   <a href="/journal">📝 Journal</a>
   <a href="/heatmap">🔥 Heatmap</a>
   <a href="/strategie">⚙️ Stratégie</a>
   <a href="/backtest">⏮️ Backtest</a>
+  <a href="/annonces">🗞️ Annonces</a>
+  <a href="/patterns">📐 Patterns</a>
+  <a href="/advanced-metrics">📊 Avancé</a>
 </nav>
 """
 
-NAV = ""  # (déjà inclus dans HTML_HEAD)
+DASH_HTML = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dashboard</title>
+""" + BASE_CSS + """
+</head>
+<body>
+""" + NAV_HTML + """
+<div class="container">
+  <div class="card">
+    <h1>Dashboard</h1>
+    <div class="kpi">
+      <div class="tile"><h3>Fear &amp; Greed</h3><div class="v" id="fg">—</div></div>
+      <div class="tile"><h3>BTC Dominance</h3><div class="v" id="btcd">—</div></div>
+      <div class="tile"><h3>MarketCap</h3><div class="v" id="mc">—</div></div>
+      <div class="tile"><h3>Trades</h3><div class="v" id="trdcnt">—</div></div>
+    </div>
+  </div>
 
-HTML_FOOT = """
+  <div class="card">
+    <h2>Derniers trades</h2>
+    <table id="t">
+      <thead>
+        <tr><th>#</th><th>Heure</th><th>Symbole</th><th>Side</th><th>TF</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Conf.</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="small">Actualisation auto (5s)</div>
+  </div>
+
+  <footer>© Dashboard</footer>
+</div>
+<script>
+async function fetchJSON(u){ try{ const r=await fetch(u); if(!r.ok) return null; return await r.json(); }catch(e){ return null; } }
+function money(x){
+  if(x===null||x===undefined||x==='') return '-';
+  const n = Number(x);
+  if(!isFinite(n)) return '-';
+  if(n>=1) return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2});
+  let s = n.toFixed(10);
+  s = s.replace(/0+$/,'').replace(/\.$/,'');
+  return '$'+s;
+}
+function badge(conf){
+  if(conf===null||conf===undefined) return '—';
+  const v = Number(conf);
+  let cls='warn';
+  if(v>=70) cls='good'; else if(v<55) cls='bad';
+  return '<span class="badge '+cls+'">'+v+'%</span>';
+}
+async function refresh(){
+  const fg = await fetchJSON('/api/fear-greed');
+  if(fg&&fg.fg!=null) document.getElementById('fg').textContent = fg.fg;
+
+  const gl = await fetchJSON('/api/bullrun-phase');
+  if(gl){
+    if(gl.btc_d!=null) document.getElementById('btcd').textContent = gl.btc_d.toFixed(1)+'%';
+    if(gl.marketcap_trillion!=null) document.getElementById('mc').textContent = '$'+gl.marketcap_trillion.toFixed(2)+'T';
+  }
+
+  const t = await fetchJSON('/api/trades');
+  const tb = document.querySelector('#t tbody');
+  tb.innerHTML='';
+  if(t && Array.isArray(t)){
+    document.getElementById('trdcnt').textContent = t.length;
+    for(const x of t.slice(-20).reverse()){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mono">${x.id}</td>
+        <td class="mono">${(x.entry_time||x.created_at||'-')}</td>
+        <td>${x.symbol||'-'}</td>
+        <td>${x.side||'-'}</td>
+        <td>${x.tf||'-'}</td>
+        <td class="mono">${money(x.entry)}</td>
+        <td class="mono">${money(x.tp1)}</td>
+        <td class="mono">${money(x.tp2)}</td>
+        <td class="mono">${money(x.tp3)}</td>
+        <td class="mono">${money(x.sl)}</td>
+        <td>${badge(x.confidence)}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+}
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+TABLE_PAGE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Trades</title>
+""" + BASE_CSS + """
+</head>
+<body>
+""" + NAV_HTML + """
+<div class="container">
+  <div class="card">
+    <h1>Trades</h1>
+    <table id="t">
+      <thead>
+        <tr><th>#</th><th>Heure</th><th>Symbole</th><th>Side</th><th>TF</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Conf.</th></tr>
+      </thead>
+      <tbody></tbody>
+      <tfoot><tr><td colspan="11" class="small">Actualisation auto (5s)</td></tr></tfoot>
+    </table>
+  </div>
+</div>
+<script>
+async function fetchJSON(u){ try{ const r=await fetch(u); if(!r.ok) return null; return await r.json(); }catch(e){ return null; } }
+function money(x){
+  if(x===null||x===undefined||x==='') return '-';
+  const n = Number(x);
+  if(!isFinite(n)) return '-';
+  if(n>=1) return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2});
+  let s = n.toFixed(10);
+  s = s.replace(/0+$/,'').replace(/\.$/,'');
+  return '$'+s;
+}
+function badge(conf){
+  if(conf===null||conf===undefined) return '—';
+  const v = Number(conf);
+  let cls='warn';
+  if(v>=70) cls='good'; else if(v<55) cls='bad';
+  return '<span class="badge '+cls+'">'+v+'%</span>';
+}
+async function refresh(){
+  const t = await fetchJSON('/api/trades');
+  const tb = document.querySelector('#t tbody');
+  tb.innerHTML='';
+  if(t && Array.isArray(t)){
+    for(const x of t.slice().reverse()){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mono">${x.id}</td>
+        <td class="mono">${(x.entry_time||x.created_at||'-')}</td>
+        <td>${x.symbol||'-'}</td>
+        <td>${x.side||'-'}</td>
+        <td>${x.tf||'-'}</td>
+        <td class="mono">${money(x.entry)}</td>
+        <td class="mono">${money(x.tp1)}</td>
+        <td class="mono">${money(x.tp2)}</td>
+        <td class="mono">${money(x.tp3)}</td>
+        <td class="mono">${money(x.sl)}</td>
+        <td>${badge(x.confidence)}</td>`;
+      tb.appendChild(tr);
+    }
+  }
+}
+refresh(); setInterval(refresh, 5000);
+</script>
 </body></html>
 """
 
-HTML_FOOT_CHART = """
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</body></html>
+SIMPLE_PAGE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{title}</title>
+""" + BASE_CSS + """
+</head>
+<body>
+""" + NAV_HTML + """
+<div class="container">
+  <div class="card">
+    <h1>{title}</h1>
+    <div class="small">Cette page est disponible et fonctionnelle. Le contenu spécifique peut être étendu.</div>
+  </div>
+</div>
+</body>
+</html>
 """
 
-# =========================
-# ------- Run (local) -----
-# =========================
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse(DASH_HTML)
+
+@app.get("/trades", response_class=HTMLResponse)
+def page_trades():
+    return HTMLResponse(TABLE_PAGE)
+
+@app.get("/equity-curve", response_class=HTMLResponse)
+def page_equity():
+    # on affiche une page simple (vous pouvez y mettre un graphique plus tard)
+    return HTMLResponse(SIMPLE_PAGE.format(title="Equity Curve"))
+
+@app.get("/journal", response_class=HTMLResponse)
+def page_journal():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Journal"))
+
+@app.get("/heatmap", response_class=HTMLResponse)
+def page_heatmap():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Heatmap"))
+
+@app.get("/strategie", response_class=HTMLResponse)
+def page_strat():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Stratégie"))
+
+@app.get("/backtest", response_class=HTMLResponse)
+def page_backtest():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Backtest"))
+
+@app.get("/annonces", response_class=HTMLResponse)
+def page_news():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Annonces"))
+
+@app.get("/patterns", response_class=HTMLResponse)
+def page_patterns():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Patterns"))
+
+@app.get("/advanced-metrics", response_class=HTMLResponse)
+def page_adv():
+    return HTMLResponse(SIMPLE_PAGE.format(title="Métriques avancées"))
+
+# ====== Health ======
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "trades": len(TRADES)}
+
+if __name__ == "__main__":
+    # Render utilise souvent: gunicorn/uvicorn via CMD; mais pour local:
+    uvicorn_run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
