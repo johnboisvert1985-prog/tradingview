@@ -371,14 +371,41 @@ HTML_HEAD = """
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Dashboard Trading</title>
 <style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial}
-  table{border-collapse:collapse;width:100%}
-  th,td{border:1px solid #ddd;padding:8px}
-  th{background:#f6f6f6;text-align:left}
-  code{background:#f3f3f3;padding:2px 4px;border-radius:4px}
+  :root{
+    --bg:#0b0f14; --card:#121822; --muted:#98a2b3; --txt:#e6edf3; --accent:#3b82f6; --accent2:#22c55e; --warn:#f59e0b; --err:#ef4444;
+    --border:#1f2937;
+  }
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;background:var(--bg);color:var(--txt);margin:0}
+  a{color:var(--txt);text-decoration:none;opacity:.9} a:hover{opacity:1}
+  nav{display:flex;gap:10px;flex-wrap:wrap;padding:12px 16px;background:#0e141b;border-bottom:1px solid var(--border)}
+  nav a{padding:8px 10px;background:var(--card);border:1px solid var(--border);border-radius:10px}
+  main{max-width:1200px;margin:24px auto;padding:0 16px}
+  h1{margin:0 0 12px 0;font-size:24px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
+  .toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap}
+  .btn{padding:8px 12px;border-radius:10px;border:1px solid var(--border);background:#0f1720;color:var(--txt);cursor:pointer}
+  .btn:hover{border-color:#2b394d}
+  .btn.reset{background:#0f141b}
+  .table-wrap{overflow:auto;border-radius:12px;border:1px solid var(--border)}
+  table{border-collapse:collapse;width:100%;min-width:900px;background:#0e141b}
+  th,td{border-bottom:1px solid var(--border);padding:10px 12px;text-align:left;white-space:nowrap}
+  th{background:#101723;color:#cbd5e1;position:sticky;top:0}
+  tr:hover td{background:#0f1824}
+  .pill{padding:4px 8px;border-radius:999px;border:1px solid var(--border);font-weight:600}
+  .buy{color:var(--accent2)}
+  .sell{color:#f87171}
+  .muted{color:var(--muted)}
+  .right{text-align:right}
+  .mono{font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,'Liberation Mono','Courier New',monospace}
+  .empty{padding:22px;text-align:center;color:var(--muted)}
+  .search{display:flex;gap:8px;align-items:center}
+  input[type="search"],select{background:#0f1720;border:1px solid var(--border);color:var(--txt);border-radius:10px;padding:8px 10px}
+  .badge{padding:2px 8px;border-radius:999px;background:#0f1720;border:1px solid var(--border);font-size:12px;color:#cbd5e1}
 </style>
 </head><body>
 """
+
 
 HTML_FOOT = "</body></html>"
 
@@ -500,3 +527,4 @@ async def annonces():
 @app.get("/healthz")
 async def health():
     return {"ok": True}
+
