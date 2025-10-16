@@ -3,34 +3,37 @@ import os
 import json
 import re
 import time
-import math
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("main")
 
 app = FastAPI(title="TradingView Webhook → Dashboard & Telegram")
 
 # --- Config Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # ex: -1001234567890
-TELEGRAM_CHANNEL_USERNAME = os.getenv("TELEGRAM_CHANNEL_USERNAME", "").strip()  # ex: @my_channel
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHANNEL_USERNAME = os.getenv("TELEGRAM_CHANNEL_USERNAME", "").strip()
 
-# --- Mini “BaaS” in-memory ---
+# --- Cibles par défaut (si TP/SL absents) ---
+TP1_PCT = float(os.getenv("TP1_PCT", "1.5"))   # %
+TP2_PCT = float(os.getenv("TP2_PCT", "2.5"))   # %
+TP3_PCT = float(os.getenv("TP3_PCT", "4.0"))   # %
+SL_PCT  = float(os.getenv("SL_PCT",  "2.0"))   # %
+
+# --- State in-memory ---
 class TradingState:
     def __init__(self):
         self.reset()
-
     def reset(self):
         self.trades: List[Dict[str, Any]] = []
         self.next_id = 1
-        # Contexte marché mock — dans un vrai projet, rafraîchir périodiquement
         self.market = {
             "fear_greed": 28,
             "fear_greed_display": "28",
@@ -40,7 +43,6 @@ class TradingState:
             "btc_price_display": "$110,900",
         }
         log.info("♻️ TradingState reset")
-
     def add_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:
         trade = dict(trade)
         trade["id"] = self.next_id
@@ -50,21 +52,24 @@ class TradingState:
 
 STATE = TradingState()
 
-# ---- Utils ----
+# --- Utils ---
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
 def fmt_price(v: Optional[float]) -> str:
-    if v is None:
-        return "-"
-    # Adaptation dynamique du nombre de décimales selon l'échelle
+    if v is None: return "-"
     mag = abs(v)
-    if mag >= 100:
-        return f"{v:,.2f}".replace(",", " ")
-    if mag >= 1:
-        return f"{v:,.4f}".replace(",", " ")
-    if mag >= 0.01:
-        return f"{v:,.6f}".replace(",", " ")
+    if mag >= 100:   return f"{v:,.2f}".replace(",", " ")
+    if mag >= 1:     return f"{v:,.4f}".replace(",", " ")
+    if mag >= 0.01:  return f"{v:,.6f}".replace(",", " ")
     return f"{v:.8f}"
 
 def label_conf(score: int) -> str:
@@ -73,130 +78,111 @@ def label_conf(score: int) -> str:
     return "FAIBLE"
 
 def compute_confidence(trade: Dict[str, Any], market: Dict[str, Any]) -> Tuple[int, str, List[str]]:
-    """Score vivant basé sur quelques signaux simples mais dynamiques."""
     bullets = []
     score = 50
-
-    fg = market.get("fear_greed", 50)        # 0-100
-    btcd = market.get("btc_dominance", 50.0) # %
-
+    fg = market.get("fear_greed", 50)
+    btcd = market.get("btc_dominance", 50.0)
     side = (trade.get("side") or "").upper()
-    # Sentiment vs side
+
     if fg <= 25 and side == "BUY":
-        score += 8
-        bullets.append("✅ Sentiment très bas : opportunité d'achat")
+        score += 8; bullets.append("✅ Sentiment très bas : opportunité d'achat")
     elif fg >= 75 and side == "SELL":
-        score += 6
-        bullets.append("✅ Euphoria élevée : vente opportuniste")
+        score += 6; bullets.append("✅ Euphorie élevée : vente opportuniste")
     else:
         bullets.append("⚠️ Sentiment frileux : avantage modéré")
 
-    # Dominance BTC — pèse sur altcoins
     sym = (trade.get("symbol") or "").upper()
     is_alt = not (sym.startswith("BTC") or sym.startswith("BTCUSD") or sym == "BTC")
     if is_alt and btcd >= 57.0 and side == "BUY":
-        score -= 8
-        bullets.append("⚠️ BTC.D élevée : pression sur altcoins")
+        score -= 8; bullets.append("⚠️ BTC.D élevée : pression sur altcoins")
     elif is_alt and btcd < 52.0 and side == "BUY":
-        score += 4
-        bullets.append("✅ BTC.D en baisse : meilleur climat pour alts")
+        score += 4; bullets.append("✅ BTC.D en baisse : meilleur climat altcoins")
 
-    # Timeframe influence légère
     tf = str(trade.get("tf") or trade.get("timeframe") or "").lower()
-    if tf in ("1m", "3m", "5m"):
+    if tf in ("1m","3m","5m"):
         score -= 3; bullets.append("⚠️ TF courte : bruit élevé")
-    elif tf in ("1h", "4h", "240"):
+    elif tf in ("1h","4h","240"):
         score += 2; bullets.append("✅ TF plus stable")
 
     score = max(0, min(100, int(round(score))))
     return score, label_conf(score), bullets
 
-# --- Extraction robuste du symbole ---
+# --- Extraction symbole ---
 TICKER_RE = re.compile(r"\b([A-Z0-9]{2,20}(?:USDT|USDC|USD|BTC)(?:\.[PS])?)\b", re.I)
 
-def _guess_symbol(payload: Dict[str, Any], raw_text: Optional[str]) -> str:
+def guess_symbol(payload: Dict[str, Any], raw_text: Optional[str]) -> str:
     sym = (payload.get("symbol") or payload.get("ticker") or "").strip()
-    if sym:
-        return sym.upper()
+    if sym: return sym.upper()
     if raw_text:
-        # HTML style:  — <b>SYMBOL</b>
         m = re.search(r"—\s*<b>\s*([A-Z0-9\.\-:_/]+)\s*</b>", raw_text, re.I)
-        if m:
-            return m.group(1).upper()
-        # Token style ABCUSDT.P
+        if m: return m.group(1).upper()
         m2 = TICKER_RE.search(raw_text)
-        if m2:
-            return m2.group(1).upper()
+        if m2: return m2.group(1).upper()
     return "UNKNOWN"
 
-# --- Parse webhook (JSON ou texte) ---
+# --- Parse webhook ---
 async def parse_webhook(request: Request) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     ctype = request.headers.get("content-type", "")
     raw = (await request.body()).decode(errors="ignore").strip()
-    log.info(f"📥 Webhook content-type: {ctype}")
-
+    log.info(f"{now_iso()} INFO:main:📥 Webhook content-type: {ctype}")
     data: Dict[str, Any] = {}
-    # 1) JSON
+
     if "application/json" in ctype:
         try:
             data = json.loads(raw or "{}")
-            log.info(f"📥 Webhook payload (keys): {sorted(list(data.keys()))}")
+            log.info(f"{now_iso()} INFO:main:📥 Webhook payload (keys): {sorted(list(data.keys()))}")
         except Exception:
             log.warning("⚠️ Webhook: JSON invalide")
             return None, raw
     else:
-        # text/plain — TradingView envoie souvent ça
-        # Essayer JSON dans un texte brut
+        # text/plain — tenter JSON d'abord
         try:
             data = json.loads(raw)
-            log.info(f"📥 Webhook payload (keys via text->json): {sorted(list(data.keys()))}")
+            log.info(f"{now_iso()} INFO:main:📥 Webhook payload (keys via text->json): {sorted(list(data.keys()))}")
         except Exception:
-            # Dernier recours: quelques regex pour attraper les champs clefs
+            # heuristiques sur texte libre
             keys = []
-            try:
-                # side
-                m = re.search(r"\b(BUY|SELL)\b", raw, re.I)
-                if m:
-                    data["side"] = m.group(1).upper(); keys.append("side")
-                # tf
-                m = re.search(r"\b(1m|3m|5m|15m|30m|1h|4h|D|W)\b", raw, re.I)
-                if m:
-                    data["tf"] = m.group(1); keys.append("tf")
-                # entry
-                m = re.search(r"(?:Entry|ix|price)\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+(?:e-?\d+)?)", raw, re.I)
-                if m:
-                    data["entry"] = float(m.group(1)); keys.append("entry")
-                # timestamps
-                m = re.search(r"Heure\s*[:=]\s*([0-9:\- ]{10,})", raw, re.I)
-                if m:
-                    data["entry_time"] = m.group(1); keys.append("entry_time")
-                # symbol via helper
-                data["symbol"] = _guess_symbol(data, raw); keys.append("symbol(guessed)")
-                log.info(f"📥 Webhook payload (keys via text): {keys}")
-            except Exception:
-                pass
+            m = re.search(r"\b(BUY|SELL)\b", raw, re.I)
+            if m: data["side"] = m.group(1).upper(); keys.append("side")
+            m = re.search(r"\b(1m|3m|5m|15m|30m|1h|4h|D|W)\b", raw, re.I)
+            if m: data["tf"] = m.group(1); keys.append("tf")
+            # prix : “Entry:”, “price:”, “ix:”, “P ix:”
+            m = re.search(r"(?:Entry|price|ix|P\s*ix)\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+(?:e-?\d+)?)", raw, re.I)
+            if m: data["entry"] = safe_float(m.group(1)); keys.append("entry")
+            # stop / take profits éventuels dans le texte
+            m = re.search(r"SL\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+)", raw, re.I)
+            if m: data["sl"] = safe_float(m.group(1)); keys.append("sl")
+            m = re.search(r"TP1\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+)", raw, re.I)
+            if m: data["tp1"] = safe_float(m.group(1)); keys.append("tp1")
+            m = re.search(r"TP2\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+)", raw, re.I)
+            if m: data["tp2"] = safe_float(m.group(1)); keys.append("tp2")
+            m = re.search(r"TP3\s*[:=]\s*[$]?\s*([0-9]*\.?[0-9]+)", raw, re.I)
+            if m: data["tp3"] = safe_float(m.group(1)); keys.append("tp3")
+
+            m = re.search(r"(?:Heure|Time)\s*[:=]\s*([0-9:\- ]{10,})", raw, re.I)
+            if m: data["entry_time"] = m.group(1); keys.append("entry_time")
+
+            data["symbol"] = guess_symbol(data, raw); keys.append("symbol(guessed)")
+            log.info(f"{now_iso()} INFO:main:📥 Webhook payload (keys via text): {keys}")
 
     if not data:
         return None, raw
 
-    # Si type absent mais on a au moins side/entry ou entry_time → considérer comme une entrée
     action = (data.get("type") or data.get("action") or "").lower()
     if not action:
-        if data.get("entry") is not None or data.get("entry_time"):
+        # si on voit des indices d'une “entrée”, on force
+        if any(k in data for k in ("entry","entry_time","side")):
             action = "entry"
         else:
             log.warning("⚠️ Action inconnue: ''")
             return None, raw
-
     data["type"] = action
     return data, raw
 
 # --- Telegram ---
 def telegram_destination() -> Optional[str]:
-    if TELEGRAM_CHAT_ID:
-        return TELEGRAM_CHAT_ID
-    if TELEGRAM_CHANNEL_USERNAME:
-        return TELEGRAM_CHANNEL_USERNAME
+    if TELEGRAM_CHAT_ID: return TELEGRAM_CHAT_ID
+    if TELEGRAM_CHANNEL_USERNAME: return TELEGRAM_CHANNEL_USERNAME
     return None
 
 def send_telegram(text: str) -> bool:
@@ -204,31 +190,32 @@ def send_telegram(text: str) -> bool:
     if not (TELEGRAM_BOT_TOKEN and dest):
         log.warning("⚠️ Telegram non configuré (TOKEN/CHAT_ID manquant)")
         return False
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": dest,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    # simple retry sur 429
-    for attempt in range(3):
+    payload = {"chat_id": dest, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    for _ in range(3):
         r = httpx.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            log.info("✅ Telegram envoyé")
-            return True
+            log.info("✅ Telegram envoyé"); return True
         if r.status_code == 429:
-            try:
-                retry_after = r.json().get("parameters", {}).get("retry_after", 5)
-            except Exception:
-                retry_after = 5
+            try: retry = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception: retry = 5
             log.error(f"❌ Telegram: 429 - {r.text}")
-            time.sleep(int(retry_after) + 1)
-            continue
+            time.sleep(retry + 1); continue
         log.error(f"❌ Telegram: {r.status_code} - {r.text}")
         break
     return False
+
+def compute_missing_targets(side: str, entry: Optional[float],
+                            tp1: Optional[float], tp2: Optional[float], tp3: Optional[float],
+                            sl: Optional[float]) -> Tuple[Optional[float],Optional[float],Optional[float],Optional[float]]:
+    if entry is None:
+        return tp1, tp2, tp3, sl
+    up = (side.upper() == "BUY")
+    if tp1 is None: tp1 = entry * (1 + TP1_PCT/100) if up else entry * (1 - TP1_PCT/100)
+    if tp2 is None: tp2 = entry * (1 + TP2_PCT/100) if up else entry * (1 - TP2_PCT/100)
+    if tp3 is None: tp3 = entry * (1 + TP3_PCT/100) if up else entry * (1 - TP3_PCT/100)
+    if sl  is None: sl  = entry * (1 - SL_PCT/100)  if up else entry * (1 + SL_PCT/100)
+    return tp1, tp2, tp3, sl
 
 def format_telegram_trade(trade: Dict[str, Any], market: Dict[str, Any]) -> str:
     side = (trade.get("side") or "").upper()
@@ -241,6 +228,9 @@ def format_telegram_trade(trade: Dict[str, Any], market: Dict[str, Any]) -> str:
     sl = trade.get("sl")
     entry_time = trade.get("entry_time")
 
+    # Fallback : calcule TP/SL si absents et entry dispo
+    tp1, tp2, tp3, sl = compute_missing_targets(side, entry, tp1, tp2, tp3, sl)
+
     score, label, bullets = compute_confidence(trade, market)
     fg = market.get("fear_greed_display", str(market.get("fear_greed", "-")))
     btcd = market.get("btc_dominance_display", str(market.get("btc_dominance", "-")))
@@ -251,19 +241,16 @@ def format_telegram_trade(trade: Dict[str, Any], market: Dict[str, Any]) -> str:
     lines.append(f"📊 <b>{side}</b>")
     lines.append(f"📈 Direction: <b>{direction}</b> | {tf}")
     if entry_time:
-        lines.append(f"🕒 Entrée: <code>{entry_time}</code>")
+        lines.append(f"🕒 Heure: <code>{entry_time}</code>")
     lines.append("")
-    if entry is not None:
-        lines.append(f"💰 Entry: ${fmt_price(entry)}")
-    if any(v is not None for v in (tp1, tp2, tp3)):
-        lines.append("")
-        lines.append("🎯 Take Profits:")
-        if tp1 is not None: lines.append(f"  TP1: ${fmt_price(tp1)}")
-        if tp2 is not None: lines.append(f"  TP2: ${fmt_price(tp2)}")
-        if tp3 is not None: lines.append(f"  TP3: ${fmt_price(tp3)}")
-    if sl is not None:
-        lines.append("")
-        lines.append(f"🛑 Stop Loss: ${fmt_price(sl)}")
+    lines.append(f"💰 Entry: ${fmt_price(entry)}")
+    # Toujours afficher TP/SL (calculés si besoin)
+    lines.append("")
+    lines.append("🎯 Take Profits:")
+    lines.append(f"  TP1: ${fmt_price(tp1)}")
+    lines.append(f"  TP2: ${fmt_price(tp2)}")
+    lines.append(f"  TP3: ${fmt_price(tp3)}")
+    lines.append(f"\n🛑 Stop Loss: ${fmt_price(sl)}")
 
     lines.append("")
     lines.append(f"📊 CONFIANCE: <b>{score}% ({label})</b>")
@@ -277,7 +264,7 @@ def format_telegram_trade(trade: Dict[str, Any], market: Dict[str, Any]) -> str:
     lines.append(f"💡 Marché: F&G {fg} | BTC.D {btcd}")
     return "\n".join(lines)
 
-# --- API routes ---
+# --- API ---
 @app.get("/api/trades")
 def api_trades():
     return {"trades": STATE.trades, "count": len(STATE.trades)}
@@ -289,13 +276,11 @@ def api_reset():
 
 @app.get("/api/fear-greed")
 def api_fg():
-    # Ici tu pourrais rafraîchir depuis une source live
     log.info(f"✅ Fear & Greed: {STATE.market['fear_greed']}")
     return {"value": STATE.market["fear_greed"], "display": STATE.market["fear_greed_display"]}
 
 @app.get("/api/bullrun-phase")
 def api_bullrun():
-    # Démo simple
     log.info(f"✅ Global: MC {STATE.market['market_cap_display']}, BTC.D {STATE.market['btc_dominance_display']}")
     log.info(f"✅ Prix: BTC {STATE.market['btc_price_display']}")
     return {
@@ -316,10 +301,8 @@ async def tv_webhook(request: Request):
         log.warning(f"⚠️ Action inconnue: '{action}'")
         return PlainTextResponse("Unknown action", status_code=400)
 
-    # Normalisation trade
     side = (data.get("side") or "").upper()
     if side not in ("BUY", "SELL"):
-        # parfois “direction” arrive mais pas side
         direction = (data.get("direction") or "").upper()
         if direction in ("LONG", "SHORT"):
             side = "BUY" if direction == "LONG" else "SELL"
@@ -329,9 +312,9 @@ async def tv_webhook(request: Request):
     trade: Dict[str, Any] = {
         "type": "entry",
         "side": side,
-        "symbol": _guess_symbol(data, raw),
+        "symbol": guess_symbol(data, raw),
         "tf": data.get("tf") or data.get("timeframe"),
-        "entry": safe_float(data.get("entry")),
+        "entry": safe_float(data.get("entry") or data.get("price") or data.get("px") or data.get("p") or data.get("ix")),
         "tp1": safe_float(data.get("tp1")),
         "tp2": safe_float(data.get("tp2")),
         "tp3": safe_float(data.get("tp3")),
@@ -340,25 +323,14 @@ async def tv_webhook(request: Request):
         "entry_time": data.get("entry_time") or data.get("created_at") or now_iso(),
     }
 
-    # Ajout au state
     saved = STATE.add_trade(trade)
     log.info(f"✅ Trade #{saved['id']}: {saved['symbol']} {saved['side']} @ {saved['entry']}")
 
-    # Envoi immédiat Telegram
     text = format_telegram_trade(saved, STATE.market)
     send_telegram(text)
-
     return JSONResponse({"ok": True, "id": saved["id"]})
 
-def safe_float(v: Any) -> Optional[float]:
-    try:
-        if v is None or v == "":
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-# ---- Pages HTML (simples) ----
+# ---- Pages (UI rapide) ----
 NAV = """
 <nav style="display:flex;gap:10px;margin-bottom:14px">
   <a href="/">🏠 Accueil</a>
@@ -378,7 +350,7 @@ RESET_BTN = """
 <script>
 document.getElementById('resetBtn').onclick = async () => {
   if (!confirm('Réinitialiser les trades ?')) return;
-  const r = await fetch('/api/reset', {method:'POST'});
+  await fetch('/api/reset', {method:'POST'});
   location.reload();
 };
 </script>
@@ -400,22 +372,23 @@ def home():
 
 @app.get("/trades")
 def page_trades():
-    rows = []
-    rows.append("<tr><th>#</th><th>Symbole</th><th>Side</th><th>TF</th><th>Entrée</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Heure entrée</th><th>Créé</th></tr>")
+    rows = ["<tr><th>#</th><th>Symbole</th><th>Side</th><th>TF</th><th>Entrée</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Heure entrée</th><th>Créé</th></tr>"]
     for t in STATE.trades:
-        rows.append(f"<tr>"
-                    f"<td>{t['id']}</td>"
-                    f"<td>{(t.get('symbol') or '-')}</td>"
-                    f"<td>{(t.get('side') or '-')}</td>"
-                    f"<td>{(t.get('tf') or '-')}</td>"
-                    f"<td>{fmt_price(t.get('entry'))}</td>"
-                    f"<td>{fmt_price(t.get('tp1'))}</td>"
-                    f"<td>{fmt_price(t.get('tp2'))}</td>"
-                    f"<td>{fmt_price(t.get('tp3'))}</td>"
-                    f"<td>{fmt_price(t.get('sl'))}</td>"
-                    f"<td>{t.get('entry_time') or '-'}</td>"
-                    f"<td>{t.get('created_at') or '-'}</td>"
-                    f"</tr>")
+        rows.append(
+            f"<tr>"
+            f"<td>{t['id']}</td>"
+            f"<td>{(t.get('symbol') or '-')}</td>"
+            f"<td>{(t.get('side') or '-')}</td>"
+            f"<td>{(t.get('tf') or '-')}</td>"
+            f"<td>{fmt_price(t.get('entry'))}</td>"
+            f"<td>{fmt_price(t.get('tp1'))}</td>"
+            f"<td>{fmt_price(t.get('tp2'))}</td>"
+            f"<td>{fmt_price(t.get('tp3'))}</td>"
+            f"<td>{fmt_price(t.get('sl'))}</td>"
+            f"<td>{t.get('entry_time') or '-'}</td>"
+            f"<td>{t.get('created_at') or '-'}</td>"
+            f"</tr>"
+        )
     html = f"""
     <html><head><meta charset="utf-8"><title>Trades</title>
     <style>
@@ -428,16 +401,13 @@ def page_trades():
       {NAV}
       <h2>Trades</h2>
       {RESET_BTN}
-      <table>
-        {''.join(rows)}
-      </table>
+      <table>{''.join(rows)}</table>
     </body></html>
     """
     return HTMLResponse(html)
 
 @app.get("/equity-curve")
 def page_equity():
-    # Placeholder simple
     html = f"""
     <html><head><meta charset="utf-8"><title>Equity</title></head>
     <body style="font-family:system-ui;max-width:1000px;margin:20px auto">
@@ -520,10 +490,9 @@ def page_news():
     """
     return HTMLResponse(html)
 
-# --- DÉMO AU DÉMARRAGE (facultatif) ---
+# --- Seed démo (facultatif) ---
 def seed_demo():
-    if STATE.trades:
-        return
+    if STATE.trades: return
     demo = [
         {"type":"entry","side":"BUY","symbol":"BTCUSDT","tf":"1h","entry":65000,"tp1":66000,"tp2":67000,"tp3":69000,"sl":63000,"created_at":now_iso(),"entry_time":now_iso()},
         {"type":"entry","side":"SELL","symbol":"ETHUSDT","tf":"1h","entry":3500,"tp1":3400,"tp2":3300,"tp3":3200,"sl":3600,"created_at":now_iso(),"entry_time":now_iso()},
