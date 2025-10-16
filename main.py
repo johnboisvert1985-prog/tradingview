@@ -1111,12 +1111,28 @@ async def webhook(request: Request):
         # Décoder le body en texte
         body_text = body.decode('utf-8')
         
-        # Essayer de parser en JSON (même si Content-Type est text/plain)
+        # CRITICAL: Nettoyer TOUS les caractères de contrôle avant parsing
+        # Les remplacer par des espaces pour éviter les erreurs JSON
+        import string
+        # Garder uniquement les caractères imprimables et les espaces
+        clean_body = ''.join(char if char in string.printable or ord(char) > 127 else ' ' for char in body_text)
+        # Ensuite, réduire les espaces multiples
+        clean_body = ' '.join(clean_body.split())
+        
+        # Parser le JSON nettoyé
         try:
-            # Remplacer les caractères de contrôle problématiques
-            clean_body = body_text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
             payload = json.loads(clean_body)
         except Exception as json_error:
+            logger.error(f"❌ JSON invalide même après nettoyage. Body (100 car): {body_text[:100]}")
+            logger.error(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
+            logger.error(f"   Erreur: {str(json_error)}")
+            
+            return JSONResponse({
+                "status": "error", 
+                "message": "JSON invalide", 
+                "hint": "Vérifiez le format de votre webhook",
+                "received_preview": body_text[:200]
+            }, status_code=400)
             logger.error(f"❌ JSON invalide. Body (100 car): {body_text[:100]}")
             logger.error(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
             logger.error(f"   Erreur: {str(json_error)}")
