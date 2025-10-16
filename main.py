@@ -422,40 +422,175 @@ async def home():
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page():
-    rows = []
-    for t in STATE.trades:
-        rows.append(f"""
-        <tr>
-          <td>{t['id']}</td>
-          <td>{t['symbol']}</td>
-          <td>{t['side']}</td>
-          <td>{t['direction']}</td>
-          <td>{t['timeframe']}</td>
-          <td>{t.get('entry_time','-')}</td>
-          <td>{fmt_money(t.get('entry'))}</td>
-          <td>{fmt_money(t.get('tp1'))}</td>
-          <td>{fmt_money(t.get('tp2'))}</td>
-          <td>{fmt_money(t.get('tp3'))}</td>
-          <td>{fmt_money(t.get('sl'))}</td>
-          <td>{t.get('alert_name','')}</td>
-        </tr>
-        """)
-    html = HTML_HEAD + NAV + f"""
-      <h1>Trades</h1>
-      {RESET_BTN}
-      <table>
-        <thead>
+    html = HTML_HEAD + NAV + """
+    <main>
+      <div class="toolbar">
+        <h1>💹 Trades</h1>
+        <form method="post" action="/api/reset" onsubmit="setTimeout(()=>location.reload(),400);" style="margin:0">
+          <button class="btn reset" type="submit">♻️ Reset</button>
+        </form>
+      </div>
+
+      <div class="card" style="margin-bottom:12px">
+        <div class="toolbar">
+          <div class="search">
+            <input id="q" type="search" placeholder="Filtrer (symbole, side, TF…)" oninput="render()" />
+            <select id="side" onchange="render()">
+              <option value="">Side: Tous</option>
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+            <select id="tf" onchange="render()">
+              <option value="">TF: Tous</option>
+              <option>1</option><option>3</option><option>5</option><option>15</option><option>30</option>
+              <option>60</option><option>120</option><option>240</option><option>1D</option>
+            </select>
+          </div>
+          <div class="search">
+            <span class="badge" id="badgeCount">0 trade</span>
+            <button class="btn" type="button" onclick="load(true)">⟳ Rafraîchir</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap card">
+        <table>
+          <thead>
+            <tr>
+              <th onclick="sortBy('id')">#</th>
+              <th onclick="sortBy('symbol')">Symbole</th>
+              <th onclick="sortBy('side')">Side</th>
+              <th>Dir</th>
+              <th onclick="sortBy('timeframe')">TF</th>
+              <th onclick="sortBy('entry_time')">Heure d’entrée</th>
+              <th class="right" onclick="sortBy('entry')">Entry</th>
+              <th class="right" onclick="sortBy('tp1')">TP1</th>
+              <th class="right" onclick="sortBy('tp2')">TP2</th>
+              <th class="right" onclick="sortBy('tp3')">TP3</th>
+              <th class="right" onclick="sortBy('sl')">SL</th>
+              <th>Alerte</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"><tr><td class="empty" colspan="12">Chargement…</td></tr></tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px">Astuce : clique sur les en-têtes pour trier • Auto-refresh toutes les 5s</p>
+    </main>
+    <script>
+      let DATA = [];
+      let sortKey = 'id';
+      let sortDir = 'desc';
+
+      function money(x){
+        if(x===null || x===undefined || x==='') return '-';
+        const n = Number(x);
+        if(!isFinite(n)) return '-';
+        return n.toFixed(6).replace(/0+$/,'').replace(/\.$/,'');
+      }
+      function text(x){ return (x===null||x===undefined||x==='') ? '-' : x; }
+
+      function applyFilters(rows){
+        const q = document.getElementById('q').value.trim().toLowerCase();
+        const side = document.getElementById('side').value;
+        const tf = document.getElementById('tf').value;
+        return rows.filter(r=>{
+          if(side && (r.side||'').toUpperCase()!==side) return false;
+          if(tf && String(r.timeframe||'').toUpperCase()!==tf.toUpperCase()) return false;
+          if(q){
+            const hay = [
+              r.symbol, r.side, r.direction, r.timeframe, r.alert_name, r.entry_time
+            ].map(v=>String(v||'').toLowerCase()).join(' ');
+            if(!hay.includes(q)) return false;
+          }
+          return true;
+        });
+      }
+
+      function sortRows(rows){
+        rows.sort((a,b)=>{
+          let va=a[sortKey], vb=b[sortKey];
+          // essais numériques si possible
+          const na = Number(va), nb = Number(vb);
+          if(isFinite(na) && isFinite(nb)){ va=na; vb=nb; }
+          if(va<vb) return (sortDir==='asc')? -1: 1;
+          if(va>vb) return (sortDir==='asc')? 1 : -1;
+          return 0;
+        });
+        return rows;
+      }
+
+      function sortBy(k){
+        if(sortKey===k){ sortDir = (sortDir==='asc')?'desc':'asc'; }
+        else { sortKey=k; sortDir='asc'; }
+        render();
+      }
+
+      function render(){
+        const tbody = document.getElementById('tbody');
+        let rows = [...DATA];
+        rows = applyFilters(rows);
+        rows = sortRows(rows);
+        document.getElementById('badgeCount').textContent = rows.length + (rows.length>1 ? " trades" : " trade");
+
+        if(rows.length===0){
+          tbody.innerHTML = '<tr><td class="empty" colspan="12">Aucun trade</td></tr>';
+          return;
+        }
+
+        const out = rows.map(t=>{
+          const sideCls = (String(t.side||'').toUpperCase()==='BUY') ? 'buy' : 'sell';
+          return `
           <tr>
-            <th>#</th><th>Symbole</th><th>Side</th><th>Dir</th><th>TF</th>
-            <th>Heure d’entrée</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>Alerte</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows) if rows else '<tr><td colspan="12">Aucun trade</td></tr>'}
-        </tbody>
-      </table>
+            <td class="mono">${t.id ?? '-'}</td>
+            <td class="mono">${text(t.symbol)}</td>
+            <td><span class="pill ${sideCls}">${text(t.side)}</span></td>
+            <td class="muted">${text(t.direction)}</td>
+            <td class="muted">${text(t.timeframe)}</td>
+            <td class="muted mono">${text(t.entry_time)}</td>
+            <td class="right mono">${money(t.entry)}</td>
+            <td class="right mono">${money(t.tp1)}</td>
+            <td class="right mono">${money(t.tp2)}</td>
+            <td class="right mono">${money(t.tp3)}</td>
+            <td class="right mono">${money(t.sl)}</td>
+            <td class="muted">${text(t.alert_name)}</td>
+          </tr>`;
+        }).join('');
+        tbody.innerHTML = out;
+      }
+
+      async function load(manual=false){
+        try{
+          const r = await fetch('/api/trades',{cache:'no-store'});
+          const j = await r.json();
+          DATA = (j.trades||[]).map(x=>({
+            id: x.id,
+            symbol: x.symbol,
+            side: x.side,
+            direction: x.direction,
+            timeframe: x.timeframe || '-',
+            entry_time: x.entry_time || '-',
+            entry: (x.entry ?? null),
+            tp1: (x.tp1 ?? null),
+            tp2: (x.tp2 ?? null),
+            tp3: (x.tp3 ?? null),
+            sl:  (x.sl ?? null),
+            alert_name: x.alert_name || ''
+          }));
+          render();
+          if(!manual){ /* ok */ }
+        }catch(e){
+          const tbody = document.getElementById('tbody');
+          tbody.innerHTML = '<tr><td class="empty" colspan="12">Erreur de chargement</td></tr>';
+          console.error(e);
+        }
+      }
+
+      load();
+      setInterval(load, 5000); // auto refresh 5s
+    </script>
     """ + HTML_FOOT
     return HTMLResponse(html)
+
 
 @app.get("/equity-curve", response_class=HTMLResponse)
 async def equity_curve():
@@ -527,4 +662,5 @@ async def annonces():
 @app.get("/healthz")
 async def health():
     return {"ok": True}
+
 
