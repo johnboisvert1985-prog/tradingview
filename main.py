@@ -1100,11 +1100,40 @@ async def webhook(request: Request):
             logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
             return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
         
+        # Décoder le body en texte pour déboguer
+        body_text = body.decode('utf-8')
+        
+        # Essayer de parser en JSON
         try:
             payload = await request.json()
-        except:
-            logger.warning("⚠️ Webhook: JSON invalide")
-            return JSONResponse({"status": "error", "message": "JSON invalide"}, status_code=400)
+        except Exception as json_error:
+            # Log du contenu brut pour déboguer
+            logger.error(f"❌ JSON invalide. Body reçu (100 premiers caractères): {body_text[:100]}")
+            logger.error(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
+            logger.error(f"   Erreur: {str(json_error)}")
+            
+            # Essayer de parser comme form data
+            if 'application/x-www-form-urlencoded' in request.headers.get('content-type', ''):
+                try:
+                    from urllib.parse import parse_qs
+                    parsed = parse_qs(body_text)
+                    # Convertir en dict simple
+                    payload = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+                    logger.info(f"✅ Form data parsé: {payload}")
+                except Exception as e:
+                    logger.error(f"❌ Impossible de parser form data: {e}")
+                    return JSONResponse({
+                        "status": "error", 
+                        "message": "Format non supporté", 
+                        "received": body_text[:200]
+                    }, status_code=400)
+            else:
+                return JSONResponse({
+                    "status": "error", 
+                    "message": "JSON invalide", 
+                    "hint": "Vérifiez le format de votre webhook TradingView",
+                    "received_preview": body_text[:200]
+                }, status_code=400)
         
         logger.info(f"📥 Webhook: {payload.get('type', 'UNKNOWN')} - {payload.get('symbol', 'N/A')}")
         
