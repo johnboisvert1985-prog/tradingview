@@ -1100,44 +1100,114 @@ async def webhook(request: Request):
             logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
             return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
         
-        # Décoder le body en texte pour déboguer
+@app.post("/tv-webhook")
+async def webhook(request: Request):
+    try:
+        body = await request.body()
+        if not body:
+            logger.warning("⚠️ Webhook: Body vide (peut-être un ping)")
+            return JSONResponse({"status": "ok", "message": "Ping reçu"}, status_code=200)
+        
+        # Décoder le body en texte
         body_text = body.decode('utf-8')
         
-        # Essayer de parser en JSON
+        # Essayer de parser en JSON (même si Content-Type est text/plain)
         try:
-            payload = await request.json()
+            # Remplacer les caractères de contrôle problématiques
+            clean_body = body_text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            payload = json.loads(clean_body)
         except Exception as json_error:
-            # Log du contenu brut pour déboguer
-            logger.error(f"❌ JSON invalide. Body reçu (100 premiers caractères): {body_text[:100]}")
+            logger.error(f"❌ JSON invalide. Body (100 car): {body_text[:100]}")
             logger.error(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
             logger.error(f"   Erreur: {str(json_error)}")
             
-            # Essayer de parser comme form data
-            if 'application/x-www-form-urlencoded' in request.headers.get('content-type', ''):
-                try:
-                    from urllib.parse import parse_qs
-                    parsed = parse_qs(body_text)
-                    # Convertir en dict simple
-                    payload = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-                    logger.info(f"✅ Form data parsé: {payload}")
-                except Exception as e:
-                    logger.error(f"❌ Impossible de parser form data: {e}")
-                    return JSONResponse({
-                        "status": "error", 
-                        "message": "Format non supporté", 
-                        "received": body_text[:200]
-                    }, status_code=400)
-            else:
+            return JSONResponse({
+                "status": "error", 
+                "message": "JSON invalide", 
+                "hint": "Vérifiez le format de votre webhook",
+                "received_preview": body_text[:200]
+            }, status_code=400)
+        
+        # DÉTECTION: Message Telegram formaté vs webhook de trading standard
+        if 'chat_id' in payload and 'text' in payload:
+            # C'est un message Telegram, on extrait les infos
+            logger.info(f"📱 Message Telegram détecté, parsing...")
+            
+            text = payload['text']
+            
+            # Parser le texte pour extraire les informations
+            # Format: ⚡ <b>SELL</b> — <b>FORTHUSDT.P</b> (15) P ix: <code>2.167</code>
+            
+            # Extraction du side (BUY/SELL)
+            side = None
+            if '<b>SELL</b>' in text or '<b>SHORT</b>' in text:
+                side = 'SHORT'
+            elif '<b>BUY</b>' in text or '<b>LONG</b>' in text:
+                side = 'LONG'
+            
+            # Extraction du symbol
+            import re
+            symbol_match = re.search(r'<b>([A-Z0-9]+\.?P?)</b>.*?\(', text)
+            symbol = symbol_match.group(1) if symbol_match else None
+            
+            # Extraction du prix (entrée)
+            price_match = re.search(r'P\s*ix:\s*<code>([\d.]+)</code>', text)
+            entry = float(price_match.group(1)) if price_match else None
+            
+            # Extraction TP1, TP2, TP3
+            tp_matches = re.findall(r'TP\d:\s*<code>([\d.]+)</code>', text)
+            tp1 = float(tp_matches[0]) if len(tp_matches) > 0 else None
+            tp2 = float(tp_matches[1]) if len(tp_matches) > 1 else None
+            tp3 = float(tp_matches[2]) if len(tp_matches) > 2 else None
+            
+            # Extraction SL
+            sl_match = re.search(r'SL:\s*<code>([\d.]+)</code>', text)
+            sl = float(sl_match.group(1)) if sl_match else None
+            
+            # Log des données extraites
+            logger.info(f"   Extrait: {symbol} {side} @ {entry}, TP1={tp1}, TP2={tp2}, TP3={tp3}, SL={sl}")
+            
+            # Vérifier que les données minimales sont présentes
+            if not all([symbol, side, entry]):
+                logger.warning(f"⚠️ Données incomplètes: symbol={symbol}, side={side}, entry={entry}")
                 return JSONResponse({
-                    "status": "error", 
-                    "message": "JSON invalide", 
-                    "hint": "Vérifiez le format de votre webhook TradingView",
-                    "received_preview": body_text[:200]
+                    "status": "error",
+                    "message": "Impossible d'extraire symbol/side/entry du message Telegram",
+                    "extracted": {"symbol": symbol, "side": side, "entry": entry}
                 }, status_code=400)
-        
-        logger.info(f"📥 Webhook: {payload.get('type', 'UNKNOWN')} - {payload.get('symbol', 'N/A')}")
-        
-        action = (payload.get("type") or payload.get("action") or "").lower()
+            
+            # Calculer automatiquement les TP/SL s'ils sont manquants
+            if not tp1:
+                if side == 'LONG':
+                    tp1 = entry * 1.015
+                    tp2 = entry * 1.025
+                    tp3 = entry * 1.04
+                    sl = entry * 0.98
+                else:  # SHORT
+                    tp1 = entry * 0.985
+                    tp2 = entry * 0.975
+                    tp3 = entry * 0.96
+                    sl = entry * 1.02
+                logger.info(f"   TP/SL auto-calculés")
+            
+            # Créer le payload standardisé
+            payload = {
+                'type': 'ENTRY',
+                'symbol': symbol,
+                'side': side,
+                'entry': entry,
+                'tp1': tp1 or entry * (1.02 if side == 'LONG' else 0.98),
+                'tp2': tp2 or entry * (1.03 if side == 'LONG' else 0.97),
+                'tp3': tp3 or entry * (1.05 if side == 'LONG' else 0.95),
+                'sl': sl or entry * (0.98 if side == 'LONG' else 1.02),
+                'tf_label': '15m'
+            }
+            
+            action = 'entry'
+        else:
+            # Format standard de webhook
+            logger.info(f"📥 Webhook standard: {payload.get('type', 'UNKNOWN')} - {payload.get('symbol', 'N/A')}")
+            action = (payload.get("type") or payload.get("action") or "").lower()
         symbol = payload.get("symbol")
         side = payload.get("side", "LONG")
         
