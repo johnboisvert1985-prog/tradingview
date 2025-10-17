@@ -20,6 +20,10 @@ CRYPTOPANIC_TOKEN = "bca5327f4c31e7511b4a7824951ed0ae4d8bb5ac"
 # Stockage des trades
 trades_db = []
 
+# Stockage Paper Trading
+paper_trades_db = []
+paper_balance = {"USDT": 10000.0}  # Solde initial en USDT
+
 # CSS commun
 CSS = """<style>
 *{margin:0;padding:0;box-sizing:border-box;}
@@ -71,6 +75,7 @@ NAV = """<div class="nav">
 <a href="/annonces">📰 Actualités</a>
 <a href="/heatmap">🔥 Heatmap</a>
 <a href="/backtesting">🔬 Backtesting</a>
+<a href="/paper-trading">📝 Paper Trading</a>
 <a href="/strategie">📋 Stratégie</a>
 <a href="/correlations">🔗 Corrélations</a>
 <a href="/top-movers">🚀 Top Movers</a>
@@ -120,7 +125,8 @@ async def home():
 <div class="card"><h2>📈 BTC Quarterly</h2><p>Rendements trimestriels</p></div>
 <div class="card"><h2>📰 Actualités</h2><p>News crypto live</p></div>
 <div class="card"><h2>🔥 Heatmap</h2><p>Performance mensuelle/annuelle</p></div>
-<div class="card"><h2>🔬 Backtesting</h2><p>Test de stratégies</p></div>
+<div class="card"><h2>🔬 Backtesting</h2><p>Test stratégies historiques</p></div>
+<div class="card"><h2>📝 Paper Trading</h2><p>Simulation temps réel</p></div>
 <div class="card"><h2>📋 Stratégie</h2><p>Règles trading</p></div>
 <div class="card"><h2>🔗 Corrélations</h2><p>Relations actifs</p></div>
 <div class="card"><h2>🚀 Top Movers</h2><p>Gainers/Losers</p></div>
@@ -534,7 +540,7 @@ async def get_heatmap(type: str = "monthly"):
         
         return {"heatmap": heatmap_data, "type": "monthly"}
 
-# ============= API BACKTESTING =============
+# ============= API BACKTESTING (VRAI AVEC DONNÉES HISTORIQUES) =============
 @app.post("/api/backtest")
 async def run_backtest(request: Request):
     data = await request.json()
@@ -543,27 +549,393 @@ async def run_backtest(request: Request):
     strategy = data.get("strategy", "SMA_CROSS")
     start_capital = data.get("start_capital", 10000)
     
-    # Simuler un backtest simple
-    trades_count = random.randint(50, 200)
-    win_rate = round(random.uniform(45, 70), 2)
-    total_return = round(random.uniform(-20, 150), 2)
-    max_drawdown = round(random.uniform(10, 40), 2)
-    sharpe_ratio = round(random.uniform(0.5, 2.5), 2)
+    try:
+        # Récupérer les données historiques de Binance (500 dernières bougies 1h)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"https://api.binance.com/api/v3/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": "1h",
+                    "limit": 500
+                }
+            )
+            
+            if response.status_code != 200:
+                raise Exception("Erreur API Binance")
+            
+            klines = response.json()
+            
+            # Extraire les prix de clôture
+            closes = [float(k[4]) for k in klines]
+            
+            # Appliquer la stratégie
+            if strategy == "SMA_CROSS":
+                signals = backtest_sma_cross(closes)
+            elif strategy == "RSI_OVERBOUGHT":
+                signals = backtest_rsi(closes)
+            elif strategy == "MACD":
+                signals = backtest_macd(closes)
+            elif strategy == "BOLLINGER":
+                signals = backtest_bollinger(closes)
+            elif strategy == "EMA_RIBBON":
+                signals = backtest_ema_ribbon(closes)
+            else:
+                signals = []
+            
+            # Calculer les résultats
+            capital = start_capital
+            position = None
+            trades = []
+            equity_curve = [capital]
+            
+            for i in range(len(signals)):
+                if signals[i] == "BUY" and position is None:
+                    position = closes[i]
+                    trades.append({"type": "BUY", "price": closes[i]})
+                
+                elif signals[i] == "SELL" and position is not None:
+                    pnl_pct = ((closes[i] - position) / position) * 100
+                    capital += (capital * pnl_pct / 100)
+                    trades.append({"type": "SELL", "price": closes[i], "pnl": pnl_pct})
+                    position = None
+                
+                equity_curve.append(capital)
+            
+            # Calculer les métriques
+            winning_trades = sum(1 for t in trades if t.get("pnl", 0) > 0)
+            total_trades = len([t for t in trades if "pnl" in t])
+            win_rate = round((winning_trades / total_trades * 100) if total_trades > 0 else 0, 2)
+            
+            total_return = round(((capital - start_capital) / start_capital) * 100, 2)
+            
+            # Max Drawdown
+            peak = start_capital
+            max_dd = 0
+            for eq in equity_curve:
+                if eq > peak:
+                    peak = eq
+                dd = ((peak - eq) / peak) * 100
+                if dd > max_dd:
+                    max_dd = dd
+            
+            # Sharpe Ratio (simplifié)
+            returns = [(equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1] for i in range(1, len(equity_curve))]
+            if returns:
+                avg_return = sum(returns) / len(returns)
+                std_return = (sum((r - avg_return)**2 for r in returns) / len(returns)) ** 0.5
+                sharpe = round((avg_return / std_return * (252 ** 0.5)) if std_return > 0 else 0, 2)
+            else:
+                sharpe = 0
+            
+            result = {
+                "symbol": symbol,
+                "strategy": strategy,
+                "start_capital": start_capital,
+                "final_capital": round(capital, 2),
+                "total_return": total_return,
+                "trades": total_trades,
+                "win_rate": win_rate,
+                "max_drawdown": round(max_dd, 2),
+                "sharpe_ratio": sharpe,
+                "status": "completed"
+            }
+            
+            return result
     
-    result = {
-        "symbol": symbol,
-        "strategy": strategy,
-        "start_capital": start_capital,
-        "final_capital": round(start_capital * (1 + total_return / 100), 2),
-        "total_return": total_return,
-        "trades": trades_count,
-        "win_rate": win_rate,
-        "max_drawdown": max_drawdown,
-        "sharpe_ratio": sharpe_ratio,
-        "status": "completed"
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Erreur lors du backtest: {str(e)}"
+        }
+
+# Stratégies de backtesting
+def backtest_sma_cross(closes):
+    """SMA Cross: Achat quand SMA20 > SMA50"""
+    signals = []
+    sma20 = []
+    sma50 = []
+    
+    for i in range(len(closes)):
+        if i >= 19:
+            sma20.append(sum(closes[i-19:i+1]) / 20)
+        else:
+            sma20.append(None)
+        
+        if i >= 49:
+            sma50.append(sum(closes[i-49:i+1]) / 50)
+        else:
+            sma50.append(None)
+        
+        if sma20[i] and sma50[i]:
+            if i > 0 and sma20[i-1] and sma50[i-1]:
+                if sma20[i] > sma50[i] and sma20[i-1] <= sma50[i-1]:
+                    signals.append("BUY")
+                elif sma20[i] < sma50[i] and sma20[i-1] >= sma50[i-1]:
+                    signals.append("SELL")
+                else:
+                    signals.append("HOLD")
+            else:
+                signals.append("HOLD")
+        else:
+            signals.append("HOLD")
+    
+    return signals
+
+def backtest_rsi(closes):
+    """RSI: Achat RSI < 30, Vente RSI > 70"""
+    signals = []
+    period = 14
+    
+    for i in range(len(closes)):
+        if i >= period:
+            changes = [closes[j] - closes[j-1] for j in range(i-period+1, i+1)]
+            gains = [c if c > 0 else 0 for c in changes]
+            losses = [abs(c) if c < 0 else 0 for c in changes]
+            
+            avg_gain = sum(gains) / period
+            avg_loss = sum(losses) / period
+            
+            if avg_loss == 0:
+                rsi = 100
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            
+            if rsi < 30:
+                signals.append("BUY")
+            elif rsi > 70:
+                signals.append("SELL")
+            else:
+                signals.append("HOLD")
+        else:
+            signals.append("HOLD")
+    
+    return signals
+
+def backtest_macd(closes):
+    """MACD: Croisement haussier/baissier"""
+    signals = []
+    ema12 = []
+    ema26 = []
+    
+    # Calculer EMA12 et EMA26
+    multiplier12 = 2 / (12 + 1)
+    multiplier26 = 2 / (26 + 1)
+    
+    for i in range(len(closes)):
+        if i == 0:
+            ema12.append(closes[i])
+            ema26.append(closes[i])
+        else:
+            ema12.append((closes[i] - ema12[i-1]) * multiplier12 + ema12[i-1])
+            ema26.append((closes[i] - ema26[i-1]) * multiplier26 + ema26[i-1])
+    
+    # Calculer MACD
+    macd_line = [ema12[i] - ema26[i] for i in range(len(closes))]
+    
+    # Signal sur croisement de 0
+    for i in range(len(macd_line)):
+        if i > 0:
+            if macd_line[i] > 0 and macd_line[i-1] <= 0:
+                signals.append("BUY")
+            elif macd_line[i] < 0 and macd_line[i-1] >= 0:
+                signals.append("SELL")
+            else:
+                signals.append("HOLD")
+        else:
+            signals.append("HOLD")
+    
+    return signals
+
+def backtest_bollinger(closes):
+    """Bollinger Bands: Achat sur rebond bande basse"""
+    signals = []
+    period = 20
+    
+    for i in range(len(closes)):
+        if i >= period - 1:
+            sma = sum(closes[i-period+1:i+1]) / period
+            std = (sum((closes[j] - sma)**2 for j in range(i-period+1, i+1)) / period) ** 0.5
+            
+            upper = sma + (2 * std)
+            lower = sma - (2 * std)
+            
+            if closes[i] < lower:
+                signals.append("BUY")
+            elif closes[i] > upper:
+                signals.append("SELL")
+            else:
+                signals.append("HOLD")
+        else:
+            signals.append("HOLD")
+    
+    return signals
+
+def backtest_ema_ribbon(closes):
+    """EMA Ribbon: Achat quand EMAs s'alignent"""
+    signals = []
+    
+    # Calculer EMA 8, 13, 21
+    ema8 = []
+    ema13 = []
+    ema21 = []
+    
+    mult8 = 2 / (8 + 1)
+    mult13 = 2 / (13 + 1)
+    mult21 = 2 / (21 + 1)
+    
+    for i in range(len(closes)):
+        if i == 0:
+            ema8.append(closes[i])
+            ema13.append(closes[i])
+            ema21.append(closes[i])
+        else:
+            ema8.append((closes[i] - ema8[i-1]) * mult8 + ema8[i-1])
+            ema13.append((closes[i] - ema13[i-1]) * mult13 + ema13[i-1])
+            ema21.append((closes[i] - ema21[i-1]) * mult21 + ema21[i-1])
+    
+    for i in range(len(closes)):
+        if i > 0:
+            # Achat si EMA8 > EMA13 > EMA21 (tendance haussière)
+            if ema8[i] > ema13[i] > ema21[i] and not (ema8[i-1] > ema13[i-1] > ema21[i-1]):
+                signals.append("BUY")
+            # Vente si EMA8 < EMA13 < EMA21 (tendance baissière)
+            elif ema8[i] < ema13[i] < ema21[i] and not (ema8[i-1] < ema13[i-1] < ema21[i-1]):
+                signals.append("SELL")
+            else:
+                signals.append("HOLD")
+        else:
+            signals.append("HOLD")
+    
+    return signals
+
+# ============= API PAPER TRADING =============
+@app.get("/api/paper-balance")
+async def get_paper_balance():
+    return {"balance": paper_balance}
+
+@app.get("/api/paper-trades")
+async def get_paper_trades():
+    return {"trades": paper_trades_db}
+
+@app.post("/api/paper-trade")
+async def place_paper_trade(request: Request):
+    data = await request.json()
+    
+    action = data.get("action")  # BUY or SELL
+    symbol = data.get("symbol")
+    quantity = float(data.get("quantity", 0))
+    
+    try:
+        # Récupérer le prix actuel
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
+            if response.status_code != 200:
+                return {"status": "error", "message": "Impossible de récupérer le prix"}
+            
+            price = float(response.json()["price"])
+        
+        if action == "BUY":
+            cost = quantity * price
+            if paper_balance.get("USDT", 0) < cost:
+                return {"status": "error", "message": "Solde USDT insuffisant"}
+            
+            # Déduire du solde USDT
+            paper_balance["USDT"] -= cost
+            
+            # Ajouter au solde crypto
+            crypto = symbol.replace("USDT", "")
+            paper_balance[crypto] = paper_balance.get(crypto, 0) + quantity
+            
+            # Enregistrer le trade
+            trade_record = {
+                "id": len(paper_trades_db) + 1,
+                "timestamp": datetime.now().isoformat(),
+                "action": "BUY",
+                "symbol": symbol,
+                "quantity": quantity,
+                "price": price,
+                "total": cost,
+                "status": "completed"
+            }
+            paper_trades_db.append(trade_record)
+            
+            return {"status": "success", "message": f"Achat de {quantity} {crypto} à ${price:.2f}", "trade": trade_record}
+        
+        elif action == "SELL":
+            crypto = symbol.replace("USDT", "")
+            if paper_balance.get(crypto, 0) < quantity:
+                return {"status": "error", "message": f"Solde {crypto} insuffisant"}
+            
+            # Déduire du solde crypto
+            paper_balance[crypto] -= quantity
+            
+            # Ajouter au solde USDT
+            revenue = quantity * price
+            paper_balance["USDT"] = paper_balance.get("USDT", 0) + revenue
+            
+            # Enregistrer le trade
+            trade_record = {
+                "id": len(paper_trades_db) + 1,
+                "timestamp": datetime.now().isoformat(),
+                "action": "SELL",
+                "symbol": symbol,
+                "quantity": quantity,
+                "price": price,
+                "total": revenue,
+                "status": "completed"
+            }
+            paper_trades_db.append(trade_record)
+            
+            return {"status": "success", "message": f"Vente de {quantity} {crypto} à ${price:.2f}", "trade": trade_record}
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/paper-reset")
+async def reset_paper_trading():
+    global paper_trades_db, paper_balance
+    paper_trades_db = []
+    paper_balance = {"USDT": 10000.0}
+    return {"status": "success", "message": "Paper trading réinitialisé"}
+
+@app.get("/api/paper-stats")
+async def get_paper_stats():
+    if not paper_trades_db:
+        return {
+            "total_trades": 0,
+            "total_value": 10000.0,
+            "pnl": 0,
+            "pnl_pct": 0
+        }
+    
+    # Calculer la valeur totale du portfolio
+    total_value = paper_balance.get("USDT", 0)
+    
+    # Ajouter la valeur des cryptos (simplifié)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for crypto, qty in paper_balance.items():
+                if crypto != "USDT" and qty > 0:
+                    symbol = f"{crypto}USDT"
+                    response = await client.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
+                    if response.status_code == 200:
+                        price = float(response.json()["price"])
+                        total_value += qty * price
+    except:
+        pass
+    
+    initial_capital = 10000.0
+    pnl = total_value - initial_capital
+    pnl_pct = (pnl / initial_capital) * 100
+    
+    return {
+        "total_trades": len(paper_trades_db),
+        "total_value": round(total_value, 2),
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 2)
     }
-    
-    return result
 
 # ============= API CORRÉLATIONS =============
 @app.get("/api/correlations")
@@ -1166,7 +1538,7 @@ async def backtesting_page():
 <html><head><meta charset="UTF-8"><title>Backtesting</title>""" + CSS + """</head>
 <body>
 <div class="container">
-<div class="header"><h1>🔬 Backtesting de Stratégies</h1><p>Testez vos stratégies sur données historiques</p></div>""" + NAV + """
+<div class="header"><h1>🔬 Backtesting de Stratégies</h1><p>Testez vos stratégies sur données historiques RÉELLES (Binance)</p></div>""" + NAV + """
 
 <div class="grid grid-2">
 <div class="card">
@@ -1178,6 +1550,8 @@ async def backtesting_page():
 <option value="SOLUSDT">Solana (SOL)</option>
 <option value="ADAUSDT">Cardano (ADA)</option>
 <option value="DOGEUSDT">Dogecoin (DOGE)</option>
+<option value="BNBUSDT">Binance Coin (BNB)</option>
+<option value="XRPUSDT">Ripple (XRP)</option>
 </select>
 
 <label style="color:#94a3b8;font-size:14px;display:block;margin-bottom:5px;">Stratégie</label>
@@ -1193,6 +1567,17 @@ async def backtesting_page():
 <input type="number" id="capital" value="10000" step="1000">
 
 <button onclick="runBacktest()" style="width:100%;margin-top:10px;">▶️ Lancer le Backtest</button>
+
+<div style="margin-top:20px;padding:15px;background:#0f172a;border-radius:8px;">
+<p style="color:#60a5fa;font-weight:bold;margin-bottom:10px;">💡 Conseils d'utilisation:</p>
+<ul style="color:#94a3b8;font-size:13px;line-height:1.8;padding-left:20px;">
+<li>Testez <strong>plusieurs stratégies</strong> sur la même crypto pour comparer</li>
+<li>Ne vous fiez pas uniquement au rendement : regardez le <strong>drawdown et le Sharpe</strong></li>
+<li><strong>Win rate > 55%</strong> = bonne stratégie</li>
+<li><strong>Sharpe > 1.5</strong> = excellent risque/rendement</li>
+<li><strong>Drawdown < 30%</strong> = risque acceptable</li>
+</ul>
+</div>
 </div>
 
 <div class="card">
@@ -1227,15 +1612,22 @@ async def backtesting_page():
 <p style="font-size:20px;font-weight:bold;color:#f59e0b;" id="sharpe">--</p>
 </div>
 </div>
+
+<div style="margin-top:20px;padding:15px;background:#0f172a;border-radius:8px;">
+<p style="color:#94a3b8;font-size:13px;"><strong style="color:#60a5fa;">ℹ️ Interprétation:</strong></p>
+<p style="color:#94a3b8;font-size:12px;margin-top:8px;" id="interpretation">--</p>
+</div>
 </div>
 
 <div id="loading" style="text-align:center;padding:40px;display:none;">
 <div style="font-size:48px;margin-bottom:20px;">⏳</div>
-<p style="color:#94a3b8;">Calcul en cours...</p>
+<p style="color:#94a3b8;">Calcul en cours sur 500 bougies 1h...</p>
+<p style="color:#64748b;font-size:12px;margin-top:10px;">Récupération données Binance + application stratégie</p>
 </div>
 
 <div id="placeholder" style="text-align:center;padding:40px;">
-<p style="color:#94a3b8;">Configurez et lancez un backtest</p>
+<p style="color:#94a3b8;">Configurez et lancez un backtest avec données RÉELLES</p>
+<p style="color:#64748b;font-size:12px;margin-top:10px;">Utilise l'API Binance pour les prix historiques</p>
 </div>
 </div>
 </div>
@@ -1260,20 +1652,1713 @@ async function runBacktest() {
     
     const data = await res.json();
     
-    setTimeout(() => {
+    if (data.status === 'error') {
+        alert('Erreur: ' + data.message);
         document.getElementById('loading').style.display = 'none';
-        document.getElementById('results').style.display = 'block';
-        
-        document.getElementById('finalCapital').textContent = '$' + data.final_capital.toLocaleString();
-        document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
-        document.getElementById('tradesCount').textContent = data.trades;
-        document.getElementById('winRate').textContent = data.win_rate + '%';
-        document.getElementById('maxDD').textContent = data.max_drawdown + '%';
-        document.getElementById('sharpe').textContent = data.sharpe_ratio;
-        
-        document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
-        document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
-    }, 2000);
+        document.getElementById('placeholder').style.display = 'block';
+        return;
+    }
+    
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('results').style.display = 'block';
+    
+    document.getElementById('finalCapital').textContent = '
+
+@app.get("/paper-trading", response_class=HTMLResponse)
+async def paper_trading_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Paper Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📝 Paper Trading</h1><p>Simulation de trading en temps réel</p></div>""" + NAV + """
+
+<div class="grid grid-3">
+<div class="stat-box">
+<div class="label">Valeur Totale</div>
+<div class="value" id="totalValue">$10,000</div>
+</div>
+<div class="stat-box">
+<div class="label">P&L</div>
+<div class="value" id="pnl">$0</div>
+</div>
+<div class="stat-box">
+<div class="label">Trades</div>
+<div class="value" id="totalTrades">0</div>
+</div>
+</div>
+
+<div class="grid grid-2">
+<div class="card">
+<h2>Placer un Trade</h2>
+<label style="color:#94a3b8;font-size:14px;display:block;margin-bottom:5px;">Action</label>
+<select id="action">
+<option value="BUY">Acheter (BUY)</option>
+<option value="SELL">Vendre (SELL)</option>
+</select>
+
+<label style="color:#94a3b8;font-size:14px;display:block;margin-bottom:5px;">Crypto</label>
+<select id="symbol">
+<option value="BTCUSDT">Bitcoin (BTC)</option>
+<option value="ETHUSDT">Ethereum (ETH)</option>
+<option value="SOLUSDT">Solana (SOL)</option>
+<option value="BNBUSDT">Binance Coin (BNB)</option>
+<option value="ADAUSDT">Cardano (ADA)</option>
+<option value="XRPUSDT">Ripple (XRP)</option>
+</select>
+
+<label style="color:#94a3b8;font-size:14px;display:block;margin-bottom:5px;">Quantité</label>
+<input type="number" id="quantity" value="0.01" step="0.001">
+
+<div style="display:flex;gap:10px;">
+<button onclick="placeTrade()" style="flex:1;">✅ Placer le Trade</button>
+<button onclick="resetPaper()" class="btn-danger" style="flex:1;">🗑️ Reset</button>
+</div>
+
+<div id="tradeMessage" style="margin-top:15px;padding:10px;border-radius:8px;display:none;"></div>
+</div>
+
+<div class="card">
+<h2>Soldes Actuels</h2>
+<div id="balances" style="padding:10px;"></div>
+</div>
+</div>
+
+<div class="card">
+<h2>Historique des Trades</h2>
+<div id="tradeHistory"></div>
+</div>
+
+<div class="card" style="background:rgba(59,130,246,0.1);border-color:#3b82f6;">
+<h2 style="color:#3b82f6;">💡 Comment utiliser le Paper Trading ?</h2>
+<div style="color:#94a3b8;font-size:14px;line-height:1.8;">
+<p style="margin-bottom:10px;"><strong>Le paper trading vous permet de :</strong></p>
+<ul style="padding-left:20px;">
+<li>Tester vos stratégies en <strong>temps réel</strong> sans risque</li>
+<li>Vous familiariser avec l'exécution de trades</li>
+<li>Suivre vos performances avant de trader en réel</li>
+<li>Pratiquer votre discipline et gestion du risque</li>
+</ul>
+<p style="margin-top:15px;"><strong>⚠️ Important :</strong> Les prix sont réels (API Binance) mais l'argent est virtuel. Commencez avec $10,000 USDT.</p>
+<p style="margin-top:10px;"><strong>🎯 Objectif :</strong> Si vous êtes rentable sur 30+ trades, considérez le passage au trading réel avec un petit capital.</p>
+</div>
+</div>
+
+</div>
+
+<script>
+async function loadStats() {
+    const res = await fetch('/api/paper-stats');
+    const data = await res.json();
+    
+    document.getElementById('totalValue').textContent = '
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.final_capital.toLocaleString();
+    document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
+    document.getElementById('tradesCount').textContent = data.trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('maxDD').textContent = data.max_drawdown + '%';
+    document.getElementById('sharpe').textContent = data.sharpe_ratio;
+    
+    document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    
+    // Interprétation
+    let interpretation = '';
+    if (data.total_return > 20 && data.win_rate > 55 && data.sharpe_ratio > 1.5 && data.max_drawdown < 30) {
+        interpretation = '🎉 <strong style="color:#10b981;">Excellente stratégie !</strong> Rendement élevé, bon win rate, excellent Sharpe et drawdown acceptable. Testez-la en paper trading !';
+    } else if (data.total_return > 0 && data.win_rate > 50) {
+        interpretation = '👍 <strong style="color:#10b981;">Stratégie rentable</strong> mais peut être optimisée. Regardez comment réduire le drawdown.';
+    } else if (data.total_return > 0) {
+        interpretation = '⚠️ <strong style="color:#f59e0b;">Rentable mais risqué.</strong> Win rate faible ou drawdown élevé. Prudence !';
+    } else {
+        interpretation = '❌ <strong style="color:#ef4444;">Stratégie perdante.</strong> Essayez une autre approche ou ajustez les paramètres.';
+    }
+    
+    document.getElementById('interpretation').innerHTML = interpretation;
+}
+</script>
+</body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.total_value.toLocaleString();
+    document.getElementById('pnl').textContent = (data.pnl > 0 ? '+
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.final_capital.toLocaleString();
+    document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
+    document.getElementById('tradesCount').textContent = data.trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('maxDD').textContent = data.max_drawdown + '%';
+    document.getElementById('sharpe').textContent = data.sharpe_ratio;
+    
+    document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    
+    // Interprétation
+    let interpretation = '';
+    if (data.total_return > 20 && data.win_rate > 55 && data.sharpe_ratio > 1.5 && data.max_drawdown < 30) {
+        interpretation = '🎉 <strong style="color:#10b981;">Excellente stratégie !</strong> Rendement élevé, bon win rate, excellent Sharpe et drawdown acceptable. Testez-la en paper trading !';
+    } else if (data.total_return > 0 && data.win_rate > 50) {
+        interpretation = '👍 <strong style="color:#10b981;">Stratégie rentable</strong> mais peut être optimisée. Regardez comment réduire le drawdown.';
+    } else if (data.total_return > 0) {
+        interpretation = '⚠️ <strong style="color:#f59e0b;">Rentable mais risqué.</strong> Win rate faible ou drawdown élevé. Prudence !';
+    } else {
+        interpretation = '❌ <strong style="color:#ef4444;">Stratégie perdante.</strong> Essayez une autre approche ou ajustez les paramètres.';
+    }
+    
+    document.getElementById('interpretation').innerHTML = interpretation;
+}
+</script>
+</body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ : '
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.final_capital.toLocaleString();
+    document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
+    document.getElementById('tradesCount').textContent = data.trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('maxDD').textContent = data.max_drawdown + '%';
+    document.getElementById('sharpe').textContent = data.sharpe_ratio;
+    
+    document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    
+    // Interprétation
+    let interpretation = '';
+    if (data.total_return > 20 && data.win_rate > 55 && data.sharpe_ratio > 1.5 && data.max_drawdown < 30) {
+        interpretation = '🎉 <strong style="color:#10b981;">Excellente stratégie !</strong> Rendement élevé, bon win rate, excellent Sharpe et drawdown acceptable. Testez-la en paper trading !';
+    } else if (data.total_return > 0 && data.win_rate > 50) {
+        interpretation = '👍 <strong style="color:#10b981;">Stratégie rentable</strong> mais peut être optimisée. Regardez comment réduire le drawdown.';
+    } else if (data.total_return > 0) {
+        interpretation = '⚠️ <strong style="color:#f59e0b;">Rentable mais risqué.</strong> Win rate faible ou drawdown élevé. Prudence !';
+    } else {
+        interpretation = '❌ <strong style="color:#ef4444;">Stratégie perdante.</strong> Essayez une autre approche ou ajustez les paramètres.';
+    }
+    
+    document.getElementById('interpretation').innerHTML = interpretation;
+}
+</script>
+</body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+) + data.pnl.toLocaleString();
+    document.getElementById('totalTrades').textContent = data.total_trades;
+    
+    document.getElementById('pnl').style.color = data.pnl > 0 ? '#10b981' : '#ef4444';
+}
+
+async function loadBalances() {
+    const res = await fetch('/api/paper-balance');
+    const data = await res.json();
+    
+    let html = '<div style="display:grid;gap:10px;">';
+    for (const [crypto, amount] of Object.entries(data.balance)) {
+        if (amount > 0.00001) {
+            html += `<div style="padding:10px;background:#0f172a;border-radius:6px;display:flex;justify-content:space-between;">
+                <strong style="color:#60a5fa;">${crypto}</strong>
+                <span style="color:#e2e8f0;">${amount.toFixed(crypto === 'USDT' ? 2 : 6)}</span>
+            </div>`;
+        }
+    }
+    html += '</div>';
+    document.getElementById('balances').innerHTML = html;
+}
+
+async function loadHistory() {
+    const res = await fetch('/api/paper-trades');
+    const data = await res.json();
+    
+    if (data.trades.length === 0) {
+        document.getElementById('tradeHistory').innerHTML = '<p style="color:#94a3b8;text-align:center;padding:20px;">Aucun trade pour le moment</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Date</th><th>Action</th><th>Crypto</th><th>Quantité</th><th>Prix</th><th>Total</th></tr></thead><tbody>';
+    
+    data.trades.reverse().forEach(t => {
+        const color = t.action === 'BUY' ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td style="font-size:12px;">${new Date(t.timestamp).toLocaleString('fr-CA')}</td>
+            <td><span style="color:${color};font-weight:bold;">${t.action}</span></td>
+            <td><strong>${t.symbol.replace('USDT', '')}</strong></td>
+            <td>${t.quantity}</td>
+            <td>${t.price.toFixed(2)}</td>
+            <td style="font-weight:bold;">${t.total.toFixed(2)}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('tradeHistory').innerHTML = html;
+}
+
+async function placeTrade() {
+    const action = document.getElementById('action').value;
+    const symbol = document.getElementById('symbol').value;
+    const quantity = document.getElementById('quantity').value;
+    
+    const res = await fetch('/api/paper-trade', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action, symbol, quantity})
+    });
+    
+    const data = await res.json();
+    
+    const msgDiv = document.getElementById('tradeMessage');
+    msgDiv.style.display = 'block';
+    
+    if (data.status === 'success') {
+        msgDiv.style.background = 'rgba(16,185,129,0.1)';
+        msgDiv.style.borderLeft = '4px solid #10b981';
+        msgDiv.style.color = '#10b981';
+        msgDiv.textContent = '✅ ' + data.message;
+    } else {
+        msgDiv.style.background = 'rgba(239,68,68,0.1)';
+        msgDiv.style.borderLeft = '4px solid #ef4444';
+        msgDiv.style.color = '#ef4444';
+        msgDiv.textContent = '❌ ' + data.message;
+    }
+    
+    setTimeout(() => {
+        msgDiv.style.display = 'none';
+    }, 5000);
+    
+    loadStats();
+    loadBalances();
+    loadHistory();
+}
+
+async function resetPaper() {
+    if (confirm('Êtes-vous sûr de vouloir réinitialiser le paper trading ?')) {
+        await fetch('/api/paper-reset', {method: 'POST'});
+        alert('Paper trading réinitialisé !');
+        loadStats();
+        loadBalances();
+        loadHistory();
+    }
+}
+
+loadStats();
+loadBalances();
+loadHistory();
+setInterval(() => {
+    loadStats();
+    loadBalances();
+}, 30000);
+</script>
+</body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Stratégie Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📋 Stratégie de Trading</h1><p>Règles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2>Règles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours défini avant l'entrée</li>
+<li><strong>Take Profit:</strong> Multiple niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
+<li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Indicateurs utilisés</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>RSI</strong> - Surachat/Survente</li>
+<li><strong>EMA 20/50/200</strong> - Tendance</li>
+<li><strong>MACD</strong> - Momentum</li>
+<li><strong>Volume Profile</strong> - Support/Résistance</li>
+<li><strong>Fear & Greed Index</strong> - Sentiment marché</li>
+<li><strong>BTC Dominance</strong> - Phase du marché</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Corrélations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🔗 Corrélations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card">
+<h2>Corrélations principales</h2>
+<div id="corrContainer"></div>
+</div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    
+    let html = '<table><thead><tr><th>Paire</th><th>Corrélation</th><th>Force</th></tr></thead><tbody>';
+    
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? '🟢 Forte' : (c.correlation >= 0.6 ? '🟡 Moyenne' : '🔴 Faible');
+        html += `<tr>
+            <td><strong>${c.pair}</strong></td>
+            <td>${(c.correlation * 100).toFixed(0)}%</td>
+            <td>${strength}</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card">
+<h2 style="color:#10b981;">🟢 Top Gainers</h2>
+<div id="gainersContainer"></div>
+</div>
+
+<div class="card">
+<h2 style="color:#ef4444;">🔴 Top Losers</h2>
+<div id="losersContainer"></div>
+</div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
+    });
+    gainersHtml += '</div>';
+    
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
+    });
+    losersHtml += '</div>';
+    
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🎯 Performance par Paire</h1></div>""" + NAV + """
+<div class="card">
+<h2>Statistiques par symbole</h2>
+<div id="perfContainer"></div>
+</div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
+        return;
+    }
+    
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += `<tr>
+            <td><strong>${p.symbol}</strong></td>
+            <td>${p.trades}</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
+            <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "="*70)
+    print("🚀 TRADING DASHBOARD v3.3.0 COMPLET ET CORRIGÉ")
+    print("="*70)
+    print("✅ Fear & Greed Index (API Alternative.me)")
+    print("✅ Bullrun Phase (analyse multi-indicateurs)")
+    print("✅ Bouton Reset Trades")
+    print("✅ Calendrier CORRIGÉ (dates réelles 28-29 oct FOMC)")
+    print("✅ Actualités LIVE (CryptoPanic API)")
+    print("✅ Heatmap MENSUEL + ANNUEL")
+    print("✅ Backtesting complet")
+    print("✅ Altcoin Season Index CMC")
+    print("✅ Convertisseur universel")
+    print("✅ Bitcoin Quarterly Returns")
+    print("✅ Toutes fonctionnalités complètes")
+    print("="*70)
+    print("\n📋 TOUTES LES PAGES (16):")
+    print("   / - Home")
+    print("   /trades - Dashboard + Reset")
+    print("   /fear-greed - Fear & Greed Index")
+    print("   /bullrun-phase - Phase du marché")
+    print("   /convertisseur - Convertisseur")
+    print("   /calendrier - Calendrier corrigé")
+    print("   /altcoin-season - Altcoin Season")
+    print("   /btc-dominance - BTC Dominance")
+    print("   /btc-quarterly - Quarterly Returns")
+    print("   /annonces - Actualités LIVE")
+    print("   /heatmap - Heatmap mensuel+annuel")
+    print("   /backtesting - Backtesting stratégies")
+    print("   /strategie - Règles")
+    print("   /correlations - Corrélations")
+    print("   /top-movers - Top Movers")
+    print("   /performance - Performance par paire")
+    print("\n" + "="*70 + "\n")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.final_capital.toLocaleString();
+    document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
+    document.getElementById('tradesCount').textContent = data.trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('maxDD').textContent = data.max_drawdown + '%';
+    document.getElementById('sharpe').textContent = data.sharpe_ratio;
+    
+    document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    
+    // Interprétation
+    let interpretation = '';
+    if (data.total_return > 20 && data.win_rate > 55 && data.sharpe_ratio > 1.5 && data.max_drawdown < 30) {
+        interpretation = '🎉 <strong style="color:#10b981;">Excellente stratégie !</strong> Rendement élevé, bon win rate, excellent Sharpe et drawdown acceptable. Testez-la en paper trading !';
+    } else if (data.total_return > 0 && data.win_rate > 50) {
+        interpretation = '👍 <strong style="color:#10b981;">Stratégie rentable</strong> mais peut être optimisée. Regardez comment réduire le drawdown.';
+    } else if (data.total_return > 0) {
+        interpretation = '⚠️ <strong style="color:#f59e0b;">Rentable mais risqué.</strong> Win rate faible ou drawdown élevé. Prudence !';
+    } else {
+        interpretation = '❌ <strong style="color:#ef4444;">Stratégie perdante.</strong> Essayez une autre approche ou ajustez les paramètres.';
+    }
+    
+    document.getElementById('interpretation').innerHTML = interpretation;
 }
 </script>
 </body></html>""")
