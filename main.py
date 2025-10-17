@@ -7,7 +7,7 @@
 </div>""" + NAV + """
 <div class="card">
 <h2>Dernieres Actualites</h2>
-""" + news_html + """
+""" + news_html + ""
 </div>
 </div>
 </body></html>""")
