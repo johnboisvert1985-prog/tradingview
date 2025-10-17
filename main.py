@@ -13,6 +13,10 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
+# Clés API
+CMC_API_KEY = "2013449b-117a-4d59-8caf-b8a052a158ca"
+CRYPTOPANIC_TOKEN = "bca5327f4c31e7511b4a7824951ed0ae4d8bb5ac"
+
 # Stockage des trades
 trades_db = []
 
@@ -297,7 +301,7 @@ async def get_altcoin_season():
             response = await client.get(
                 "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
                 params={"limit": 100, "convert": "USD"},
-                headers={"X-CMC_PRO_API_KEY": "YOUR_CMC_API_KEY"}
+                headers={"X-CMC_PRO_API_KEY": CMC_API_KEY}
             )
             
             if response.status_code == 200:
@@ -466,7 +470,7 @@ async def get_news():
             response = await client.get(
                 "https://cryptopanic.com/api/v1/posts/",
                 params={
-                    "auth_token": "YOUR_CRYPTOPANIC_TOKEN",
+                    "auth_token": CRYPTOPANIC_TOKEN,
                     "currencies": "BTC,ETH",
                     "filter": "rising",
                     "public": "true"
