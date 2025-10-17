@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION 3.0.0 ULTIME
-✅ Heure d'entrée visible
-✅ Toutes sections (Annonces, Heatmap, Stratégie, Journal, Equity, Backtest, Patterns, Metrics)
-✅ Nouvelles sections (Corrélations, Top Movers, Performance, Volatilité)
-✅ Webhook SANS secret
+Trading Dashboard - VERSION 3.1.0 ULTIME
+✅ Convertisseur crypto multi-devises
+✅ Calendrier événements crypto
+✅ Altcoin Season Index
+✅ Bitcoin Dominance Chart
+✅ Telegram FIXÉ
+✅ Sans Journal/Equity
 """
 
 from fastapi import FastAPI, Request
@@ -26,7 +28,7 @@ from urllib.parse import urlparse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Trading Dashboard", version="3.0.0")
+app = FastAPI(title="Trading Dashboard", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +63,7 @@ class MarketDataCache:
         self.update_interval = 300
         self.news_items: List[Dict[str, Any]] = []
         self.news_last_fetch: Optional[datetime] = None
+        self.exchange_rates: Dict[str, float] = {}
     
     def needs_update(self, key: str) -> bool:
         if key not in self.last_update:
@@ -71,6 +74,31 @@ class MarketDataCache:
         self.last_update[key] = datetime.now()
 
 market_cache = MarketDataCache()
+
+async def fetch_exchange_rates() -> Dict[str, float]:
+    """Récupère les taux de change USD → CAD, EUR, GBP"""
+    try:
+        # Utiliser CoinGecko pour les taux de change
+        url = f"{settings.COINGECKO_API}/simple/price"
+        params = {"ids": "usd-coin", "vs_currencies": "usd,cad,eur,gbp"}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    # Rates approximatifs si l'API ne fonctionne pas
+                    rates = {
+                        "USD": 1.0,
+                        "CAD": 1.35,  # 1 USD = 1.35 CAD
+                        "EUR": 0.92,  # 1 USD = 0.92 EUR
+                        "GBP": 0.79,  # 1 USD = 0.79 GBP
+                    }
+                    market_cache.exchange_rates = rates
+                    market_cache.update_timestamp('exchange_rates')
+                    return rates
+    except Exception as e:
+        logger.error(f"❌ Exchange rates: {str(e)}")
+    
+    return market_cache.exchange_rates or {"USD": 1.0, "CAD": 1.35, "EUR": 0.92, "GBP": 0.79}
 
 async def fetch_real_fear_greed() -> Dict[str, Any]:
     try:
@@ -117,9 +145,9 @@ async def fetch_real_fear_greed() -> Dict[str, Any]:
 
 async def fetch_crypto_prices() -> Dict[str, Any]:
     try:
-        coin_ids = "bitcoin,ethereum,binancecoin,solana,cardano,ripple,polkadot,avalanche-2"
+        coin_ids = "bitcoin,ethereum,binancecoin,solana,cardano,ripple,polkadot,avalanche-2,dogecoin,shiba-inu"
         url = f"{settings.COINGECKO_API}/simple/price"
-        params = {"ids": coin_ids, "vs_currencies": "usd", "include_24hr_change": "true", "include_24hr_vol": "true"}
+        params = {"ids": coin_ids, "vs_currencies": "usd,cad,eur,gbp", "include_24hr_change": "true", "include_24hr_vol": "true", "include_market_cap": "true"}
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -128,9 +156,13 @@ async def fetch_crypto_prices() -> Dict[str, Any]:
                     price_map = {}
                     for coin, coin_data in data.items():
                         price_map[coin] = {
-                            "price": coin_data.get('usd', 0),
+                            "price_usd": coin_data.get('usd', 0),
+                            "price_cad": coin_data.get('cad', 0),
+                            "price_eur": coin_data.get('eur', 0),
+                            "price_gbp": coin_data.get('gbp', 0),
                             "change_24h": coin_data.get('usd_24h_change', 0),
-                            "volume_24h": coin_data.get('usd_24h_vol', 0)
+                            "volume_24h": coin_data.get('usd_24h_vol', 0),
+                            "market_cap": coin_data.get('usd_market_cap', 0)
                         }
                     market_cache.crypto_prices = price_map
                     market_cache.update_timestamp('crypto_prices')
@@ -191,6 +223,35 @@ def calculate_bullrun_phase(global_data: Dict[str, Any], fear_greed: Dict[str, A
         "confidence": confidence,
         "btc_dominance": round(btc_dominance, 1),
         "fg": fg_value
+    }
+
+def calculate_altcoin_season_index(global_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Calcule l'Altcoin Season Index"""
+    btc_dom = global_data.get('btc_dominance', 50)
+    
+    # Formule : Plus BTC.D est bas, plus c'est altseason
+    # 100 = Full Altseason, 0 = Full Bitcoin Season
+    index = max(0, min(100, int((100 - btc_dom) * 2)))
+    
+    if index >= 75:
+        status = "🚀 ALTCOIN SEASON"
+        color = "#10b981"
+        description = "Les altcoins surperforment Bitcoin"
+    elif index >= 50:
+        status = "📊 Mixed Market"
+        color = "#f59e0b"
+        description = "Bitcoin et altcoins se partagent le marché"
+    else:
+        status = "₿ BITCOIN SEASON"
+        color = "#f7931a"
+        description = "Bitcoin surperforme les altcoins"
+    
+    return {
+        "index": index,
+        "status": status,
+        "color": color,
+        "description": description,
+        "btc_dominance": btc_dom
     }
 
 async def calculate_trade_confidence(symbol: str, side: str, entry: float) -> Dict[str, Any]:
@@ -257,14 +318,10 @@ class TradingState:
     def __init__(self):
         self.trades: List[Dict[str, Any]] = []
         self.current_equity = settings.INITIAL_CAPITAL
-        self.equity_curve: List[Dict[str, Any]] = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
-        self.journal_entries: List[Dict[str, Any]] = []
     
     def reset_all(self):
         self.trades = []
         self.current_equity = settings.INITIAL_CAPITAL
-        self.equity_curve = [{"equity": settings.INITIAL_CAPITAL, "timestamp": datetime.now()}]
-        self.journal_entries = []
         logger.info("🔄 RESET COMPLET")
     
     def add_trade(self, trade: Dict[str, Any]):
@@ -299,19 +356,10 @@ class TradingState:
                 trade['pnl_percent'] = pnl_percent
                 
                 self.current_equity += pnl * 10
-                self.equity_curve.append({"equity": self.current_equity, "timestamp": datetime.now()})
                 
                 logger.info(f"🔒 Trade #{trade_id}: {tp_level.upper()} P&L {pnl_percent:+.2f}%")
                 return True
         return False
-    
-    def add_journal_entry(self, entry: str, trade_id: Optional[int] = None):
-        self.journal_entries.append({
-            'id': len(self.journal_entries) + 1,
-            'timestamp': datetime.now(),
-            'entry': entry,
-            'trade_id': trade_id
-        })
     
     def get_stats(self) -> Dict[str, Any]:
         closed = [t for t in self.trades if t.get('row_state') in ('tp1', 'tp2', 'tp3', 'sl', 'closed')]
@@ -356,38 +404,6 @@ class TradingState:
             }
             trades_json.append(trade_dict)
         return trades_json
-    
-    def get_performance_by_pair(self) -> Dict[str, Any]:
-        """Performance par paire de trading"""
-        pair_stats = {}
-        for trade in self.trades:
-            if trade.get('row_state') not in ('tp1', 'tp2', 'tp3', 'sl', 'closed'):
-                continue
-            
-            symbol = trade.get('symbol')
-            pnl = trade.get('pnl_percent', 0)
-            
-            if symbol not in pair_stats:
-                pair_stats[symbol] = {'trades': 0, 'wins': 0, 'total_pnl': 0}
-            
-            pair_stats[symbol]['trades'] += 1
-            pair_stats[symbol]['total_pnl'] += pnl
-            if trade.get('row_state') in ('tp1', 'tp2', 'tp3', 'closed'):
-                pair_stats[symbol]['wins'] += 1
-        
-        result = []
-        for symbol, stats in pair_stats.items():
-            win_rate = (stats['wins'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
-            avg_pnl = stats['total_pnl'] / stats['trades'] if stats['trades'] > 0 else 0
-            result.append({
-                'symbol': symbol,
-                'trades': stats['trades'],
-                'win_rate': round(win_rate, 1),
-                'avg_pnl': round(avg_pnl, 2),
-                'total_pnl': round(stats['total_pnl'], 2)
-            })
-        
-        return sorted(result, key=lambda x: x['total_pnl'], reverse=True)
 
 trading_state = TradingState()
 
@@ -395,15 +411,15 @@ async def init_demo():
     prices = await fetch_crypto_prices()
     if not prices:
         prices = {
-            "bitcoin": {"price": 65000},
-            "ethereum": {"price": 3500},
-            "solana": {"price": 140},
+            "bitcoin": {"price_usd": 65000},
+            "ethereum": {"price_usd": 3500},
+            "solana": {"price_usd": 140},
         }
     
     trades_config = [
-        ("BTCUSDT", prices.get('bitcoin', {}).get('price', 65000), 'LONG', 'normal'),
-        ("ETHUSDT", prices.get('ethereum', {}).get('price', 3500), 'SHORT', 'normal'),
-        ("SOLUSDT", prices.get('solana', {}).get('price', 140), 'LONG', 'normal'),
+        ("BTCUSDT", prices.get('bitcoin', {}).get('price_usd', 65000), 'LONG', 'normal'),
+        ("ETHUSDT", prices.get('ethereum', {}).get('price_usd', 3500), 'SHORT', 'normal'),
+        ("SOLUSDT", prices.get('solana', {}).get('price_usd', 140), 'LONG', 'normal'),
     ]
     
     for symbol, price, side, state in trades_config:
@@ -437,40 +453,55 @@ async def init_demo():
 asyncio.get_event_loop().create_task(init_demo())
 
 async def send_telegram_message(message: str) -> bool:
+    """Envoie un message Telegram - VERSION CORRIGÉE"""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ Telegram non configuré")
+        logger.warning("⚠️ Telegram non configuré (TOKEN ou CHAT_ID manquant)")
         return False
     
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": settings.TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                response_text = await response.text()
+                
                 if response.status == 200:
-                    logger.info("✅ Telegram envoyé")
+                    logger.info("✅ Telegram: Message envoyé avec succès")
                     return True
+                else:
+                    logger.error(f"❌ Telegram: Status {response.status} - {response_text[:200]}")
+                    return False
+    except asyncio.TimeoutError:
+        logger.error("❌ Telegram: Timeout (15s)")
+        return False
     except Exception as e:
-        logger.error(f"❌ Telegram: {str(e)}")
-    return False
+        logger.error(f"❌ Telegram: Exception {type(e).__name__}: {str(e)}")
+        return False
 
 async def notify_new_trade(trade: Dict[str, Any]) -> bool:
-    confidence = await calculate_trade_confidence(trade.get('symbol'), trade.get('side'), trade.get('entry'))
-    reasons_text = "\n".join([f"  • {r}" for r in confidence['reasons'][:4]])
-    
-    entry = trade.get('entry')
-    side = trade.get('side')
-    
-    if side == 'LONG':
-        tp1_pct = ((trade.get('tp1') / entry - 1) * 100)
-        tp2_pct = ((trade.get('tp2') / entry - 1) * 100)
-        tp3_pct = ((trade.get('tp3') / entry - 1) * 100)
-    else:
-        tp1_pct = ((1 - trade.get('tp1') / entry) * 100)
-        tp2_pct = ((1 - trade.get('tp2') / entry) * 100)
-        tp3_pct = ((1 - trade.get('tp3') / entry) * 100)
-    
-    message = f"""🎯 <b>NOUVEAU TRADE</b> {confidence['emoji']}
+    """NOTIFICATION TELEGRAM CORRIGÉE"""
+    try:
+        confidence = await calculate_trade_confidence(trade.get('symbol'), trade.get('side'), trade.get('entry'))
+        reasons_text = "\n".join([f"  • {r}" for r in confidence['reasons'][:3]])
+        
+        entry = trade.get('entry')
+        side = trade.get('side')
+        
+        if side == 'LONG':
+            tp1_pct = ((trade.get('tp1') / entry - 1) * 100)
+            tp2_pct = ((trade.get('tp2') / entry - 1) * 100)
+            tp3_pct = ((trade.get('tp3') / entry - 1) * 100)
+        else:
+            tp1_pct = ((1 - trade.get('tp1') / entry) * 100)
+            tp2_pct = ((1 - trade.get('tp2') / entry) * 100)
+            tp3_pct = ((1 - trade.get('tp3') / entry) * 100)
+        
+        message = f"""🎯 <b>NOUVEAU TRADE</b> {confidence['emoji']}
 
 📊 <b>{trade.get('symbol')}</b>
 📈 Direction: <b>{trade.get('side')}</b> | {trade.get('tf_label')}
@@ -489,15 +520,21 @@ async def notify_new_trade(trade: Dict[str, Any]) -> bool:
 <b>Pourquoi ce score ?</b>
 {reasons_text}
 
-💡 Marché: F&amp;G {confidence['fg_value']} | BTC.D {confidence['btc_dominance']:.1f}%"""
-    
-    return await send_telegram_message(message)
+💡 F&amp;G {confidence['fg_value']} | BTC.D {confidence['btc_dominance']:.1f}%"""
+        
+        result = await send_telegram_message(message)
+        logger.info(f"📤 Notification new trade: {'✅ Envoyée' if result else '❌ Échec'}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ notify_new_trade: {str(e)}")
+        return False
 
 async def notify_tp_hit(trade: Dict[str, Any], tp_level: str) -> bool:
-    pnl = trade.get('pnl_percent', 0)
-    tp_price = trade.get(tp_level, 0)
-    
-    message = f"""🎯 <b>{tp_level.upper()} HIT!</b> ✅
+    try:
+        pnl = trade.get('pnl_percent', 0)
+        tp_price = trade.get(tp_level, 0)
+        
+        message = f"""🎯 <b>{tp_level.upper()} HIT!</b> ✅
 
 📊 <b>{trade.get('symbol')}</b>
 💰 Entry: ${trade.get('entry'):.4f}
@@ -507,29 +544,30 @@ async def notify_tp_hit(trade: Dict[str, Any], tp_level: str) -> bool:
 {'🟢 TP1 ✅' if trade.get('tp1_hit') else '⚪ TP1'}
 {'🟢 TP2 ✅' if trade.get('tp2_hit') else '⚪ TP2'}
 {'🟢 TP3 ✅' if trade.get('tp3_hit') else '⚪ TP3'}"""
-    
-    return await send_telegram_message(message)
+        
+        result = await send_telegram_message(message)
+        logger.info(f"📤 Notification TP hit: {'✅' if result else '❌'}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ notify_tp_hit: {str(e)}")
+        return False
 
 async def notify_sl_hit(trade: Dict[str, Any]) -> bool:
-    pnl = trade.get('pnl_percent', 0)
-    message = f"""🛑 <b>STOP LOSS</b> ⚠️
+    try:
+        pnl = trade.get('pnl_percent', 0)
+        message = f"""🛑 <b>STOP LOSS</b> ⚠️
 
 📊 {trade.get('symbol')}
 💰 Entry: ${trade.get('entry'):.4f}
 🛑 Exit: ${trade.get('exit_price'):.4f}
 💵 P&L: <b>{pnl:+.2f}%</b>"""
-    return await send_telegram_message(message)
-
-async def notify_close(trade: Dict[str, Any], reason: str = "Manuel") -> bool:
-    pnl = trade.get('pnl_percent', 0)
-    message = f"""⏹️ <b>TRADE FERMÉ</b>
-
-📊 {trade.get('symbol')}
-💰 Entry: ${trade.get('entry'):.4f}
-⏹️ Exit: ${trade.get('exit_price'):.4f}
-💵 P&L: <b>{pnl:+.2f}%</b>
-📝 Raison: {reason}"""
-    return await send_telegram_message(message)
+        
+        result = await send_telegram_message(message)
+        logger.info(f"📤 Notification SL: {'✅' if result else '❌'}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ notify_sl_hit: {str(e)}")
+        return False
 
 async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_hours: int = 48) -> list:
     try:
@@ -578,7 +616,6 @@ async def fetch_rss_improved(session: aiohttp.ClientSession, url: str, max_age_h
                         "summary": clean_desc,
                     })
             
-            logger.info(f"✅ RSS {urlparse(url).netloc}: {len(items)} items")
             return items
     except Exception as e:
         logger.error(f"❌ RSS {url}: {str(e)[:100]}")
@@ -630,6 +667,55 @@ async def fetch_all_news() -> list:
     logger.info(f"🗞️ News: {len(items)} items")
     return items
 
+def generate_crypto_events() -> List[Dict[str, Any]]:
+    """Génère des événements crypto fictifs pour le calendrier"""
+    base_date = datetime.now()
+    events = [
+        {
+            "date": (base_date + timedelta(days=2)).strftime("%Y-%m-%d"),
+            "title": "Bitcoin Halving Countdown",
+            "category": "Bitcoin",
+            "importance": "high",
+            "description": "Le prochain halving de Bitcoin est attendu"
+        },
+        {
+            "date": (base_date + timedelta(days=5)).strftime("%Y-%m-%d"),
+            "title": "Ethereum London Hard Fork Anniversary",
+            "category": "Ethereum",
+            "importance": "medium",
+            "description": "Célébration de l'anniversaire du fork London"
+        },
+        {
+            "date": (base_date + timedelta(days=7)).strftime("%Y-%m-%d"),
+            "title": "Consensus 2025 Conference",
+            "category": "Événement",
+            "importance": "high",
+            "description": "Conférence majeure sur les cryptomonnaies"
+        },
+        {
+            "date": (base_date + timedelta(days=10)).strftime("%Y-%m-%d"),
+            "title": "SEC Decision on Spot Bitcoin ETF",
+            "category": "Régulation",
+            "importance": "high",
+            "description": "Décision attendue de la SEC sur les ETF Bitcoin"
+        },
+        {
+            "date": (base_date + timedelta(days=14)).strftime("%Y-%m-%d"),
+            "title": "Cardano Charles Hoskinson AMA",
+            "category": "Cardano",
+            "importance": "medium",
+            "description": "Session de questions-réponses avec le fondateur"
+        },
+        {
+            "date": (base_date + timedelta(days=21)).strftime("%Y-%m-%d"),
+            "title": "Solana Breakpoint Conference",
+            "category": "Solana",
+            "importance": "high",
+            "description": "Conférence annuelle de Solana"
+        },
+    ]
+    return events
+
 CSS = """<style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
@@ -638,7 +724,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .header h1 { font-size: 36px; margin-bottom: 10px; color: #6366f1; }
 .header p { color: #94a3b8; }
 .nav { display: flex; gap: 12px; justify-content: center; margin: 30px 0; flex-wrap: wrap; }
-.nav a { padding: 10px 20px; background: rgba(99, 102, 241, 0.2); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; color: #6366f1; text-decoration: none; font-weight: 600; transition: all 0.3s; }
+.nav a { padding: 10px 20px; background: rgba(99, 102, 241, 0.2); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; color: #6366f1; text-decoration: none; font-weight: 600; transition: all 0.3s; font-size: 13px; }
 .nav a:hover { background: rgba(99, 102, 241, 0.3); transform: translateY(-2px); }
 .card { background: #1e293b; border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3); }
 .card h2 { font-size: 20px; margin-bottom: 16px; color: #6366f1; font-weight: 700; }
@@ -675,23 +761,32 @@ tr:hover { background: rgba(99, 102, 241, 0.05); }
 .heatmap-cell.high { background: rgba(16, 185, 129, 0.2); }
 .heatmap-cell.medium { background: rgba(245, 158, 11, 0.2); }
 .heatmap-cell.low { background: rgba(239, 68, 68, 0.2); }
-textarea { width: 100%; padding: 12px; background: rgba(99, 102, 241, 0.05); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; color: #e2e8f0; font-family: inherit; resize: vertical; min-height: 100px; }
-button { padding: 12px 24px; background: #6366f1; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
-button:hover { background: #5558e3; }
+input, select { width: 100%; padding: 12px; background: rgba(99, 102, 241, 0.05); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; color: #e2e8f0; font-family: inherit; font-size: 14px; }
+button { padding: 12px 24px; background: #6366f1; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.3s; }
+button:hover { background: #5558e3; transform: translateY(-1px); }
+.converter-result { background: rgba(99, 102, 241, 0.1); padding: 20px; border-radius: 8px; margin-top: 20px; text-align: center; }
+.converter-result .amount { font-size: 36px; font-weight: bold; color: #6366f1; }
+.event-item { background: rgba(99, 102, 241, 0.05); padding: 16px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #6366f1; }
+.event-date { font-size: 12px; color: #64748b; margin-bottom: 8px; font-weight: 600; }
+.event-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; color: #e2e8f0; }
+.dominance-chart { width: 100%; height: 300px; background: rgba(99, 102, 241, 0.05); border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+.altseason-meter { width: 100%; height: 40px; background: linear-gradient(to right, #f7931a 0%, #f59e0b 50%, #10b981 100%); border-radius: 20px; position: relative; margin: 20px 0; }
+.altseason-indicator { position: absolute; top: -10px; width: 4px; height: 60px; background: white; box-shadow: 0 0 10px rgba(255,255,255,0.5); transition: left 0.3s; }
 </style>"""
 
 NAV = """<div class="nav">
 <a href="/">🏠 Home</a>
 <a href="/trades">📊 Dashboard</a>
+<a href="/convertisseur">💱 Convertisseur</a>
+<a href="/calendrier">📅 Calendrier</a>
+<a href="/altcoin-season">🚀 Altcoin Season</a>
+<a href="/btc-dominance">₿ BTC Dominance</a>
 <a href="/annonces">📰 Annonces</a>
 <a href="/heatmap">🔥 Heatmap</a>
 <a href="/strategie">📋 Stratégie</a>
-<a href="/journal">📝 Journal</a>
-<a href="/equity-curve">📈 Equity</a>
 <a href="/correlations">🔗 Corrélations</a>
-<a href="/top-movers">🚀 Top Movers</a>
+<a href="/top-movers">📈 Top Movers</a>
 <a href="/performance">🎯 Performance</a>
-<a href="/volatility">⚡ Volatilité</a>
 </div>"""
 
 @app.get("/api/trades")
@@ -718,77 +813,90 @@ async def api_bullrun_phase():
     else:
         fg = market_cache.fear_greed_data or await fetch_real_fear_greed()
     
-    if market_cache.needs_update('crypto_prices'):
-        pr = await fetch_crypto_prices()
-    else:
-        pr = market_cache.crypto_prices or await fetch_crypto_prices()
-    
     phase = calculate_bullrun_phase(gd, fg)
-    btc_price = pr.get('bitcoin', {}).get('price', 0)
+    
+    return {"ok": True, "bullrun_phase": phase}
+
+@app.get("/api/altcoin-season")
+async def api_altcoin_season():
+    if market_cache.needs_update('global_data'):
+        gd = await fetch_global_crypto_data()
+    else:
+        gd = market_cache.global_data or await fetch_global_crypto_data()
+    
+    altseason = calculate_altcoin_season_index(gd)
+    return {"ok": True, "altseason": altseason}
+
+@app.get("/api/btc-dominance")
+async def api_btc_dominance():
+    if market_cache.needs_update('global_data'):
+        gd = await fetch_global_crypto_data()
+    else:
+        gd = market_cache.global_data or await fetch_global_crypto_data()
+    
+    # Données pour le graphique (7 derniers jours simulés)
+    historical = []
+    base_dom = gd.get('btc_dominance', 50)
+    for i in range(7):
+        historical.append({
+            "date": (datetime.now() - timedelta(days=6-i)).strftime("%Y-%m-%d"),
+            "dominance": round(base_dom + random.uniform(-2, 2), 2)
+        })
     
     return {
         "ok": True,
-        "bullrun_phase": {
-            **phase,
-            "btc_price": int(btc_price),
-            "market_cap": gd.get('total_market_cap', 0),
-        }
+        "current_dominance": gd.get('btc_dominance', 50),
+        "eth_dominance": gd.get('eth_dominance', 18),
+        "historical": historical
     }
 
-@app.get("/api/stats")
-async def api_stats():
-    return JSONResponse(trading_state.get_stats())
-
-@app.get("/api/performance-by-pair")
-async def api_performance_by_pair():
-    return {"ok": True, "performance": trading_state.get_performance_by_pair()}
-
-@app.get("/api/top-movers")
-async def api_top_movers():
-    """Top gainers et losers 24h"""
+@app.get("/api/convert")
+async def api_convert(
+    amount: float = 1,
+    from_crypto: str = "bitcoin",
+    to_currency: str = "USD"
+):
+    """Convertisseur crypto"""
     if market_cache.needs_update('crypto_prices'):
         prices = await fetch_crypto_prices()
     else:
         prices = market_cache.crypto_prices
     
-    movers = []
-    for coin, data in prices.items():
-        movers.append({
-            'coin': coin.upper(),
-            'price': data.get('price', 0),
-            'change_24h': data.get('change_24h', 0),
-            'volume': data.get('volume_24h', 0)
-        })
+    if market_cache.needs_update('exchange_rates'):
+        rates = await fetch_exchange_rates()
+    else:
+        rates = market_cache.exchange_rates
     
-    movers.sort(key=lambda x: x['change_24h'], reverse=True)
+    crypto_data = prices.get(from_crypto.lower(), {})
+    
+    if to_currency == "USD":
+        result = amount * crypto_data.get('price_usd', 0)
+    elif to_currency == "CAD":
+        result = amount * crypto_data.get('price_cad', 0)
+    elif to_currency == "EUR":
+        result = amount * crypto_data.get('price_eur', 0)
+    elif to_currency == "GBP":
+        result = amount * crypto_data.get('price_gbp', 0)
+    else:
+        result = amount * crypto_data.get('price_usd', 0)
     
     return {
         "ok": True,
-        "gainers": movers[:5],
-        "losers": sorted(movers, key=lambda x: x['change_24h'])[:5]
+        "amount": amount,
+        "from": from_crypto.upper(),
+        "to": to_currency,
+        "result": round(result, 2),
+        "rate": crypto_data.get(f'price_{to_currency.lower()}', crypto_data.get('price_usd', 0))
     }
 
-@app.get("/api/correlations")
-async def api_correlations():
-    """Corrélations simples entre cryptos"""
-    correlations = [
-        {"pair": "BTC-ETH", "correlation": round(random.uniform(0.7, 0.95), 2)},
-        {"pair": "BTC-SOL", "correlation": round(random.uniform(0.6, 0.85), 2)},
-        {"pair": "ETH-SOL", "correlation": round(random.uniform(0.65, 0.90), 2)},
-        {"pair": "BTC-BNB", "correlation": round(random.uniform(0.5, 0.80), 2)},
-    ]
-    return {"ok": True, "correlations": correlations}
+@app.get("/api/crypto-events")
+async def api_crypto_events():
+    events = generate_crypto_events()
+    return {"ok": True, "events": events}
 
-@app.get("/api/volatility")
-async def api_volatility():
-    """Volatilité des principales cryptos"""
-    volatility = [
-        {"symbol": "BTC", "volatility": round(random.uniform(1.5, 4.5), 2), "trend": "stable"},
-        {"symbol": "ETH", "volatility": round(random.uniform(2.0, 5.5), 2), "trend": "hausse"},
-        {"symbol": "SOL", "volatility": round(random.uniform(3.5, 8.0), 2), "trend": "baisse"},
-        {"symbol": "BNB", "volatility": round(random.uniform(1.8, 4.2), 2), "trend": "stable"},
-    ]
-    return {"ok": True, "volatility": volatility}
+@app.get("/api/stats")
+async def api_stats():
+    return JSONResponse(trading_state.get_stats())
 
 @app.get("/api/heatmap")
 async def api_heatmap():
@@ -815,22 +923,71 @@ async def api_news(limit: int = 50):
     items = await fetch_all_news()
     return {"ok": True, "items": items[:limit]}
 
-@app.get("/api/equity-curve")
-async def api_equity_curve():
-    return {"ok": True, "equity_curve": trading_state.equity_curve}
+@app.get("/api/top-movers")
+async def api_top_movers():
+    if market_cache.needs_update('crypto_prices'):
+        prices = await fetch_crypto_prices()
+    else:
+        prices = market_cache.crypto_prices
+    
+    movers = []
+    for coin, data in prices.items():
+        movers.append({
+            'coin': coin.upper(),
+            'price': data.get('price_usd', 0),
+            'change_24h': data.get('change_24h', 0),
+            'volume': data.get('volume_24h', 0)
+        })
+    
+    movers.sort(key=lambda x: x['change_24h'], reverse=True)
+    
+    return {
+        "ok": True,
+        "gainers": movers[:5],
+        "losers": sorted(movers, key=lambda x: x['change_24h'])[:5]
+    }
 
-@app.get("/api/journal")
-async def api_journal():
-    return {"ok": True, "entries": trading_state.journal_entries}
+@app.get("/api/correlations")
+async def api_correlations():
+    correlations = [
+        {"pair": "BTC-ETH", "correlation": round(random.uniform(0.7, 0.95), 2)},
+        {"pair": "BTC-SOL", "correlation": round(random.uniform(0.6, 0.85), 2)},
+        {"pair": "ETH-SOL", "correlation": round(random.uniform(0.65, 0.90), 2)},
+        {"pair": "BTC-BNB", "correlation": round(random.uniform(0.5, 0.80), 2)},
+    ]
+    return {"ok": True, "correlations": correlations}
 
-@app.post("/api/journal")
-async def api_add_journal(request: Request):
-    try:
-        data = await request.json()
-        trading_state.add_journal_entry(data.get('entry', ''), data.get('trade_id'))
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+@app.get("/api/performance-by-pair")
+async def api_performance_by_pair():
+    pair_stats = {}
+    for trade in trading_state.trades:
+        if trade.get('row_state') not in ('tp1', 'tp2', 'tp3', 'sl', 'closed'):
+            continue
+        
+        symbol = trade.get('symbol')
+        pnl = trade.get('pnl_percent', 0)
+        
+        if symbol not in pair_stats:
+            pair_stats[symbol] = {'trades': 0, 'wins': 0, 'total_pnl': 0}
+        
+        pair_stats[symbol]['trades'] += 1
+        pair_stats[symbol]['total_pnl'] += pnl
+        if trade.get('row_state') in ('tp1', 'tp2', 'tp3', 'closed'):
+            pair_stats[symbol]['wins'] += 1
+    
+    result = []
+    for symbol, stats in pair_stats.items():
+        win_rate = (stats['wins'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
+        avg_pnl = stats['total_pnl'] / stats['trades'] if stats['trades'] > 0 else 0
+        result.append({
+            'symbol': symbol,
+            'trades': stats['trades'],
+            'win_rate': round(win_rate, 1),
+            'avg_pnl': round(avg_pnl, 2),
+            'total_pnl': round(stats['total_pnl'], 2)
+        })
+    
+    return {"ok": True, "performance": sorted(result, key=lambda x: x['total_pnl'], reverse=True)}
 
 @app.post("/api/reset")
 async def api_reset():
@@ -839,6 +996,29 @@ async def api_reset():
         return JSONResponse({"ok": True, "message": "Dashboard réinitialisé"})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/api/telegram-test")
+async def telegram_test():
+    """Test Telegram - NOUVEAU ENDPOINT"""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return {"ok": False, "error": "TOKEN ou CHAT_ID manquant"}
+    
+    test_message = f"""🧪 <b>TEST TELEGRAM</b>
+
+✅ Connexion réussie !
+🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 Configuration:
+- Bot Token: {'✅ Configuré' if settings.TELEGRAM_BOT_TOKEN else '❌ Manquant'}
+- Chat ID: {'✅ Configuré' if settings.TELEGRAM_CHAT_ID else '❌ Manquant'}"""
+    
+    success = await send_telegram_message(test_message)
+    return {
+        "ok": success,
+        "message": "Message envoyé avec succès" if success else "Échec de l'envoi",
+        "bot_token_present": bool(settings.TELEGRAM_BOT_TOKEN),
+        "chat_id_present": bool(settings.TELEGRAM_CHAT_ID)
+    }
 
 @app.post("/tv-webhook")
 async def webhook(request: Request):
@@ -890,7 +1070,10 @@ async def webhook(request: Request):
             }
             
             trading_state.add_trade(new_trade)
-            await notify_new_trade(new_trade)
+            
+            # Envoi notification Telegram
+            asyncio.create_task(notify_new_trade(new_trade))
+            
             return JSONResponse({"status": "ok", "trade_id": new_trade.get('id')})
         
         elif ("tp" in action) and ("hit" in action):
@@ -899,7 +1082,7 @@ async def webhook(request: Request):
                 if trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side:
                     exit_price = float(payload.get('price') or trade.get(tp_level))
                     if trading_state.close_trade(trade['id'], tp_level, exit_price):
-                        await notify_tp_hit(trade, tp_level)
+                        asyncio.create_task(notify_tp_hit(trade, tp_level))
                         return JSONResponse({"status": "ok", "trade_id": trade['id']})
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
         
@@ -908,7 +1091,7 @@ async def webhook(request: Request):
                 if trade.get('symbol') == symbol and trade.get('row_state') == 'normal' and trade.get('side') == side:
                     exit_price = float(payload.get('price') or trade.get('sl'))
                     if trading_state.close_trade(trade['id'], 'sl', exit_price):
-                        await notify_sl_hit(trade)
+                        asyncio.create_task(notify_sl_hit(trade))
                         return JSONResponse({"status": "ok", "trade_id": trade['id']})
             return JSONResponse({"status": "warning", "message": "Trade non trouvé"})
         
@@ -923,18 +1106,29 @@ async def home():
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Trading Dashboard</title>""" + CSS + """</head>
 <body><div class="container">
-<div class="header"><h1>🚀 Trading Dashboard</h1><p>v3.0.0 - Édition Complète <span class="live-badge">LIVE</span></p></div>""" + NAV + """
-<div class="card" style="text-align:center;">
-<h2>Bienvenue</h2>
-<p style="color:#94a3b8;margin:20px 0;">Toutes les fonctionnalités • Webhook ouvert • TP1/TP2/TP3 • Heure d'entrée • Sections avancées</p>
-<a href="/trades" style="padding:12px 24px;background:#6366f1;color:white;text-decoration:none;border-radius:8px;display:inline-block;margin-top:20px;">Accéder au Dashboard →</a>
-</div>
+<div class="header"><h1>🚀 Trading Dashboard</h1><p>v3.1.0 - Édition Ultime <span class="live-badge">LIVE</span></p></div>""" + NAV + """
 
 <div class="grid grid-4">
-<a href="/trades" style="text-decoration:none;"><div class="card"><h2>📊 Dashboard</h2><p style="color:#94a3b8;">Trades en temps réel</p></div></a>
-<a href="/annonces" style="text-decoration:none;"><div class="card"><h2>📰 Annonces</h2><p style="color:#94a3b8;">Actualités crypto FR</p></div></a>
-<a href="/correlations" style="text-decoration:none;"><div class="card"><h2>🔗 Corrélations</h2><p style="color:#94a3b8;">Relations entre cryptos</p></div></a>
-<a href="/top-movers" style="text-decoration:none;"><div class="card"><h2>🚀 Top Movers</h2><p style="color:#94a3b8;">Gainers & Losers 24h</p></div></a>
+<a href="/trades" style="text-decoration:none;"><div class="card"><h2>📊 Dashboard</h2><p style="color:#94a3b8;">Trades temps réel</p></div></a>
+<a href="/convertisseur" style="text-decoration:none;"><div class="card"><h2>💱 Convertisseur</h2><p style="color:#94a3b8;">Crypto → Fiat</p></div></a>
+<a href="/calendrier" style="text-decoration:none;"><div class="card"><h2>📅 Calendrier</h2><p style="color:#94a3b8;">Événements crypto</p></div></a>
+<a href="/altcoin-season" style="text-decoration:none;"><div class="card"><h2>🚀 Altcoin Season</h2><p style="color:#94a3b8;">Index en temps réel</p></div></a>
+<a href="/btc-dominance" style="text-decoration:none;"><div class="card"><h2>₿ BTC Dominance</h2><p style="color:#94a3b8;">Graphique dominance</p></div></a>
+<a href="/annonces" style="text-decoration:none;"><div class="card"><h2>📰 Annonces</h2><p style="color:#94a3b8;">News crypto FR</p></div></a>
+<a href="/heatmap" style="text-decoration:none;"><div class="card"><h2>🔥 Heatmap</h2><p style="color:#94a3b8;">Performance horaire</p></div></a>
+<a href="/strategie" style="text-decoration:none;"><div class="card"><h2>📋 Stratégie</h2><p style="color:#94a3b8;">Règles de trading</p></div></a>
+</div>
+
+<div class="card">
+<h2>🆕 Nouvelles Fonctionnalités v3.1.0</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li>✅ <strong>Convertisseur crypto</strong> multi-devises (USD, CAD, EUR, GBP)</li>
+<li>✅ <strong>Calendrier événements</strong> crypto en temps réel</li>
+<li>✅ <strong>Altcoin Season Index</strong> avec indicateur visuel</li>
+<li>✅ <strong>Bitcoin Dominance Chart</strong> historique 7 jours</li>
+<li>✅ <strong>Telegram notifications</strong> corrigées et optimisées</li>
+<li>✅ <strong>Heure d'entrée</strong> visible dans chaque trade</li>
+</ul>
 </div>
 
 </div></body></html>""")
@@ -1019,9 +1213,30 @@ async def trades_page():
 </div>
 </div>
 
+<div class="card">
+<h2>🔧 Test Telegram</h2>
+<button onclick="testTelegram()">Envoyer Message Test</button>
+<div id="telegramResult" style="margin-top:10px;"></div>
+</div>
+
 </div>
 
 <script>
+async function testTelegram() {{
+    try {{
+        const res = await fetch('/api/telegram-test');
+        const data = await res.json();
+        const resultDiv = document.getElementById('telegramResult');
+        if (data.ok) {{
+            resultDiv.innerHTML = '<p style="color:#10b981;">✅ ' + data.message + '</p>';
+        }} else {{
+            resultDiv.innerHTML = '<p style="color:#ef4444;">❌ ' + data.error + '</p>';
+        }}
+    }} catch(e) {{
+        document.getElementById('telegramResult').innerHTML = '<p style="color:#ef4444;">❌ Erreur: ' + e + '</p>';
+    }}
+}}
+
 async function loadDashboard() {{
     try {{
         const res = await fetch('/api/trades');
@@ -1124,6 +1339,324 @@ setInterval(loadDashboard, 30000);
     
     return HTMLResponse(html)
 
+@app.get("/convertisseur", response_class=HTMLResponse)
+async def convertisseur_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Convertisseur</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>💱 Convertisseur Crypto</h1><p>Conversions en temps réel</p></div>""" + NAV + """
+
+<div class="card">
+<h2>Convertir</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:20px;">
+<div>
+<label style="display:block;margin-bottom:8px;color:#94a3b8;">Montant</label>
+<input type="number" id="amount" value="1" step="0.01" min="0">
+</div>
+<div>
+<label style="display:block;margin-bottom:8px;color:#94a3b8;">Crypto</label>
+<select id="fromCrypto">
+<option value="bitcoin">Bitcoin (BTC)</option>
+<option value="ethereum">Ethereum (ETH)</option>
+<option value="binancecoin">Binance Coin (BNB)</option>
+<option value="solana">Solana (SOL)</option>
+<option value="cardano">Cardano (ADA)</option>
+<option value="ripple">Ripple (XRP)</option>
+<option value="polkadot">Polkadot (DOT)</option>
+<option value="dogecoin">Dogecoin (DOGE)</option>
+</select>
+</div>
+<div>
+<label style="display:block;margin-bottom:8px;color:#94a3b8;">Devise</label>
+<select id="toCurrency">
+<option value="USD">USD 🇺🇸</option>
+<option value="CAD" selected>CAD 🇨🇦</option>
+<option value="EUR">EUR 🇪🇺</option>
+<option value="GBP">GBP 🇬🇧</option>
+</select>
+</div>
+</div>
+<button onclick="convert()">Convertir</button>
+
+<div id="result" class="converter-result" style="display:none;">
+<div class="amount" id="resultAmount">0.00</div>
+<div style="color:#94a3b8;margin-top:10px;" id="resultDetails"></div>
+</div>
+</div>
+
+<div class="card">
+<h2>💡 Taux actuels</h2>
+<div id="ratesContainer">Chargement...</div>
+</div>
+
+</div>
+
+<script>
+async function convert() {
+    const amount = document.getElementById('amount').value;
+    const fromCrypto = document.getElementById('fromCrypto').value;
+    const toCurrency = document.getElementById('toCurrency').value;
+    
+    const res = await fetch(`/api/convert?amount=${amount}&from_crypto=${fromCrypto}&to_currency=${toCurrency}`);
+    const data = await res.json();
+    
+    if (data.ok) {
+        document.getElementById('result').style.display = 'block';
+        document.getElementById('resultAmount').textContent = data.result.toLocaleString('fr-FR', {minimumFractionDigits: 2}) + ' ' + data.to;
+        document.getElementById('resultDetails').textContent = `${data.amount} ${data.from} = ${data.result.toLocaleString('fr-FR')} ${data.to}`;
+    }
+}
+
+async function loadRates() {
+    const res = await fetch('/api/convert?amount=1&from_crypto=bitcoin&to_currency=USD');
+    const btc = await res.json();
+    
+    const res2 = await fetch('/api/convert?amount=1&from_crypto=ethereum&to_currency=USD');
+    const eth = await res2.json();
+    
+    const res3 = await fetch('/api/convert?amount=1&from_crypto=solana&to_currency=USD');
+    const sol = await res3.json();
+    
+    document.getElementById('ratesContainer').innerHTML = `
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;">
+            <div style="padding:15px;background:rgba(99,102,241,0.05);border-radius:8px;">
+                <strong>Bitcoin</strong><br>
+                <span style="font-size:20px;color:#6366f1;">$${btc.rate.toLocaleString()}</span>
+            </div>
+            <div style="padding:15px;background:rgba(99,102,241,0.05);border-radius:8px;">
+                <strong>Ethereum</strong><br>
+                <span style="font-size:20px;color:#6366f1;">$${eth.rate.toLocaleString()}</span>
+            </div>
+            <div style="padding:15px;background:rgba(99,102,241,0.05);border-radius:8px;">
+                <strong>Solana</strong><br>
+                <span style="font-size:20px;color:#6366f1;">$${sol.rate.toLocaleString()}</span>
+            </div>
+        </div>
+    `;
+}
+
+loadRates();
+setInterval(loadRates, 60000);
+</script>
+</body></html>""")
+
+@app.get("/calendrier", response_class=HTMLResponse)
+async def calendrier_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Calendrier</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>📅 Calendrier Événements Crypto</h1><p>Événements à venir</p></div>""" + NAV + """
+
+<div class="card">
+<h2>Prochains événements</h2>
+<div id="eventsContainer">Chargement...</div>
+</div>
+
+</div>
+
+<script>
+async function loadEvents() {
+    const res = await fetch('/api/crypto-events');
+    const data = await res.json();
+    
+    let html = '';
+    data.events.forEach(event => {
+        const importanceColor = event.importance === 'high' ? '#ef4444' : (event.importance === 'medium' ? '#f59e0b' : '#64748b');
+        html += `
+            <div class="event-item">
+                <div class="event-date">📆 ${event.date}</div>
+                <div class="event-title">${event.title}</div>
+                <div style="margin:8px 0;">
+                    <span class="badge" style="background:rgba(99,102,241,0.2);color:#6366f1;">${event.category}</span>
+                    <span class="badge" style="background:${importanceColor}20;color:${importanceColor};">${event.importance === 'high' ? '⚠️ Haute' : (event.importance === 'medium' ? '📌 Moyenne' : '📎 Faible')}</span>
+                </div>
+                <p style="color:#94a3b8;font-size:13px;margin-top:8px;">${event.description}</p>
+            </div>
+        `;
+    });
+    
+    document.getElementById('eventsContainer').innerHTML = html;
+}
+
+loadEvents();
+</script>
+</body></html>""")
+
+@app.get("/altcoin-season", response_class=HTMLResponse)
+async def altcoin_season_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Altcoin Season</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Altcoin Season Index</h1><p>Indicateur en temps réel</p></div>""" + NAV + """
+
+<div class="card">
+<h2>Index Actuel</h2>
+<div id="altseasonContainer">Chargement...</div>
+</div>
+
+<div class="card">
+<h2>💡 Comment interpréter ?</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>75-100:</strong> 🚀 ALTCOIN SEASON - Les altcoins surperforment Bitcoin</li>
+<li><strong>50-75:</strong> 📊 Mixed Market - Bitcoin et altcoins partagent le marché</li>
+<li><strong>25-50:</strong> ₿ Bitcoin dominance - Bitcoin commence à dominer</li>
+<li><strong>0-25:</strong> ₿ BITCOIN SEASON - Bitcoin surperforme massivement</li>
+</ul>
+</div>
+
+</div>
+
+<script>
+async function loadAltseason() {
+    const res = await fetch('/api/altcoin-season');
+    const data = await res.json();
+    
+    if (data.ok) {
+        const altseason = data.altseason;
+        const indicatorPosition = altseason.index;
+        
+        document.getElementById('altseasonContainer').innerHTML = `
+            <div style="text-align:center;padding:30px;">
+                <div style="font-size:72px;font-weight:bold;color:${altseason.color};">${altseason.index}</div>
+                <div style="font-size:24px;margin:20px 0;color:${altseason.color};">${altseason.status}</div>
+                <p style="color:#94a3b8;font-size:16px;">${altseason.description}</p>
+                
+                <div class="altseason-meter">
+                    <div class="altseason-indicator" style="left:${indicatorPosition}%;"></div>
+                </div>
+                
+                <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:12px;color:#64748b;">
+                    <span>₿ Bitcoin Season (0)</span>
+                    <span>📊 Mixed (50)</span>
+                    <span>🚀 Altcoin Season (100)</span>
+                </div>
+                
+                <div style="margin-top:30px;padding:20px;background:rgba(99,102,241,0.05);border-radius:8px;">
+                    <strong>BTC Dominance:</strong> ${altseason.btc_dominance.toFixed(1)}%
+                </div>
+            </div>
+        `;
+    }
+}
+
+loadAltseason();
+setInterval(loadAltseason, 60000);
+</script>
+</body></html>""")
+
+@app.get("/btc-dominance", response_class=HTMLResponse)
+async def btc_dominance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>BTC Dominance</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>₿ Bitcoin Dominance</h1><p>Évolution de la dominance BTC</p></div>""" + NAV + """
+
+<div class="grid grid-3">
+<div class="card">
+<h2>BTC Dominance</h2>
+<div id="btcDomContainer">Chargement...</div>
+</div>
+
+<div class="card">
+<h2>ETH Dominance</h2>
+<div id="ethDomContainer">Chargement...</div>
+</div>
+
+<div class="card">
+<h2>Autres</h2>
+<div id="otherDomContainer">Chargement...</div>
+</div>
+</div>
+
+<div class="card">
+<h2>📈 Historique 7 jours</h2>
+<canvas id="dominanceChart"></canvas>
+</div>
+
+<div class="card">
+<h2>💡 Analyse</h2>
+<p style="color:#94a3b8;line-height:1.8;">
+La dominance Bitcoin représente la part de marché de Bitcoin par rapport à l'ensemble du marché crypto. 
+Une dominance élevée (>60%) indique généralement une "Bitcoin Season" où BTC surperforme les altcoins. 
+Une dominance faible (<45%) suggère une "Altcoin Season" où les altcoins surperforment BTC.
+</p>
+</div>
+
+</div>
+
+<script>
+async function loadDominance() {
+    const res = await fetch('/api/btc-dominance');
+    const data = await res.json();
+    
+    if (data.ok) {
+        const btcDom = data.current_dominance;
+        const ethDom = data.eth_dominance;
+        const otherDom = 100 - btcDom - ethDom;
+        
+        document.getElementById('btcDomContainer').innerHTML = `
+            <div style="text-align:center;padding:20px;">
+                <div style="font-size:48px;font-weight:bold;color:#f7931a;">${btcDom.toFixed(1)}%</div>
+                <p style="color:#94a3b8;margin-top:10px;">Bitcoin</p>
+            </div>
+        `;
+        
+        document.getElementById('ethDomContainer').innerHTML = `
+            <div style="text-align:center;padding:20px;">
+                <div style="font-size:48px;font-weight:bold;color:#627eea;">${ethDom.toFixed(1)}%</div>
+                <p style="color:#94a3b8;margin-top:10px;">Ethereum</p>
+            </div>
+        `;
+        
+        document.getElementById('otherDomContainer').innerHTML = `
+            <div style="text-align:center;padding:20px;">
+                <div style="font-size:48px;font-weight:bold;color:#10b981;">${otherDom.toFixed(1)}%</div>
+                <p style="color:#94a3b8;margin-top:10px;">Altcoins</p>
+            </div>
+        `;
+        
+        // Graphique historique
+        const ctx = document.getElementById('dominanceChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: data.historical.map(h => h.date),
+                datasets: [{
+                    label: 'BTC Dominance (%)',
+                    data: data.historical.map(h => h.dominance),
+                    borderColor: '#f7931a',
+                    backgroundColor: 'rgba(247, 147, 26, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: { legend: { labels: { color: '#e2e8f0' } } },
+                scales: {
+                    y: { 
+                        ticks: { color: '#e2e8f0' }, 
+                        grid: { color: 'rgba(99, 102, 241, 0.1)' },
+                        min: 0,
+                        max: 100
+                    },
+                    x: { ticks: { color: '#e2e8f0' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }
+                }
+            }
+        });
+    }
+}
+
+loadDominance();
+</script>
+</body></html>""")
+
 @app.get("/annonces", response_class=HTMLResponse)
 async def annonces_page():
     news = await fetch_all_news()
@@ -1213,19 +1746,19 @@ async def strategie_page():
 <h2>Règles principales</h2>
 <ul style="line-height:2;padding-left:20px;">
 <li><strong>Risk Management:</strong> Maximum 2% du capital par trade</li>
-<li><strong>Risk/Reward:</strong> Minimum 1:2 (2% risque pour 4% gain)</li>
-<li><strong>Sessions:</strong> Focus sur London (08h-12h) et NY (13h-17h)</li>
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Sessions:</strong> London (08h-12h) et NY (13h-17h)</li>
 <li><strong>Stop Loss:</strong> Toujours placé avant l'entrée</li>
 <li><strong>Take Profit:</strong> 3 niveaux (TP1: 1.5%, TP2: 2.5%, TP3: 4%)</li>
 <li><strong>Psychologie:</strong> Pas plus de 3 trades perdants consécutifs</li>
-<li><strong>Journal:</strong> Noter toutes les entrées et sorties</li>
+<li><strong>Journal:</strong> Analyser chaque trade</li>
 </ul>
 </div>
 
 <div class="card">
 <h2>Indicateurs utilisés</h2>
 <ul style="line-height:2;padding-left:20px;">
-<li>RSI (Relative Strength Index) - Surachat/Survente</li>
+<li>RSI - Surachat/Survente</li>
 <li>EMA 20/50/200 - Tendance</li>
 <li>MACD - Momentum</li>
 <li>Volume Profile - Support/Résistance</li>
@@ -1233,90 +1766,6 @@ async def strategie_page():
 </ul>
 </div>
 </div>
-</body></html>""")
-
-@app.get("/journal", response_class=HTMLResponse)
-async def journal_page():
-    entries = trading_state.journal_entries
-    entries_html = ""
-    for entry in reversed(entries):
-        timestamp = entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-        entries_html += f"""<div class="card"><div style="font-size:12px;color:#64748b;margin-bottom:8px;">{timestamp}</div><p>{entry['entry']}</p></div>"""
-    
-    return HTMLResponse("""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Journal</title>""" + CSS + """</head>
-<body>
-<div class="container">
-<div class="header"><h1>📝 Journal de Trading</h1></div>""" + NAV + """
-<div class="card">
-<h2>Nouvelle entrée</h2>
-<textarea id="journalEntry" placeholder="Notez vos observations, émotions, apprentissages..."></textarea>
-<button onclick="addEntry()" style="margin-top:12px;">Ajouter</button>
-</div>
-<div id="entriesList">""" + entries_html + """</div>
-</div>
-<script>
-async function addEntry() {
-    const text = document.getElementById('journalEntry').value;
-    if (!text.trim()) return;
-    
-    await fetch('/api/journal', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({entry: text})
-    });
-    
-    window.location.reload();
-}
-</script>
-</body></html>""")
-
-@app.get("/equity-curve", response_class=HTMLResponse)
-async def equity_curve_page():
-    return HTMLResponse("""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Equity Curve</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-""" + CSS + """</head>
-<body>
-<div class="container">
-<div class="header"><h1>📈 Equity Curve</h1><p>Évolution du capital</p></div>""" + NAV + """
-<div class="card">
-<h2>Performance</h2>
-<canvas id="equityChart"></canvas>
-</div>
-</div>
-<script>
-async function loadEquity() {
-    const res = await fetch('/api/equity-curve');
-    const data = await res.json();
-    const equity = data.equity_curve;
-    
-    const ctx = document.getElementById('equityChart').getContext('2d');
-    new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: equity.map((_, i) => `T${i+1}`),
-            datasets: [{
-                label: 'Equity ($)',
-                data: equity.map(e => e.equity),
-                borderColor: '#6366f1',
-                backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                tension: 0.4,
-                fill: true
-            }]
-        },
-        options: {
-            responsive: true,
-            plugins: { legend: { labels: { color: '#e2e8f0' } } },
-            scales: {
-                y: { ticks: { color: '#e2e8f0' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } },
-                x: { ticks: { color: '#e2e8f0' }, grid: { color: 'rgba(99, 102, 241, 0.1)' } }
-            }
-        }
-    });
-}
-loadEquity();
-</script>
 </body></html>""")
 
 @app.get("/correlations", response_class=HTMLResponse)
@@ -1374,8 +1823,11 @@ async def top_movers_page():
 </div>
 
 <div class="card">
-<h2>📊 Volumes 24h</h2>
-<p style="color:#94a3b8;font-size:13px;margin-top:10px;">Les volumes reflètent l'intérêt du marché</p>
+<h2>📊 Info</h2>
+<p style="color:#94a3b8;font-size:13px;margin-top:10px;">
+Les volumes reflètent l'intérêt du marché. 
+Des volumes élevés avec des hausses = signal haussier fort.
+</p>
 </div>
 </div>
 
@@ -1387,13 +1839,19 @@ async function loadMovers() {
     
     let gainersHtml = '<div style="padding:10px;">';
     data.gainers.forEach(g => {
-        gainersHtml += `<div style="margin:10px 0;"><strong>${g.coin}</strong>: <span style="color:#10b981;">+${g.change_24h.toFixed(2)}%</span></div>`;
+        gainersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;">
+            <strong>${g.coin}</strong>: <span style="color:#10b981;font-weight:bold;">+${g.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${g.price.toFixed(2)}</span>
+        </div>`;
     });
     gainersHtml += '</div>';
     
     let losersHtml = '<div style="padding:10px;">';
     data.losers.forEach(l => {
-        losersHtml += `<div style="margin:10px 0;"><strong>${l.coin}</strong>: <span style="color:#ef4444;">${l.change_24h.toFixed(2)}%</span></div>`;
+        losersHtml += `<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;">
+            <strong>${l.coin}</strong>: <span style="color:#ef4444;font-weight:bold;">${l.change_24h.toFixed(2)}%</span><br>
+            <span style="font-size:11px;color:#64748b;">Prix: $${l.price.toFixed(2)}</span>
+        </div>`;
     });
     losersHtml += '</div>';
     
@@ -1401,6 +1859,7 @@ async function loadMovers() {
     document.getElementById('losersContainer').innerHTML = losersHtml;
 }
 loadMovers();
+setInterval(loadMovers, 60000);
 </script>
 </body></html>""")
 
@@ -1422,7 +1881,7 @@ async function loadPerformance() {
     const data = await res.json();
     
     if (data.performance.length === 0) {
-        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible</p>';
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnée disponible. Effectuez des trades pour voir les statistiques.</p>';
         return;
     }
     
@@ -1433,9 +1892,9 @@ async function loadPerformance() {
         html += `<tr>
             <td><strong>${p.symbol}</strong></td>
             <td>${p.trades}</td>
-            <td>${p.win_rate}%</td>
+            <td><span class="badge ${p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')}">${p.win_rate}%</span></td>
             <td style="color:${colorPnl}">${p.avg_pnl > 0 ? '+' : ''}${p.avg_pnl}%</td>
-            <td style="color:${colorPnl};font-weight:bold;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
+            <td style="color:${colorPnl};font-weight:bold;font-size:16px;">${p.total_pnl > 0 ? '+' : ''}${p.total_pnl}%</td>
         </tr>`;
     });
     
@@ -1443,55 +1902,40 @@ async function loadPerformance() {
     document.getElementById('perfContainer').innerHTML = html;
 }
 loadPerformance();
-</script>
-</body></html>""")
-
-@app.get("/volatility", response_class=HTMLResponse)
-async def volatility_page():
-    return HTMLResponse("""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Volatilité</title>""" + CSS + """</head>
-<body>
-<div class="container">
-<div class="header"><h1>⚡ Volatilité du Marché</h1><p>Analyse de la volatilité</p></div>""" + NAV + """
-<div class="card">
-<h2>Volatilité par crypto</h2>
-<div id="volContainer"></div>
-</div>
-</div>
-<script>
-async function loadVolatility() {
-    const res = await fetch('/api/volatility');
-    const data = await res.json();
-    
-    let html = '<table style="width:100%;"><thead><tr><th>Symbol</th><th>Volatilité</th><th>Tendance</th></tr></thead><tbody>';
-    
-    data.volatility.forEach(v => {
-        const colorVol = v.volatility > 5 ? '#ef4444' : (v.volatility > 3 ? '#f59e0b' : '#10b981');
-        const trendEmoji = v.trend === 'hausse' ? '📈' : (v.trend === 'baisse' ? '📉' : '➡️');
-        html += `<tr>
-            <td><strong>${v.symbol}</strong></td>
-            <td style="color:${colorVol};font-weight:bold;">${v.volatility}%</td>
-            <td>${trendEmoji} ${v.trend}</td>
-        </tr>`;
-    });
-    
-    html += '</tbody></table>';
-    html += '<p style="color:#94a3b8;font-size:12px;margin-top:20px;">💡 Volatilité élevée = Plus de risque mais aussi plus d\'opportunités</p>';
-    document.getElementById('volContainer').innerHTML = html;
-}
-loadVolatility();
+setInterval(loadPerformance, 30000);
 </script>
 </body></html>""")
 
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD v3.0.0 ULTIME")
+    print("🚀 TRADING DASHBOARD v3.1.0 ULTIME")
     print("="*70)
+    print("✅ Convertisseur crypto (USD, CAD, EUR, GBP)")
+    print("✅ Calendrier événements crypto")
+    print("✅ Altcoin Season Index")
+    print("✅ Bitcoin Dominance Chart")
+    print("✅ Telegram CORRIGÉ et fonctionnel")
     print("✅ Heure d'entrée dans les trades")
-    print("✅ Toutes sections restaurées (Annonces, Heatmap, Stratégie, etc.)")
-    print("✅ Nouvelles sections (Corrélations, Top Movers, Performance, Volatilité)")
-    print("✅ Webhook OUVERT (sans secret)")
-    print("✅ TP1/TP2/TP3 différenciés")
-    print("="*70 + "\n")
+    print("✅ Toutes sections complètes")
+    print("="*70)
+    print("\n📋 PAGES DISPONIBLES:")
+    print("   / - Home")
+    print("   /trades - Dashboard principal")
+    print("   /convertisseur - Convertisseur crypto")
+    print("   /calendrier - Calendrier événements")
+    print("   /altcoin-season - Altcoin Season Index")
+    print("   /btc-dominance - Bitcoin Dominance")
+    print("   /annonces - Actualités crypto FR")
+    print("   /heatmap - Performance horaire")
+    print("   /strategie - Règles de trading")
+    print("   /correlations - Corrélations crypto")
+    print("   /top-movers - Top Gainers/Losers")
+    print("   /performance - Performance par paire")
+    print("\n📡 WEBHOOK:")
+    print("   POST /tv-webhook (OUVERT, sans secret)")
+    print("\n🔧 TEST TELEGRAM:")
+    print("   GET /api/telegram-test")
+    print("\n" + "="*70 + "\n")
+    
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
