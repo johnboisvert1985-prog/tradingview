@@ -1670,7 +1670,7 @@ async def paper_trading_page():
 <html><head><meta charset="UTF-8"><title>Paper Trading</title>""" + CSS + """</head>
 <body>
 <div class="container">
-<div class="header"><h1>📝 Paper Trading</h1><p>Simulation de trading en temps réel</p></div>""" + NAV + """
+<div class="header"><h1>Paper Trading</h1><p>Simulation de trading en temps réel</p></div>""" + NAV + """
 
 <div class="grid grid-3">
 <div class="stat-box">
@@ -3563,3 +3563,4 @@ if __name__ == "__main__":
     print("\n" + "="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
