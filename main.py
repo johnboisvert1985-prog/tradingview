@@ -3,7 +3,7 @@
 Trading Dashboard - VERSION 2.5.4 FINALE
 ✅ Toutes les routes HTML
 ✅ TP1/TP2/TP3 affichage corrigé
-✅ Support action CLOSE
+✅ Support action CLOS
 ✅ Logs détaillés
 """
 
@@ -1859,3 +1859,4 @@ if __name__ == "__main__":
     print("="*70 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
