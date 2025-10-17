@@ -1710,8 +1710,8 @@ async def paper_trading_page():
 <input type="number" id="quantity" value="0.01" step="0.001">
 
 <div style="display:flex;gap:10px;">
-<button onclick="placeTrade()" style="flex:1;">✅ Placer le Trade</button>
-<button onclick="resetPaper()" class="btn-danger" style="flex:1;">🗑️ Reset</button>
+<button onclick="placeTrade()" style="flex:1;">&#9989; Placer le Trade</button>
+<button onclick="resetPaper()" class="btn-danger" style="flex:1;">&#128465; Reset</button>
 </div>
 
 <div id="tradeMessage" style="margin-top:15px;padding:10px;border-radius:8px;display:none;"></div>
@@ -1729,7 +1729,7 @@ async def paper_trading_page():
 </div>
 
 <div class="card" style="background:rgba(59,130,246,0.1);border-color:#3b82f6;">
-<h2 style="color:#3b82f6;">💡 Comment utiliser le Paper Trading ?</h2>
+<h2 style="color:#3b82f6;">&#128161; Comment utiliser le Paper Trading ?</h2>
 <div style="color:#94a3b8;font-size:14px;line-height:1.8;">
 <p style="margin-bottom:10px;"><strong>Le paper trading vous permet de :</strong></p>
 <ul style="padding-left:20px;">
@@ -1738,8 +1738,8 @@ async def paper_trading_page():
 <li>Suivre vos performances avant de trader en réel</li>
 <li>Pratiquer votre discipline et gestion du risque</li>
 </ul>
-<p style="margin-top:15px;"><strong>⚠️ Important :</strong> Les prix sont réels (API Binance) mais l'argent est virtuel. Commencez avec $10,000 USDT.</p>
-<p style="margin-top:10px;"><strong>🎯 Objectif :</strong> Si vous êtes rentable sur 30+ trades, considérez le passage au trading réel avec un petit capital.</p>
+<p style="margin-top:15px;"><strong>&#9888; Important :</strong> Les prix sont réels (API Binance) mais l'argent est virtuel. Commencez avec $10,000 USDT.</p>
+<p style="margin-top:10px;"><strong>&#127919; Objectif :</strong> Si vous êtes rentable sur 30+ trades, considérez le passage au trading réel avec un petit capital.</p>
 </div>
 </div>
 
@@ -3099,12 +3099,12 @@ async function placeTrade() {
         msgDiv.style.background = 'rgba(16,185,129,0.1)';
         msgDiv.style.borderLeft = '4px solid #10b981';
         msgDiv.style.color = '#10b981';
-        msgDiv.textContent = '✅ ' + data.message;
+        msgDiv.textContent = '\u2705 ' + data.message;
     } else {
         msgDiv.style.background = 'rgba(239,68,68,0.1)';
         msgDiv.style.borderLeft = '4px solid #ef4444';
         msgDiv.style.color = '#ef4444';
-        msgDiv.textContent = '❌ ' + data.message;
+        msgDiv.textContent = '\u274C ' + data.message;
     }
     
     setTimeout(() => {
