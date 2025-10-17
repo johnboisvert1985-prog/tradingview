@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Trading Dashboard - VERSION 2.6.1 FINALE
-✅ Syntaxe corrigée
+Trading Dashboard - VERSION 2.6.2 COMPLÈTE
+✅ Toutes fonctionnalités OK
 ✅ Webhook SANS secret
-✅ RESET OK
+✅ RESET + Fear&Greed + Bull Run + Toutes pages
 """
 
 from fastapi import FastAPI, Request
@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Trading Dashboard", version="2.6.1")
+app = FastAPI(title="Trading Dashboard", version="2.6.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,8 +46,7 @@ class Settings:
         "https://fr.cointelegraph.com/rss",
         "https://cryptoast.fr/feed/",
     ]
-    FRENCH_SOURCES = ['journalducoin.com', 'fr.cointelegraph.com', 'cryptoast.fr']
-    NEWS_CACHE_TTL = 60
+    NEWS_CACHE_TTL = 300
     NEWS_MAX_AGE_HOURS = 48
 
 settings = Settings()
@@ -355,6 +354,52 @@ class TradingState:
 
 trading_state = TradingState()
 
+async def init_demo():
+    prices = await fetch_crypto_prices()
+    if not prices:
+        prices = {
+            "bitcoin": {"price": 65000},
+            "ethereum": {"price": 3500},
+            "binancecoin": {"price": 600},
+            "solana": {"price": 140},
+        }
+    
+    trades_config = [
+        ("BTCUSDT", prices.get('bitcoin', {}).get('price', 65000), 'LONG', 'normal'),
+        ("ETHUSDT", prices.get('ethereum', {}).get('price', 3500), 'SHORT', 'normal'),
+        ("SOLUSDT", prices.get('solana', {}).get('price', 140), 'LONG', 'normal'),
+    ]
+    
+    for symbol, price, side, state in trades_config:
+        if side == 'LONG':
+            tp1 = price * 1.015
+            tp2 = price * 1.025
+            tp3 = price * 1.04
+            sl = price * 0.98
+        else:
+            tp1 = price * 0.985
+            tp2 = price * 0.975
+            tp3 = price * 0.96
+            sl = price * 1.02
+        
+        trade = {
+            'symbol': symbol,
+            'tf_label': '15m',
+            'side': side,
+            'entry': price,
+            'tp1': tp1,
+            'tp2': tp2,
+            'tp3': tp3,
+            'sl': sl,
+            'row_state': state
+        }
+        
+        trading_state.add_trade(trade)
+    
+    logger.info("✅ Démo: 3 trades")
+
+asyncio.get_event_loop().create_task(init_demo())
+
 async def send_telegram_message(message: str) -> bool:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
         logger.warning("⚠️ Telegram non configuré")
@@ -371,7 +416,7 @@ async def send_telegram_message(message: str) -> bool:
                     return True
                 else:
                     txt = await response.text()
-                    logger.error(f"❌ Telegram: {response.status} - {txt[:500]}")
+                    logger.error(f"❌ Telegram: {response.status}")
                     return False
     except Exception as e:
         logger.error(f"❌ Telegram: {str(e)}")
@@ -484,8 +529,19 @@ tr:hover { background: rgba(99, 102, 241, 0.05); }
 .tp-item { padding: 4px 8px; border-radius: 4px; font-size: 11px; }
 .tp-pending { background: rgba(100, 116, 139, 0.2); color: #64748b; }
 .tp-hit { background: rgba(16, 185, 129, 0.2); color: #10b981; font-weight: 600; }
+.gauge { width: 120px; height: 120px; margin: 0 auto 20px; background: conic-gradient(#6366f1 0deg, #8b5cf6 180deg, #ec4899 360deg); border-radius: 50%; display: flex; align-items: center; justify-content: center; }
+.gauge-inner { width: 90px; height: 90px; background: #1e293b; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.gauge-value { font-size: 32px; font-weight: bold; }
+.gauge-label { font-size: 12px; color: #64748b; }
 .live-badge { display: inline-block; padding: 4px 8px; background: rgba(16, 185, 129, 0.2); color: #10b981; border-radius: 4px; font-size: 10px; font-weight: 700; animation: pulse 2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.reset-btn { position: fixed; top: 20px; right: 20px; padding: 12px 24px; background: #ef4444; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; z-index: 1000; }
+.reset-btn:hover { background: #dc2626; }
+.modal { display: none; position: fixed; z-index: 2000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.7); }
+.modal-content { background-color: #1e293b; margin: 15% auto; padding: 30px; border: 2px solid #ef4444; border-radius: 12px; width: 90%; max-width: 500px; text-align: center; }
+.modal-buttons { display: flex; gap: 12px; justify-content: center; margin-top: 20px; }
+.btn-confirm { padding: 12px 24px; background: #ef4444; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
+.btn-cancel { padding: 12px 24px; background: #64748b; color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
 </style>"""
 
 NAV = """<div class="nav">
@@ -496,6 +552,47 @@ NAV = """<div class="nav">
 @app.get("/api/trades")
 async def api_trades():
     return {"ok": True, "trades": trading_state.get_trades_json()}
+
+@app.get("/api/fear-greed")
+async def api_fear_greed():
+    if market_cache.needs_update('fear_greed'):
+        fg = await fetch_real_fear_greed()
+    else:
+        fg = market_cache.fear_greed_data or await fetch_real_fear_greed()
+    return {"ok": True, "fear_greed": fg}
+
+@app.get("/api/bullrun-phase")
+async def api_bullrun_phase():
+    if market_cache.needs_update('global_data'):
+        gd = await fetch_global_crypto_data()
+    else:
+        gd = market_cache.global_data or await fetch_global_crypto_data()
+    
+    if market_cache.needs_update('fear_greed'):
+        fg = await fetch_real_fear_greed()
+    else:
+        fg = market_cache.fear_greed_data or await fetch_real_fear_greed()
+    
+    if market_cache.needs_update('crypto_prices'):
+        pr = await fetch_crypto_prices()
+    else:
+        pr = market_cache.crypto_prices or await fetch_crypto_prices()
+    
+    phase = calculate_bullrun_phase(gd, fg)
+    btc_price = pr.get('bitcoin', {}).get('price', 0)
+    
+    return {
+        "ok": True,
+        "bullrun_phase": {
+            **phase,
+            "btc_price": int(btc_price),
+            "market_cap": gd.get('total_market_cap', 0),
+            "details": {
+                "btc": {"performance_30d": pr.get('bitcoin', {}).get('change_24h', 0), "dominance": phase.get('btc_dominance', 0)},
+                "eth": {"performance_30d": pr.get('ethereum', {}).get('change_24h', 0)},
+            },
+        }
+    }
 
 @app.get("/api/stats")
 async def api_stats():
@@ -608,11 +705,11 @@ async def home():
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Dashboard</title>""" + CSS + """</head>
 <body><div class="container">
-<div class="header"><h1>Trading Dashboard</h1><p>v2.6.1 <span class="live-badge">LIVE</span></p></div>""" + NAV + """
+<div class="header"><h1>Trading Dashboard</h1><p>v2.6.2 <span class="live-badge">LIVE</span></p></div>""" + NAV + """
 <div class="card" style="text-align:center;">
 <h2>Dashboard Actif</h2>
-<p style="color:#94a3b8;margin:20px 0;">Webhook ouvert • TP1/TP2/TP3</p>
-<a href="/trades" style="padding:12px 24px;background:#6366f1;color:white;text-decoration:none;border-radius:8px;">Dashboard</a>
+<p style="color:#94a3b8;margin:20px 0;">Webhook ouvert • TP1/TP2/TP3 • Fear&Greed • Bull Run</p>
+<a href="/trades" style="padding:12px 24px;background:#6366f1;color:white;text-decoration:none;border-radius:8px;display:inline-block;margin-top:20px;">Dashboard →</a>
 </div></div></body></html>""")
 
 @app.get("/trades", response_class=HTMLResponse)
@@ -625,6 +722,23 @@ async def trades_page():
 {CSS}
 </head>
 <body>
+
+<button class="reset-btn" onclick="showResetModal()">RESET</button>
+
+<div id="resetModal" class="modal">
+    <div class="modal-content">
+        <h2 style="color:#ef4444;margin-bottom:20px;">Confirmation RESET</h2>
+        <p style="color:#e2e8f0;margin-bottom:20px;">
+            TOUT supprimer ?<br><br>
+            <strong>Supprime tous les trades</strong>
+        </p>
+        <div class="modal-buttons">
+            <button class="btn-confirm" onclick="confirmReset()">OUI</button>
+            <button class="btn-cancel" onclick="closeResetModal()">ANNULER</button>
+        </div>
+    </div>
+</div>
+
 <div class="container">
 <div class="header">
 <h1>Trading Dashboard</h1>
@@ -669,9 +783,53 @@ async def trades_page():
 </table>
 </div>
 
+<div class="card">
+<h2>Fear & Greed</h2>
+<div id="fearGreedContainer">Chargement...</div>
+</div>
+
+<div class="card">
+<h2>Bull Run Phase</h2>
+<div id="bullrunContainer">Chargement...</div>
+</div>
+
 </div>
 
 <script>
+function showResetModal() {{
+    document.getElementById('resetModal').style.display = 'block';
+}}
+
+function closeResetModal() {{
+    document.getElementById('resetModal').style.display = 'none';
+}}
+
+async function confirmReset() {{
+    try {{
+        const response = await fetch('/api/reset', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}}
+        }});
+        
+        const data = await response.json();
+        
+        if (data.ok) {{
+            alert('Dashboard réinitialisé !');
+            closeResetModal();
+            window.location.reload();
+        }} else {{
+            alert('Erreur: ' + data.error);
+        }}
+    }} catch (error) {{
+        alert('Erreur: ' + error);
+    }}
+}}
+
+window.onclick = function(event) {{
+    const modal = document.getElementById('resetModal');
+    if (event.target == modal) closeResetModal();
+}}
+
 async function loadDashboard() {{
     try {{
         const res = await fetch('/api/trades');
@@ -729,6 +887,39 @@ async function loadDashboard() {{
             tbody.appendChild(row);
         }});
         
+        const fgRes = await fetch('/api/fear-greed');
+        const fgData = await fgRes.json();
+        
+        if (fgData.ok) {{
+            const fg = fgData.fear_greed;
+            document.getElementById('fearGreedContainer').innerHTML = `
+                <div class="gauge"><div class="gauge-inner">
+                    <div class="gauge-value">${{fg.value}}</div>
+                    <div class="gauge-label">${{fg.sentiment}}</div>
+                </div></div>
+                <p style="text-align:center;margin-top:15px;">${{fg.emoji}} ${{fg.recommendation}}</p>
+            `;
+        }}
+        
+        const brRes = await fetch('/api/bullrun-phase');
+        const brData = await brRes.json();
+        
+        if (brData.ok) {{
+            const phase = brData.bullrun_phase;
+            document.getElementById('bullrunContainer').innerHTML = `
+                <div style="text-align:center;padding:20px;">
+                    <div style="font-size:48px;">${{phase.emoji}}</div>
+                    <h3 style="color:${{phase.color}};margin:15px 0;">${{phase.phase_name}}</h3>
+                    <p style="color:#94a3b8;margin-bottom:15px;">${{phase.description}}</p>
+                    <div style="display:flex;gap:20px;justify-content:center;">
+                        <div><strong>BTC.D:</strong> ${{phase.btc_dominance}}%</div>
+                        <div><strong>F&G:</strong> ${{phase.fg}}</div>
+                        <div><strong>Confiance:</strong> ${{phase.confidence}}%</div>
+                    </div>
+                </div>
+            `;
+        }}
+        
     }} catch(e) {{
         console.error('Erreur:', e);
     }}
@@ -744,9 +935,12 @@ setInterval(loadDashboard, 30000);
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*70)
-    print("🚀 TRADING DASHBOARD v2.6.1")
+    print("🚀 TRADING DASHBOARD v2.6.2 COMPLET")
     print("="*70)
-    print("✅ Webhook OUVERT (sans secret)")
-    print("✅ Syntaxe OK")
+    print("✅ Webhook OUVERT")
+    print("✅ Fear & Greed")
+    print("✅ Bull Run Phase")
+    print("✅ TP1/TP2/TP3")
+    print("✅ RESET")
     print("="*70 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
