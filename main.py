@@ -968,6 +968,693 @@ async def get_performance_by_pair():
 # NOTE: Les pages HTML suivent, je continue dans le prochain message pour rester en dessous de la limite
 # TOUTES les pages sont sans emojis et caracteres speciaux
 
+# PAGES HTML (sans emojis ni caracteres speciaux)
+
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Trades Dashboard</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Dashboard Trading</h1><p>Suivi en temps reel</p></div>""" + NAV + """
+<div class="grid grid-4">
+<div class="stat-box"><div class="label">Total Trades</div><div class="value" id="totalTrades">0</div></div>
+<div class="stat-box"><div class="label">Win Rate</div><div class="value" id="winRate">0%</div></div>
+<div class="stat-box"><div class="label">P&L Total</div><div class="value" id="totalPnl">$0</div></div>
+<div class="stat-box"><div class="label">P&L Moyen</div><div class="value" id="avgPnl">$0</div></div>
+</div>
+<div class="card">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+<h2 style="margin:0;">Trades Actifs</h2>
+<button class="btn-danger" onclick="resetTrades()">Reset Trades</button>
+</div>
+<div id="tradesContainer"><p style="color:#94a3b8;text-align:center;padding:20px;">Aucun trade pour le moment</p></div>
+</div>
+</div>
+<script>
+async function loadStats() {
+    const res = await fetch('/api/stats');
+    const data = await res.json();
+    document.getElementById('totalTrades').textContent = data.total_trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('totalPnl').textContent = (data.total_pnl > 0 ? '+' : '') + data.total_pnl + '%';
+    document.getElementById('avgPnl').textContent = (data.avg_pnl > 0 ? '+' : '') + data.avg_pnl + '%';
+    document.getElementById('totalPnl').style.color = data.total_pnl > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('avgPnl').style.color = data.avg_pnl > 0 ? '#10b981' : '#ef4444';
+}
+async function resetTrades() {
+    if (confirm('Reset tous les trades ?')) {
+        await fetch('/api/reset-trades', {method: 'POST'});
+        alert('Trades reinitialises!');
+        loadStats();
+    }
+}
+loadStats();
+setInterval(loadStats, 10000);
+</script>
+</body></html>""")
+
+@app.get("/fear-greed", response_class=HTMLResponse)
+async def fear_greed_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Fear & Greed Index</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Crypto Fear & Greed Index</h1><p>Sentiment du marche en temps reel</p></div>""" + NAV + """
+<div class="card"><h2>Index actuel</h2>
+<div style="text-align:center;padding:40px;">
+<div style="font-size:100px;margin-bottom:20px;" id="emoji">-</div>
+<div style="font-size:80px;font-weight:bold;margin-bottom:20px;" id="value">--</div>
+<div style="font-size:28px;margin-bottom:30px;" id="classification">Chargement...</div>
+</div>
+</div>
+</div>
+<script>
+async function loadFearGreed() {
+    const res = await fetch('/api/fear-greed');
+    const data = await res.json();
+    document.getElementById('value').textContent = data.value;
+    document.getElementById('classification').textContent = data.classification;
+    document.getElementById('emoji').textContent = data.emoji;
+    const color = data.value < 25 ? '#ef4444' : (data.value < 45 ? '#f59e0b' : (data.value < 55 ? '#64748b' : '#10b981'));
+    document.getElementById('value').style.color = color;
+}
+loadFearGreed();
+setInterval(loadFearGreed, 300000);
+</script>
+</body></html>""")
+
+@app.get("/bullrun-phase", response_class=HTMLResponse)
+async def bullrun_phase_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Bullrun Phase</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Phase du Bullrun</h1><p>Analyse multi-indicateurs</p></div>""" + NAV + """
+<div class="card"><h2>Phase actuelle du marche</h2>
+<div style="text-align:center;padding:40px;">
+<div style="font-size:48px;font-weight:bold;margin-bottom:30px;" id="phase">Chargement...</div>
+<div class="grid grid-3" style="max-width:900px;margin:0 auto;">
+<div style="background:#0f172a;padding:20px;border-radius:8px;"><p style="color:#94a3b8;font-size:13px;">Prix BTC</p><p style="font-size:24px;font-weight:bold;color:#f7931a;" id="btcPrice">--</p></div>
+<div style="background:#0f172a;padding:20px;border-radius:8px;"><p style="color:#94a3b8;font-size:13px;">Change 24h</p><p style="font-size:24px;font-weight:bold;" id="btcChange">--</p></div>
+<div style="background:#0f172a;padding:20px;border-radius:8px;"><p style="color:#94a3b8;font-size:13px;">Dominance BTC</p><p style="font-size:24px;font-weight:bold;color:#60a5fa;" id="btcDom">--</p></div>
+</div>
+</div>
+</div>
+</div>
+<script>
+async function loadBullrunPhase() {
+    const res = await fetch('/api/bullrun-phase');
+    const data = await res.json();
+    document.getElementById('phase').textContent = data.phase;
+    document.getElementById('btcPrice').textContent = '
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.btc_price.toLocaleString();
+    document.getElementById('btcChange').textContent = (data.btc_change_24h > 0 ? '+' : '') + data.btc_change_24h + '%';
+    document.getElementById('btcDom').textContent = data.btc_dominance + '%';
+    document.getElementById('phase').style.color = data.color;
+    document.getElementById('btcChange').style.color = data.btc_change_24h > 0 ? '#10b981' : '#ef4444';
+}
+loadBullrunPhase();
+setInterval(loadBullrunPhase, 60000);
+</script>
+</body></html>""")
+
+@app.get("/paper-trading", response_class=HTMLResponse)
+async def paper_trading_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Paper Trading</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Paper Trading</h1><p>Simulation de trading en temps reel</p></div>""" + NAV + """
+<div class="grid grid-3">
+<div class="stat-box"><div class="label">Valeur Totale</div><div class="value" id="totalValue">$10,000</div></div>
+<div class="stat-box"><div class="label">P&L</div><div class="value" id="pnl">$0</div></div>
+<div class="stat-box"><div class="label">Trades</div><div class="value" id="totalTrades">0</div></div>
+</div>
+<div class="grid grid-2">
+<div class="card"><h2>Placer un Trade</h2>
+<select id="action"><option value="BUY">Acheter (BUY)</option><option value="SELL">Vendre (SELL)</option></select>
+<select id="symbol"><option value="BTCUSDT">Bitcoin (BTC)</option><option value="ETHUSDT">Ethereum (ETH)</option><option value="SOLUSDT">Solana (SOL)</option></select>
+<input type="number" id="quantity" value="0.01" step="0.001">
+<div style="display:flex;gap:10px;"><button onclick="placeTrade()" style="flex:1;">Placer Trade</button><button onclick="resetPaper()" class="btn-danger" style="flex:1;">Reset</button></div>
+<div id="tradeMessage" style="margin-top:15px;padding:10px;border-radius:8px;display:none;"></div>
+</div>
+<div class="card"><h2>Soldes</h2><div id="balances"></div></div>
+</div>
+<div class="card"><h2>Historique</h2><div id="tradeHistory"></div></div>
+</div>
+<script>
+async function loadStats() {
+    const res = await fetch('/api/paper-stats');
+    const data = await res.json();
+    document.getElementById('totalValue').textContent = '
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.total_value.toLocaleString();
+    document.getElementById('pnl').textContent = (data.pnl > 0 ? '+
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ : '
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+) + data.pnl.toLocaleString();
+    document.getElementById('totalTrades').textContent = data.total_trades;
+    document.getElementById('pnl').style.color = data.pnl > 0 ? '#10b981' : '#ef4444';
+}
+async function loadBalances() {
+    const res = await fetch('/api/paper-balance');
+    const data = await res.json();
+    let html = '<div style="display:grid;gap:10px;">';
+    for (const [crypto, amount] of Object.entries(data.balance)) {
+        if (amount > 0.00001) {
+            html += '<div style="padding:10px;background:#0f172a;border-radius:6px;display:flex;justify-content:space-between;"><strong style="color:#60a5fa;">' + crypto + '</strong><span style="color:#e2e8f0;">' + amount.toFixed(crypto === 'USDT' ? 2 : 6) + '</span></div>';
+        }
+    }
+    html += '</div>';
+    document.getElementById('balances').innerHTML = html;
+}
+async function loadHistory() {
+    const res = await fetch('/api/paper-trades');
+    const data = await res.json();
+    if (data.trades.length === 0) {
+        document.getElementById('tradeHistory').innerHTML = '<p style="color:#94a3b8;text-align:center;padding:20px;">Aucun trade</p>';
+        return;
+    }
+    let html = '<table><thead><tr><th>Date</th><th>Action</th><th>Crypto</th><th>Quantite</th><th>Prix</th><th>Total</th></tr></thead><tbody>';
+    data.trades.reverse().forEach(t => {
+        const color = t.action === 'BUY' ? '#10b981' : '#ef4444';
+        html += '<tr><td style="font-size:12px;">' + new Date(t.timestamp).toLocaleString('fr-CA') + '</td><td><span style="color:' + color + ';font-weight:bold;">' + t.action + '</span></td><td><strong>' + t.symbol.replace('USDT', '') + '</strong></td><td>' + t.quantity + '</td><td>
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + t.price.toFixed(2) + '</td><td style="font-weight:bold;">
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + t.total.toFixed(2) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('tradeHistory').innerHTML = html;
+}
+async function placeTrade() {
+    const action = document.getElementById('action').value;
+    const symbol = document.getElementById('symbol').value;
+    const quantity = document.getElementById('quantity').value;
+    const res = await fetch('/api/paper-trade', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action, symbol, quantity})});
+    const data = await res.json();
+    const msgDiv = document.getElementById('tradeMessage');
+    msgDiv.style.display = 'block';
+    if (data.status === 'success') {
+        msgDiv.style.background = 'rgba(16,185,129,0.1)';
+        msgDiv.style.borderLeft = '4px solid #10b981';
+        msgDiv.style.color = '#10b981';
+        msgDiv.textContent = 'OK: ' + data.message;
+    } else {
+        msgDiv.style.background = 'rgba(239,68,68,0.1)';
+        msgDiv.style.borderLeft = '4px solid #ef4444';
+        msgDiv.style.color = '#ef4444';
+        msgDiv.textContent = 'ERREUR: ' + data.message;
+    }
+    setTimeout(() => { msgDiv.style.display = 'none'; }, 5000);
+    loadStats();loadBalances();loadHistory();
+}
+async function resetPaper() {
+    if (confirm('Reset paper trading?')) {
+        await fetch('/api/paper-reset', {method: 'POST'});
+        alert('Reset OK!');
+        loadStats();loadBalances();loadHistory();
+    }
+}
+loadStats();loadBalances();loadHistory();
+setInterval(() => { loadStats();loadBalances(); }, 30000);
+</script>
+</body></html>""")
+
+@app.get("/backtesting", response_class=HTMLResponse)
+async def backtesting_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Backtesting</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Backtesting de Strategies</h1><p>Donnees historiques REELLES (Binance)</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card"><h2>Configuration</h2>
+<select id="symbol"><option value="BTCUSDT">Bitcoin</option><option value="ETHUSDT">Ethereum</option><option value="SOLUSDT">Solana</option></select>
+<select id="strategy"><option value="SMA_CROSS">SMA Cross</option><option value="RSI_OVERBOUGHT">RSI</option><option value="MACD">MACD</option><option value="BOLLINGER">Bollinger</option><option value="EMA_RIBBON">EMA Ribbon</option></select>
+<input type="number" id="capital" value="10000" step="1000">
+<button onclick="runBacktest()" style="width:100%;">Lancer Backtest</button>
+</div>
+<div class="card"><h2>Resultats</h2>
+<div id="results" style="display:none;">
+<div class="grid grid-2" style="margin-bottom:20px;">
+<div class="stat-box"><div class="label">Capital Final</div><div class="value" id="finalCapital">$0</div></div>
+<div class="stat-box"><div class="label">Rendement</div><div class="value" id="totalReturn">0%</div></div>
+</div>
+<div class="grid grid-3">
+<div style="background:#0f172a;padding:15px;border-radius:8px;"><p style="color:#94a3b8;font-size:12px;">Trades</p><p style="font-size:20px;font-weight:bold;color:#60a5fa;" id="tradesCount">--</p></div>
+<div style="background:#0f172a;padding:15px;border-radius:8px;"><p style="color:#94a3b8;font-size:12px;">Win Rate</p><p style="font-size:20px;font-weight:bold;color:#10b981;" id="winRate">--</p></div>
+<div style="background:#0f172a;padding:15px;border-radius:8px;"><p style="color:#94a3b8;font-size:12px;">Max DD</p><p style="font-size:20px;font-weight:bold;color:#ef4444;" id="maxDD">--</p></div>
+</div>
+</div>
+<div id="loading" style="text-align:center;padding:40px;display:none;"><p>Calcul en cours...</p></div>
+<div id="placeholder" style="text-align:center;padding:40px;"><p style="color:#94a3b8;">Configurez et lancez un backtest</p></div>
+</div>
+</div>
+</div>
+<script>
+async function runBacktest() {
+    document.getElementById('placeholder').style.display = 'none';
+    document.getElementById('results').style.display = 'none';
+    document.getElementById('loading').style.display = 'block';
+    const symbol = document.getElementById('symbol').value;
+    const strategy = document.getElementById('strategy').value;
+    const capital = document.getElementById('capital').value;
+    const res = await fetch('/api/backtest', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({symbol, strategy, start_capital: parseFloat(capital)})});
+    const data = await res.json();
+    if (data.status === 'error') {
+        alert('Erreur: ' + data.message);
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('placeholder').style.display = 'block';
+        return;
+    }
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('results').style.display = 'block';
+    document.getElementById('finalCapital').textContent = '
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + data.final_capital.toLocaleString();
+    document.getElementById('totalReturn').textContent = (data.total_return > 0 ? '+' : '') + data.total_return + '%';
+    document.getElementById('tradesCount').textContent = data.trades;
+    document.getElementById('winRate').textContent = data.win_rate + '%';
+    document.getElementById('maxDD').textContent = data.max_drawdown + '%';
+    document.getElementById('totalReturn').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+    document.getElementById('finalCapital').style.color = data.total_return > 0 ? '#10b981' : '#ef4444';
+}
+</script>
+</body></html>""")
+
+@app.get("/convertisseur", response_class=HTMLResponse)
+async def convertisseur_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Convertisseur</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Convertisseur Universel</h1><p>Crypto - Crypto | Crypto - Fiat</p></div>""" + NAV + """
+<div class="card"><h2>Conversion</h2>
+<div style="max-width:600px;margin:20px auto;">
+<input type="number" id="amount" value="1" step="any">
+<select id="fromCurrency"><optgroup label="Cryptos"><option value="BTC">Bitcoin</option><option value="ETH">Ethereum</option><option value="USDT">Tether</option><option value="SOL">Solana</option></optgroup><optgroup label="Devises"><option value="USD">USD</option><option value="EUR">EUR</option><option value="CAD">CAD</option></optgroup></select>
+<select id="toCurrency"><optgroup label="Cryptos"><option value="BTC">Bitcoin</option><option value="ETH">Ethereum</option><option value="USDT">Tether</option><option value="SOL">Solana</option></optgroup><optgroup label="Devises"><option value="USD">USD</option><option value="EUR">EUR</option><option value="CAD">CAD</option></optgroup></select>
+<button onclick="convert()" style="width:100%;">Convertir</button>
+<div id="result" style="margin-top:30px;padding:25px;background:#0f172a;border-radius:8px;text-align:center;display:none;">
+<div style="font-size:48px;font-weight:bold;color:#60a5fa;margin-bottom:10px;" id="resultValue">--</div>
+<div style="color:#94a3b8;font-size:14px;" id="resultDetails">--</div>
+</div>
+</div>
+</div>
+</div>
+<script>
+async function convert() {
+    const amount = document.getElementById('amount').value;
+    const from = document.getElementById('fromCurrency').value;
+    const to = document.getElementById('toCurrency').value;
+    const res = await fetch('/api/convert?from_currency=' + from + '&to_currency=' + to + '&amount=' + amount);
+    const data = await res.json();
+    if (data.error) { alert('Erreur: ' + data.error); return; }
+    document.getElementById('result').style.display = 'block';
+    document.getElementById('resultValue').textContent = data.result.toLocaleString('fr-FR', {maximumFractionDigits: 8}) + ' ' + to;
+    document.getElementById('resultDetails').textContent = amount + ' ' + from + ' = ' + data.result.toFixed(8) + ' ' + to;
+}
+</script>
+</body></html>""")
+
+@app.get("/altcoin-season", response_class=HTMLResponse)
+async def altcoin_season_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Altcoin Season</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Altcoin Season Index</h1><p>Donnees CMC en temps reel</p></div>""" + NAV + """
+<div class="card"><h2>Index CMC</h2>
+<div style="text-align:center;padding:40px;">
+<div style="font-size:80px;font-weight:bold;margin-bottom:20px;" id="indexValue">--</div>
+<div style="font-size:24px;margin-bottom:30px;" id="statusText">Chargement...</div>
+</div>
+</div>
+</div>
+<script>
+async function loadAltcoinSeason() {
+    const res = await fetch('/api/altcoin-season');
+    const data = await res.json();
+    document.getElementById('indexValue').textContent = data.index;
+    document.getElementById('statusText').textContent = data.status;
+    const color = data.index >= 75 ? '#10b981' : (data.index >= 25 ? '#f59e0b' : '#ef4444');
+    document.getElementById('indexValue').style.color = color;
+    document.getElementById('statusText').style.color = color;
+}
+loadAltcoinSeason();
+setInterval(loadAltcoinSeason, 300000);
+</script>
+</body></html>""")
+
+@app.get("/calendrier", response_class=HTMLResponse)
+async def calendar_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Calendrier</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Calendrier Evenements</h1><p>Dates VERIFIEES</p></div>""" + NAV + """
+<div class="card"><h2>Prochains evenements</h2><div id="calendarContainer"></div></div>
+</div>
+<script>
+async function loadCalendar() {
+    const res = await fetch('/api/calendar');
+    const data = await res.json();
+    let html = '<table><thead><tr><th>Date</th><th>Evenement</th><th>Coins</th><th>Categorie</th></tr></thead><tbody>';
+    data.events.forEach(e => {
+        const categoryColor = e.category === 'Macro' ? '#f59e0b' : (e.category === 'Conference' ? '#3b82f6' : '#10b981');
+        html += '<tr><td><strong>' + e.date + '</strong></td><td>' + e.title + '</td><td><span style="color:#60a5fa;">' + e.coins.join(', ') + '</span></td><td><span class="badge" style="background:' + categoryColor + ';">' + e.category + '</span></td></tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('calendarContainer').innerHTML = html;
+}
+loadCalendar();
+</script>
+</body></html>""")
+
+@app.get("/btc-dominance", response_class=HTMLResponse)
+async def btc_dominance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>BTC Dominance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Bitcoin Dominance</h1><p>Part de marche de Bitcoin</p></div>""" + NAV + """
+<div class="card"><h2>Dominance BTC</h2>
+<div style="text-align:center;padding:40px;">
+<div style="font-size:80px;font-weight:bold;margin-bottom:20px;color:#f7931a;" id="domValue">--</div>
+<div style="font-size:24px;color:#94a3b8;" id="trendText">--</div>
+</div>
+</div>
+</div>
+<script>
+async function loadDominance() {
+    const res = await fetch('/api/btc-dominance');
+    const data = await res.json();
+    document.getElementById('domValue').textContent = data.dominance + '%';
+    document.getElementById('trendText').textContent = 'Tendance: ' + data.trend;
+}
+loadDominance();
+setInterval(loadDominance, 60000);
+</script>
+</body></html>""")
+
+@app.get("/btc-quarterly", response_class=HTMLResponse)
+async def btc_quarterly_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>BTC Quarterly</title>""" + CSS + """
+<style>.quarterly-grid{display:grid;grid-template-columns:auto repeat(4,1fr);gap:3px;margin-top:20px;}
+.qcell{padding:12px;text-align:center;border-radius:4px;font-weight:bold;font-size:13px;}
+.qheader{background:#0f172a;color:#60a5fa;font-weight:bold;}
+.qyear{background:#0f172a;color:#94a3b8;font-weight:bold;}</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>Bitcoin Quarterly Returns</h1><p>Rendements trimestriels</p></div>""" + NAV + """
+<div class="card"><h2>Performance Q1-Q4</h2><div id="quarterlyContainer"></div></div>
+</div>
+<script>
+async function loadQuarterly() {
+    const res = await fetch('/api/btc-quarterly');
+    const data = await res.json();
+    let html = '<div class="quarterly-grid">';
+    html += '<div class="qcell qheader">Annee</div><div class="qcell qheader">Q1</div><div class="qcell qheader">Q2</div><div class="qcell qheader">Q3</div><div class="qcell qheader">Q4</div>';
+    Object.keys(data.quarterly_returns).reverse().forEach(year => {
+        const quarters = data.quarterly_returns[year];
+        html += '<div class="qcell qyear">' + year + '</div>';
+        ['Q1', 'Q2', 'Q3', 'Q4'].forEach(q => {
+            const value = quarters[q];
+            const color = value > 0 ? '#10b981' : (value < 0 ? '#ef4444' : '#64748b');
+            const bgColor = value > 0 ? 'rgba(16,185,129,0.15)' : (value < 0 ? 'rgba(239,68,68,0.15)' : 'rgba(100,116,139,0.1)');
+            html += '<div class="qcell" style="background:' + bgColor + ';color:' + color + ';">' + (value > 0 ? '+' : '') + value + '%</div>';
+        });
+    });
+    html += '</div>';
+    document.getElementById('quarterlyContainer').innerHTML = html;
+}
+loadQuarterly();
+</script>
+</body></html>""")
+
+@app.get("/annonces", response_class=HTMLResponse)
+async def annonces_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Actualites</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Actualites Crypto LIVE</h1><p>News en temps reel</p></div>""" + NAV + """
+<div class="card"><h2>Dernieres actualites</h2><div id="newsContainer"></div></div>
+</div>
+<script>
+async function loadNews() {
+    const res = await fetch('/api/news');
+    const data = await res.json();
+    let html = '<div style="padding:10px;">';
+    data.news.forEach(n => {
+        html += '<div style="margin:15px 0;padding:15px;background:#0f172a;border-radius:8px;border-left:4px solid #60a5fa;"><h3 style="color:#e2e8f0;margin-bottom:8px;">' + n.title + '</h3><p style="color:#94a3b8;font-size:13px;">' + n.source + '</p></div>';
+    });
+    html += '</div>';
+    document.getElementById('newsContainer').innerHTML = html;
+}
+loadNews();
+setInterval(loadNews, 300000);
+</script>
+</body></html>""")
+
+@app.get("/heatmap", response_class=HTMLResponse)
+async def heatmap_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Heatmap</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Heatmap Performance</h1><p>Performance mensuelle et annuelle</p></div>""" + NAV + """
+<div class="card"><h2>Mensuel</h2><div id="heatmapMonthly" class="heatmap"></div></div>
+<div class="card"><h2>Annuel</h2><div id="heatmapYearly"></div></div>
+</div>
+<script>
+async function loadHeatmapMonthly() {
+    const res = await fetch('/api/heatmap?type=monthly');
+    const data = await res.json();
+    let html = '';
+    data.heatmap.forEach(m => {
+        const color = m.performance > 0 ? '#10b981' : '#ef4444';
+        const opacity = Math.min(Math.abs(m.performance) / 25, 1);
+        html += '<div class="heatmap-cell" style="background:' + color + ';opacity:' + opacity + ';">' + m.month + '<br>' + (m.performance > 0 ? '+' : '') + m.performance + '%</div>';
+    });
+    document.getElementById('heatmapMonthly').innerHTML = html;
+}
+async function loadHeatmapYearly() {
+    const res = await fetch('/api/heatmap?type=yearly');
+    const data = await res.json();
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;">';
+    data.heatmap.forEach(y => {
+        const color = y.performance > 0 ? '#10b981' : '#ef4444';
+        const opacity = Math.min(Math.abs(y.performance) / 200, 0.9);
+        html += '<div style="padding:20px;text-align:center;border-radius:8px;background:' + color + ';opacity:' + opacity + ';"><div style="font-weight:bold;font-size:18px;">' + y.year + '</div><div style="font-size:24px;font-weight:bold;">' + (y.performance > 0 ? '+' : '') + y.performance + '%</div></div>';
+    });
+    html += '</div>';
+    document.getElementById('heatmapYearly').innerHTML = html;
+}
+loadHeatmapMonthly();
+loadHeatmapYearly();
+</script>
+</body></html>""")
+
+@app.get("/strategie", response_class=HTMLResponse)
+async def strategie_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Strategie</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Strategie de Trading</h1><p>Regles et indicateurs</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card"><h2>Regles principales</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li><strong>Risk/Reward:</strong> Minimum 1:2</li>
+<li><strong>Position Size:</strong> Max 2% du capital</li>
+<li><strong>Stop Loss:</strong> Toujours defini</li>
+<li><strong>Take Profit:</strong> Multiples niveaux</li>
+</ul>
+</div>
+<div class="card"><h2>Indicateurs</h2>
+<ul style="line-height:2;padding-left:20px;color:#94a3b8;">
+<li>RSI - Surachat/Survente</li>
+<li>EMA 20/50/200 - Tendance</li>
+<li>MACD - Momentum</li>
+<li>Volume Profile</li>
+</ul>
+</div>
+</div>
+</div>
+</body></html>""")
+
+@app.get("/correlations", response_class=HTMLResponse)
+async def correlations_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Correlations</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Correlations Crypto</h1><p>Relations entre actifs</p></div>""" + NAV + """
+<div class="card"><h2>Correlations principales</h2><div id="corrContainer"></div></div>
+</div>
+<script>
+async function loadCorrelations() {
+    const res = await fetch('/api/correlations');
+    const data = await res.json();
+    let html = '<table><thead><tr><th>Paire</th><th>Correlation</th><th>Force</th></tr></thead><tbody>';
+    data.correlations.forEach(c => {
+        const strength = c.correlation >= 0.8 ? 'Forte' : (c.correlation >= 0.6 ? 'Moyenne' : 'Faible');
+        html += '<tr><td><strong>' + c.pair + '</strong></td><td>' + (c.correlation * 100).toFixed(0) + '%</td><td>' + strength + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('corrContainer').innerHTML = html;
+}
+loadCorrelations();
+</script>
+</body></html>""")
+
+@app.get("/top-movers", response_class=HTMLResponse)
+async def top_movers_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Top Movers</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Top Movers 24h</h1><p>Gainers & Losers</p></div>""" + NAV + """
+<div class="grid grid-2">
+<div class="card"><h2 style="color:#10b981;">Top Gainers</h2><div id="gainersContainer"></div></div>
+<div class="card"><h2 style="color:#ef4444;">Top Losers</h2><div id="losersContainer"></div></div>
+</div>
+</div>
+<script>
+async function loadMovers() {
+    const res = await fetch('/api/top-movers');
+    const data = await res.json();
+    let gainersHtml = '<div style="padding:10px;">';
+    data.gainers.forEach(g => {
+        gainersHtml += '<div style="margin:10px 0;padding:10px;background:rgba(16,185,129,0.05);border-radius:6px;"><strong>' + g.coin + '</strong>: <span style="color:#10b981;font-weight:bold;">+' + g.change_24h.toFixed(2) + '%</span><br><span style="font-size:11px;color:#64748b;">Prix: 
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + g.price.toFixed(2) + '</span></div>';
+    });
+    gainersHtml += '</div>';
+    let losersHtml = '<div style="padding:10px;">';
+    data.losers.forEach(l => {
+        losersHtml += '<div style="margin:10px 0;padding:10px;background:rgba(239,68,68,0.05);border-radius:6px;"><strong>' + l.coin + '</strong>: <span style="color:#ef4444;font-weight:bold;">' + l.change_24h.toFixed(2) + '%</span><br><span style="font-size:11px;color:#64748b;">Prix: 
+    import uvicorn
+    print("\n" + "="*70)
+    print("TRADING DASHBOARD v3.4.0 - VERSIONS SANS EMOJIS")
+    print("="*70)
+    print("Toutes les fonctionnalites sont presentes")
+    print("Code nettoye sans caracteres speciaux")
+    print("="*70)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+ + l.price.toFixed(2) + '</span></div>';
+    });
+    losersHtml += '</div>';
+    document.getElementById('gainersContainer').innerHTML = gainersHtml;
+    document.getElementById('losersContainer').innerHTML = losersHtml;
+}
+loadMovers();
+setInterval(loadMovers, 60000);
+</script>
+</body></html>""")
+
+@app.get("/performance", response_class=HTMLResponse)
+async def performance_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Performance</title>""" + CSS + """</head>
+<body>
+<div class="container">
+<div class="header"><h1>Performance par Paire</h1></div>""" + NAV + """
+<div class="card"><h2>Statistiques par symbole</h2><div id="perfContainer"></div></div>
+</div>
+<script>
+async function loadPerformance() {
+    const res = await fetch('/api/performance-by-pair');
+    const data = await res.json();
+    if (data.performance.length === 0) {
+        document.getElementById('perfContainer').innerHTML = '<p style="color:#94a3b8;padding:20px;text-align:center;">Aucune donnee disponible</p>';
+        return;
+    }
+    let html = '<table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>';
+    data.performance.forEach(p => {
+        const colorPnl = p.total_pnl > 0 ? '#10b981' : '#ef4444';
+        html += '<tr><td><strong>' + p.symbol + '</strong></td><td>' + p.trades + '</td><td><span class="badge ' + (p.win_rate >= 60 ? 'badge-green' : (p.win_rate >= 50 ? 'badge-yellow' : 'badge-red')) + '">' + p.win_rate + '%</span></td><td style="color:' + colorPnl + '">' + (p.avg_pnl > 0 ? '+' : '') + p.avg_pnl + '%</td><td style="color:' + colorPnl + ';font-weight:bold;">' + (p.total_pnl > 0 ? '+' : '') + p.total_pnl + '%</td></tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('perfContainer').innerHTML = html;
+}
+loadPerformance();
+setInterval(loadPerformance, 30000);
+</script>
+</body></html>""")
+
 print("API endpoints charges avec succes")
 print("Dashboard pret a demarrer!")
 
